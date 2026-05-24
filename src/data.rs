@@ -66,6 +66,7 @@ pub struct AppConfig {
     pub concurrency: u32,
     pub delay_ms: u32,
     pub step_delay_ms: u32,
+    pub hide_browser: bool,
     pub debug_mode: bool,
 }
 
@@ -77,6 +78,7 @@ impl Default for AppConfig {
             concurrency: 1,
             delay_ms: 2000,
             step_delay_ms: 1000,
+            hide_browser: true,
             debug_mode: false,
         }
     }

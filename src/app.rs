@@ -33,6 +33,7 @@ pub struct GaokaoApp {
     status_message: String,
     // debug
     debug_mode: bool,
+    hide_browser: bool,
     debug_logs: Arc<Mutex<Vec<String>>>,
     displayed_logs: Vec<String>,
     // cancellation
@@ -66,6 +67,7 @@ impl GaokaoApp {
             progress: Arc::new(Mutex::new(QueryProgress::default())),
             status_message: String::new(),
             debug_mode: cfg.debug_mode,
+            hide_browser: cfg.hide_browser,
             debug_logs: Arc::new(Mutex::new(Vec::new())),
             displayed_logs: Vec::new(),
             cancel_flag: Arc::new(Mutex::new(false)),
@@ -93,6 +95,7 @@ impl GaokaoApp {
         self.config.concurrency = self.concurrency;
         self.config.delay_ms = self.delay_ms;
         self.config.step_delay_ms = self.step_delay_ms;
+        self.config.hide_browser = self.hide_browser;
         self.config.debug_mode = self.debug_mode;
         config::save(&self.config);
         self.config_dirty = false;
@@ -131,7 +134,14 @@ impl eframe::App for GaokaoApp {
                     ui.separator();
                     ui.add_space(8.0);
 
-                    // debug toggle
+                    ui.add_space(4.0);
+                    let hw = self.hide_browser;
+                    ui.checkbox(&mut self.hide_browser, "🙈 隐藏浏览器");
+                    if hw != self.hide_browser {
+                        self.config_dirty = true;
+                        self.log(if self.hide_browser { "浏览器将隐藏" } else { "浏览器将可见" });
+                    }
+                    ui.add_space(4.0);
                     let was = self.debug_mode;
                     ui.checkbox(&mut self.debug_mode, "🔧 调试模式");
                     if was != self.debug_mode {
@@ -453,6 +463,7 @@ impl GaokaoApp {
         let results = self.results.clone();
         let cancel = self.cancel_flag.clone();
         let debug_mode = self.debug_mode;
+        let hide_browser = self.hide_browser;
         let logs = self.debug_logs.clone();
 
         {
@@ -480,6 +491,7 @@ impl GaokaoApp {
                 let delay = delay;
                 let step_delay = step_delay;
                 let debug_mode = debug_mode;
+                let hide_browser = hide_browser;
                 let logs = logs.clone();
 
                 tokio::spawn(async move {
@@ -504,7 +516,7 @@ impl GaokaoApp {
                     let mut last_err = String::new();
 
                     // Open ONE browser per record, try all candidates
-                    match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay).await {
+                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay, hide_browser).await {
                         Ok(client) => {
                             for (ci, sfz) in candidates.iter().enumerate() {
                                 if *cancel_inner.lock().await { return; }
