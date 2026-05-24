@@ -885,7 +885,7 @@ impl GaokaoApp {
                     ui.add_space(4.0);
 
                     // Only redraw when data changes (perf optimization)
-                    let result_count = self.pred_displayed_results.len();
+                    let _result_count = self.pred_displayed_results.len();
                     egui::ScrollArea::vertical().id_source("pred_results_table").max_height(250.0).show(ui, |ui| {
                         TableBuilder::new(ui).id_source("pred_results")
                             .striped(true)
