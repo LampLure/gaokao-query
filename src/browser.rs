@@ -25,6 +25,7 @@ pub struct BrowserClient {
     target_url: String,
     instance_id: u64,
     start: std::time::Instant,
+    turbo: bool,
 }
 
 impl BrowserClient {
@@ -32,6 +33,10 @@ impl BrowserClient {
         self.perf = perf;
         self.start = std::time::Instant::now();
         self.perf_event("浏览器获取完成");
+    }
+
+    pub fn set_turbo(&mut self, turbo: bool) {
+        self.turbo = turbo;
     }
 
     fn perf_event(&self, label: &'static str) {
@@ -44,12 +49,17 @@ impl BrowserClient {
     }
 
     async fn sleep_step(&self, factor: f64) {
-        let ms = (self.step_delay_ms as f64 * factor) as u64;
+        let ms = if self.turbo {
+            50u64
+        } else {
+            (self.step_delay_ms as f64 * factor) as u64
+        };
         tokio::time::sleep(std::time::Duration::from_millis(ms.max(50))).await;
     }
 
-    async fn sleep_critical(ms: u64) {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    async fn sleep_critical(&self, ms: u64) {
+        let actual = if self.turbo { ms.min(500) } else { ms };
+        tokio::time::sleep(std::time::Duration::from_millis(actual)).await;
     }
 
     pub async fn new_with_log(
@@ -61,7 +71,7 @@ impl BrowserClient {
         hide_browser: bool,
         target_url: &str,
     ) -> Result<Self, String> {
-        Self::new_with_perf(_headed, log, None, step_delay_ms, captcha_retries, captcha_wait_ms, hide_browser, target_url).await
+        Self::new_with_perf(_headed, log, None, step_delay_ms, captcha_retries, captcha_wait_ms, hide_browser, target_url, false).await
     }
 
     pub async fn new_with_perf(
@@ -73,6 +83,7 @@ impl BrowserClient {
         captcha_wait_ms: u64,
         hide_browser: bool,
         target_url: &str,
+        turbo: bool,
     ) -> Result<Self, String> {
         let chrome_path = find_chrome()
             .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
@@ -146,6 +157,7 @@ impl BrowserClient {
             target_url: url,
             instance_id,
             start: now,
+            turbo,
         })
     }
 
@@ -218,7 +230,7 @@ impl BrowserClient {
             if has_err {
                 break;
             }
-            Self::sleep_critical(200).await;
+            self.sleep_critical(200).await;
         }
         if captcha_visible {
             self.perf_event("验证码弹窗出现");
@@ -226,7 +238,7 @@ impl BrowserClient {
                 self.perf_event("总耗时");
                 return Err(format!("验证码处理失败: {}", e));
             }
-            Self::sleep_critical(2000).await;
+            self.sleep_critical(200).await;
         }
 
         let has_error: bool = page.evaluate_expression(
@@ -326,7 +338,7 @@ impl BrowserClient {
                         return 'no_btn';
                     })()"#
                 ).await;
-                Self::sleep_critical(3000).await;
+                self.sleep_critical(3000).await;
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
@@ -383,7 +395,7 @@ impl BrowserClient {
                         last_src = src;
                         break;
                     }
-                    Self::sleep_critical(poll_step).await;
+                    self.sleep_critical(poll_step).await;
                 }
                 if last_src.is_empty() {
                     return Err("验证码图片加载超时".to_string());
@@ -486,7 +498,20 @@ impl BrowserClient {
                 self.sleep_step(0.3).await;
             }
 
-            Self::sleep_critical(2000).await;
+            // Poll for verification result (200ms, max 2s)
+            self.perf_event("验证码点击完成");
+            for _ in 0..10 {
+                let still_visible: bool = page.evaluate_expression(
+                    r#"(function() {
+                        const m = document.getElementById('captchaModal');
+                        return m ? !m.classList.contains('hidden') : false;
+                    })()"#
+                ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+                if !still_visible {
+                    break;
+                }
+                self.sleep_critical(200).await;
+            }
 
             // Check if captcha modal is still visible (verification failed)
             let still_visible: bool = page.evaluate_expression(
@@ -495,8 +520,6 @@ impl BrowserClient {
                     return m ? !m.classList.contains('hidden') : false;
                 })()"#
             ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
-
-            self.perf_event("验证码点击完成");
 
             if !still_visible {
                 // Captcha passed
@@ -523,7 +546,7 @@ impl BrowserClient {
                 })()"#
             ).await;
 
-            Self::sleep_critical(1000).await;
+            self.sleep_critical(500).await;
         }
 
         Err(format!("验证码连续失败 {} 次，已放弃", max_retries))
@@ -552,14 +575,15 @@ impl BrowserPool {
         captcha_wait_ms: u64,
         target_url: &str,
         logs: Option<Arc<Mutex<Vec<String>>>>,
+        turbo: bool,
     ) -> Result<Arc<Self>, String> {
-        let launch_delay = if step_delay_ms > 0 { step_delay_ms } else { 100 };
+        let launch_delay = if step_delay_ms > 0 && !turbo { step_delay_ms } else { 100 };
         let mut handles = Vec::with_capacity(count);
         for i in 0..count {
             let url = target_url.to_string();
             let l = logs.clone();
             handles.push(tokio::spawn(async move {
-                BrowserClient::new_with_log(false, l, step_delay_ms, captcha_retries, captcha_wait_ms, hide_browser, &url).await
+                BrowserClient::new_with_perf(false, l, None, step_delay_ms, captcha_retries, captcha_wait_ms, hide_browser, &url, turbo).await
             }));
             if i + 1 < count {
                 tokio::time::sleep(std::time::Duration::from_millis(launch_delay)).await;

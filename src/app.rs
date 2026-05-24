@@ -152,6 +152,7 @@ impl GaokaoApp {
         self.config.captcha_wait_ms = self.captcha_wait_ms;
         self.config.hide_browser = self.hide_browser;
         self.config.debug_mode = self.debug_mode;
+        self.config.turbo = self.config.turbo;
         config::save(&self.config);
         self.config_dirty = false;
     }
@@ -325,6 +326,9 @@ impl eframe::App for GaokaoApp {
                     let sp = self.show_perf;
                     ui.checkbox(&mut self.show_perf, "⏱ 性能");
                     if sp != self.show_perf { self.config_dirty = true; }
+                    let tb = self.config.turbo;
+                    ui.checkbox(&mut self.config.turbo, "🔥 暴力");
+                    if tb != self.config.turbo { self.config_dirty = true; }
                 });
             });
             ui.separator();
@@ -946,6 +950,7 @@ impl GaokaoApp {
         let target_url = self.target_url.clone();
         let logs = self.debug_logs.clone();
         let perf_logs = self.perf_logs.clone();
+        let turbo = self.config.turbo;
 
         {
             let mut p = progress.try_lock().unwrap();
@@ -953,12 +958,13 @@ impl GaokaoApp {
             p.completed = 0; p.success = 0; p.failed = 0;
         }
 
-        self.log(format!("开始查询: {} 条记录, 并发 {}, 间隔 {}ms", matched.len(), concurrency, delay));
+        self.log(format!("开始查询: {} 条记录, 并发 {}, 间隔 {}ms, turbo={}", matched.len(), concurrency, delay, turbo));
 
         tokio::spawn(async move {
+            let turbo = turbo;
             let pool = match crate::browser::BrowserPool::new(
                 concurrency, hide_browser, step_delay, captcha_retries, captcha_wait_ms,
-                &target_url, Some(logs.clone()),
+                &target_url, Some(logs.clone()), turbo,
             ).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1015,6 +1021,7 @@ impl GaokaoApp {
 
                         let record_perf: Arc<Mutex<Vec<PerfEvent>>> = Arc::new(Mutex::new(Vec::new()));
                         client.set_perf(Some(record_perf.clone()));
+                        client.set_turbo(turbo);
 
                         {
                             let mut l = logs.lock().await;
@@ -1161,6 +1168,7 @@ impl GaokaoApp {
         let captcha_retries = self.captcha_retries;
         let captcha_wait_ms = self.captcha_wait_ms as u64;
         let target_url = self.target_url.clone();
+        let turbo = self.config.turbo;
         let logs = self.debug_logs.clone();
         let cancel = self.cancel_flag.clone();
         let pred_results = self.pred_results.clone();
@@ -1182,6 +1190,7 @@ impl GaokaoApp {
                 captcha_wait_ms,
                 &target_url,
                 Some(logs.clone()),
+                turbo,
             ).await {
                 Ok(p) => p,
                 Err(e) => {

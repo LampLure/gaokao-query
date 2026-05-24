@@ -71,6 +71,7 @@ pub struct AppConfig {
     pub captcha_wait_ms: u32,
     pub hide_browser: bool,
     pub debug_mode: bool,
+    pub turbo: bool,
 }
 
 impl Default for AppConfig {
@@ -86,6 +87,7 @@ impl Default for AppConfig {
             captcha_wait_ms: 2000,
             hide_browser: true,
             debug_mode: false,
+            turbo: false,
         }
     }
 }
