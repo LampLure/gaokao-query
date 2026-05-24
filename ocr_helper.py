@@ -1,43 +1,29 @@
 #!/usr/bin/env python3
-"""
-OCR helper: find captcha character positions via connected components,
-recognize each via tesseract, then reorder to match expected click order.
-"""
-
 import sys
 import os
-from PIL import Image
+import itertools
+import numpy as np
+from PIL import Image, ImageFilter, ImageDraw, ImageFont
 
-os.environ["TESSDATA_PREFIX"] = "/tmp"
+TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chars")
+os.makedirs(TEMPLATE_DIR, exist_ok=True)
+
+FONT_PATHS = [
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc",
+    "/usr/share/fonts/truetype/arphic/uming.ttc",
+]
+COMPARE_SIZE = 48
+SSIM_THRESHOLD = 0.3
 
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
-def find_char_boxes(image_path):
-    """Find character bounding boxes via connected components on binarized image."""
-    img = Image.open(image_path)
-    if img.mode == 'RGBA':
-        img = img.convert('RGB')
-    gray = img.convert('L')
-    iw, ih = img.size
-    log(f"Image size: {iw}x{ih}")
-
-    # Binarize: text is dark on light background
-    pixels = list(gray.getdata())
-    # Find a good threshold - look for the dark pixels
-    sorted_p = sorted(pixels)
-    threshold = sorted_p[len(sorted_p) * 20 // 100]  # top 20% dark
-    threshold = min(threshold, 160)
-    log(f"Threshold: {threshold}")
-
-    bw = gray.point(lambda x: 0 if x < threshold else 255)
-    bw.save("/tmp/gaokao_bw.png")
-    log("Saved binarized image to /tmp/gaokao_bw.png")
-
-    # Find connected components using scan-line flood fill
-    w, h = bw.size
+def _flood_fill(dilated, min_count=15, min_size=8, max_w_ratio=0.4, max_h_ratio=0.5):
+    w, h = dilated.size
+    iw, ih = w, h
     visited = [[False] * w for _ in range(h)]
     components = []
 
@@ -45,15 +31,14 @@ def find_char_boxes(image_path):
         for x in range(w):
             if visited[y][x]:
                 continue
-            if bw.getpixel((x, y)) != 0:  # not dark pixel
+            if dilated.getpixel((x, y)) != 0:
                 visited[y][x] = True
                 continue
 
-            # BFS flood fill for this component
             stack = [(x, y)]
             visited[y][x] = True
-            min_x, max_x = x, x
-            min_y, max_y = y, y
+            min_x = max_x = x
+            min_y = max_y = y
             count = 0
 
             while stack:
@@ -63,138 +48,251 @@ def find_char_boxes(image_path):
                 max_x = max(max_x, cx)
                 min_y = min(min_y, cy)
                 max_y = max(max_y, cy)
-                # Check 4-connected neighbors
-                for nx, ny in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]:
+                for nx, ny in [(cx-1,cy),(cx+1,cy),(cx,cy-1),(cx,cy+1),
+                               (cx-1,cy-1),(cx+1,cy-1),(cx-1,cy+1),(cx+1,cy+1)]:
                     if 0 <= nx < w and 0 <= ny < h and not visited[ny][nx]:
-                        if bw.getpixel((nx, ny)) == 0:
+                        if dilated.getpixel((nx, ny)) == 0:
                             visited[ny][nx] = True
                             stack.append((nx, ny))
 
-            cw = max_x - min_x + 1
-            ch = max_y - min_y + 1
-            # Filter: character-like components
-            if count >= 15 and cw >= 8 and ch >= 8 and cw <= iw * 0.4 and ch <= ih * 0.5:
+            cw, ch = max_x - min_x + 1, max_y - min_y + 1
+            if count >= min_count and cw >= min_size and ch >= min_size and cw <= iw * max_w_ratio and ch <= ih * max_h_ratio:
                 components.append((min_x, min_y, max_x, max_y, count))
 
-    log(f"Found {len(components)} character-like components:")
-    for x1, y1, x2, y2, sz in components:
-        log(f"  ({x1},{y1})-({x2},{y2})  size={x2-x1}x{y2-y1}  pixels={sz}")
+    return components
 
+
+def _pick_top3(components):
     if len(components) < 3:
-        log(f"WARNING: Only {len(components)} components found, too few")
-        return []
-
-    # Sort by x position, take 3
-    components.sort(key=lambda c: c[0])
-    # If more than 3, try to pick the 3 most likely (by pixel count, position)
-    if len(components) > 3:
-        # Prefer components in the middle band (y = 25%-75% of height)
-        mid_y_low = ih * 0.25
-        mid_y_high = ih * 0.75
-        scored = []
-        for c in components:
-            cy = (c[1] + c[3]) / 2
-            y_score = 1.0 - abs(cy - ih / 2) / (ih / 2)  # closer to center = better
-            size_score = min(1.0, c[4] / 200)  # bigger = better up to a point
-            scored.append((y_score * 0.6 + size_score * 0.4, c))
-        scored.sort(key=lambda s: -s[0])
-        components = [c for _, c in scored[:3]]
-        components.sort(key=lambda c: c[0])
-
-    log(f"\nSelected 3 components (left-to-right):")
-    for x1, y1, x2, y2, sz in components:
-        log(f"  ({x1},{y1})-({x2},{y2})")
-
-    return [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in components]
+        return None
+    components.sort(key=lambda c: -c[4])
+    top3 = components[:3]
+    top3.sort(key=lambda c: c[0])
+    return [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in top3]
 
 
-def recognize_char(image_path, box):
-    """Crop and recognize a single character using tesseract."""
-    import tesserocr
-    x1, y1, x2, y2 = box
-    try:
-        img = Image.open(image_path)
-        crop = img.crop((x1, y1, x2, y2))
-        crop_gray = crop.convert('L')
-        # Enlarge for better recognition
-        crop_big = crop_gray.resize((crop_gray.width * 3, crop_gray.height * 3), Image.LANCZOS)
+def find_char_boxes(image_path):
+    img = Image.open(image_path)
+    if img.mode == 'RGBA':
+        img = img.convert('RGB')
+    gray = img.convert('L')
+    iw, ih = img.size
+    log(f"Image size: {iw}x{ih}")
 
-        api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
+    pixels = sorted(gray.get_flattened_data())
+    threshold = min(pixels[len(pixels) * 20 // 100], 160)
+    log(f"Threshold: {threshold}")
+
+    bw = gray.point(lambda x: 0 if x < threshold else 255)
+    bw.save("/tmp/gaokao_bw.png")
+    log("Saved binarized image to /tmp/gaokao_bw.png")
+
+    dilate_sizes = [5, 3, 7, 1]
+    for ksize in dilate_sizes:
+        if ksize == 1:
+            dilated = bw
+        else:
+            dilated = bw.filter(ImageFilter.MinFilter(ksize))
+        components = _flood_fill(dilated)
+        log(f"Dilate {ksize}x{ksize}: found {len(components)} components")
+        for x1, y1, x2, y2, sz in components:
+            log(f"  ({x1},{y1})-({x2},{y2})  size={x2-x1}x{y2-y1}  pixels={sz}")
+        result = _pick_top3(components)
+        if result is not None:
+            log(f"\nSelected 3 components (left-to-right, dilation={ksize}):")
+            for x1, y1, x2, y2 in result:
+                log(f"  ({x1},{y1})-({x2},{y2})")
+            return result
+
+    log("ERROR: Could not find 3 character components with any dilation setting")
+    sys.exit(1)
+
+
+def to_square_gray(img, target_size, bg=255):
+    w, h = img.size
+    side = max(w, h)
+    sq = Image.new('L', (side, side), bg)
+    sq.paste(img, ((side - w) // 2, (side - h) // 2))
+    return np.array(sq.resize((target_size, target_size), Image.LANCZOS), dtype=np.float32)
+
+
+def get_cached_template(char):
+    path = os.path.join(TEMPLATE_DIR, f"{char}.png")
+    if os.path.exists(path):
+        return Image.open(path).convert('L')
+    return None
+
+
+def save_template(char, img):
+    path = os.path.join(TEMPLATE_DIR, f"{char}.png")
+    img.save(path)
+    log(f"  Saved template '{char}' ({img.size[0]}x{img.size[1]}) to {path}")
+
+
+def render_font_img(char):
+    results = []
+    for fp in FONT_PATHS:
         try:
-            api.SetImage(crop_big)
-            api.SetVariable("tessedit_pageseg_mode", "10")  # single char
-            api.Recognize()
-            text = api.GetUTF8Text().strip()
-            if text:
-                # Take first char only
-                return text[0]
-        finally:
-            api.End()
-    except Exception as e:
-        log(f"  Recognize error: {e}")
-    return ""
-
-
-def solve(image_path, expected_chars):
-    log("--- OCR Debug ---")
-    log(f"Expected click order: {' → '.join(expected_chars)}")
-
-    # Step 1: find character positions via connected components
-    boxes = find_char_boxes(image_path)
-
-    if len(boxes) < 3:
-        log("ERROR: Could not find 3 character positions in image")
-        sys.exit(1)
-
-    # Step 2: recognize each character
-    log(f"\nCharacter recognition:")
-    recognized = []
-    for i, box in enumerate(boxes):
-        ch = recognize_char(image_path, box)
-        recognized.append(ch)
-        log(f"  Box[{i}] at ({box[0]},{box[1]})-({box[2]},{box[3]}): '{ch}'")
-
-    # Step 3: match recognized chars to expected order
-    assigned = {}   # expected_char -> box_index
-    used = set()
-    unmatched = []
-
-    for ch in expected_chars:
-        found = False
-        for idx, rch in enumerate(recognized):
-            if idx in used:
+            canvas = Image.new('L', (COMPARE_SIZE * 2, COMPARE_SIZE * 2), 255)
+            draw = ImageDraw.Draw(canvas)
+            font = ImageFont.truetype(fp, COMPARE_SIZE)
+            draw.text((10, 10), char, font=font, fill=0)
+            arr = np.array(canvas)
+            ys, xs = np.where(arr < 128)
+            if len(xs) < 10:
                 continue
-            if rch and (ch == rch or ch in rch or rch in ch):
-                assigned[ch] = idx
-                used.add(idx)
-                found = True
-                break
-        if not found:
-            unmatched.append(ch)
+            x1, x2 = xs.min(), xs.max()
+            y1, y2 = ys.min(), ys.max()
+            crop = canvas.crop((x1, y1, x2 + 1, y2 + 1))
+            dark_ratio = (arr < 128).sum() / arr.size
+            results.append((dark_ratio, crop))
+        except Exception:
+            continue
+    if not results:
+        raise RuntimeError(f"No font available to render '{char}'")
+    results.sort(key=lambda r: -r[0])
+    return results[0][1]
 
-    log(f"\nMatching results:")
-    for ch, idx in assigned.items():
-        log(f"  '{ch}' → box[{idx}] (recognized as '{recognized[idx]}')")
-    if unmatched:
-        log(f"  Unmatched: {unmatched}")
 
-    # Assign remaining boxes to unmatched chars
-    remaining = [i for i in range(len(boxes)) if i not in used]
-    for ch, idx in zip(unmatched, remaining):
-        assigned[ch] = idx
-        log(f"  '{ch}' → box[{idx}] (by position, recognized as '{recognized[idx]}')")
+def binarize(arr, threshold=128):
+    return (arr < threshold).astype(np.float32)
 
-    # If still missing, fall back to position
-    if len(assigned) < 3:
-        log("WARNING: Not all assigned, using left-to-right fallback")
+
+def jaccard_score(a, b):
+    ma, mb = binarize(a), binarize(b)
+    inter = (ma * mb).sum()
+    union = ((ma + mb) > 0).sum()
+    return inter / union if union > 0 else 0
+
+
+def ncc_score(a, b):
+    a_m = a - a.mean()
+    b_m = b - b.mean()
+    denom = np.sqrt((a_m ** 2).sum() * (b_m ** 2).sum())
+    return (a_m * b_m).sum() / denom if denom > 0 else 0
+
+
+def ssim_score(a, b):
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+    mu1, mu2 = a.mean(), b.mean()
+    sigma1_sq = ((a - mu1) ** 2).mean()
+    sigma2_sq = ((b - mu2) ** 2).mean()
+    sigma12 = ((a - mu1) * (b - mu2)).mean()
+    num = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
+    den = (mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2)
+    return num / den
+
+
+def combined_score(a, b):
+    return max(ssim_score(a, b), jaccard_score(a, b))
+
+
+def _score_matrix(gray, boxes, expected_chars, template_source):
+    n = len(expected_chars)
+    scores = np.zeros((n, n))
+    for i, ch in enumerate(expected_chars):
+        if template_source == 'cached':
+            tmpl = get_cached_template(ch)
+        else:
+            tmpl = render_font_img(ch)
+        tmpl_arr = to_square_gray(tmpl, COMPARE_SIZE)
+        for j, (x1, y1, x2, y2) in enumerate(boxes):
+            crop = gray.crop((x1, y1, x2, y2))
+            crop_arr = to_square_gray(crop, COMPARE_SIZE)
+            scores[i, j] = combined_score(crop_arr, tmpl_arr)
+    return scores
+
+
+def _best_assignment(scores, expected_chars):
+    n = len(expected_chars)
+    best_perm = None
+    best_total = -1
+    for perm in itertools.permutations(range(n)):
+        total = sum(scores[i, perm[i]] for i in range(n))
+        if total > best_total:
+            best_total = total
+            best_perm = perm
+    assigned = {}
+    for i, j in enumerate(best_perm):
+        assigned[expected_chars[i]] = j
+    return assigned, best_total / n
+
+
+def match_characters(boxes, image_path, expected_chars):
+    gray = Image.open(image_path).convert('L')
+    log(f"\nTemplate matching:")
+
+    n = len(expected_chars)
+    all_cached = all(get_cached_template(ch) is not None for ch in expected_chars)
+
+    # Compute scores using font-rendered templates (always available)
+    font_scores = _score_matrix(gray, boxes, expected_chars, 'font')
+    log(f"Font-rendered scores:")
+    for i, ch in enumerate(expected_chars):
+        for j in range(n):
+            log(f"  '{ch}' vs box[{j}]: match={font_scores[i, j]:.4f}")
+
+    font_assigned, font_avg = _best_assignment(font_scores, expected_chars)
+
+    # If all cached templates exist, also compute with them
+    if all_cached:
+        cache_scores = _score_matrix(gray, boxes, expected_chars, 'cached')
+        log(f"Cached template scores:")
+        for i, ch in enumerate(expected_chars):
+            for j in range(n):
+                log(f"  '{ch}' vs box[{j}]: match={cache_scores[i, j]:.4f}")
+        cache_assigned, cache_avg = _best_assignment(cache_scores, expected_chars)
+
+        # Use cached if it's clearly better; otherwise prefer font (unbiased)
+        if cache_avg > max(font_avg, 0.5):
+            assigned = cache_assigned
+            avg = cache_avg
+            log(f"\nUsing cached templates (avg score={avg:.4f})")
+        else:
+            assigned = font_assigned
+            avg = font_avg
+            log(f"\nUsing font-rendered templates (avg score={avg:.4f})")
+    else:
+        assigned = font_assigned
+        avg = font_avg
+        log(f"\nFont-rendered assignment (avg score={avg:.4f}):")
+
+    for ch, j in assigned.items():
+        log(f"  '{ch}' → box[{j}] (score={font_scores[expected_chars.index(ch), j]:.4f})")
+
+    if avg < SSIM_THRESHOLD:
+        log(f"WARNING: Low score ({avg:.4f}), falling back to left-to-right")
+        assigned = {}
         for i, ch in enumerate(expected_chars):
             assigned[ch] = i
 
-    # Build final result
+    if avg >= SSIM_THRESHOLD:
+        for ch, j in assigned.items():
+            x1, y1, x2, y2 = boxes[j]
+            crop = gray.crop((x1, y1, x2, y2))
+            save_template(ch, crop)
+    else:
+        log("Score too low, not saving templates (to avoid polluting cache)")
+
+    return assigned
+
+
+def solve(image_path, expected_chars):
+    log("--- Character Matching Debug ---")
+    log(f"Expected click order: {' → '.join(expected_chars)}")
+
+    boxes = find_char_boxes(image_path)
+    if len(boxes) < 3:
+        log("ERROR: Could not find 3 character positions")
+        sys.exit(1)
+
+    assignments = match_characters(boxes, image_path, expected_chars)
+
     result = []
     log(f"\nFinal click order:")
     for ch in expected_chars:
-        idx = assigned[ch]
+        idx = assignments[ch]
         box = boxes[idx]
         result.append(box)
         log(f"  '{ch}' at ({box[0]},{box[1]})-({box[2]},{box[3]})")
@@ -232,7 +330,7 @@ def main():
         log(f"  Click {i+1}: ({cx:.4f}, {cy:.4f})")
         print(f"{cx:.4f},{cy:.4f}")
 
-    log("--- OCR Done ---")
+    log("--- Done ---")
 
 
 if __name__ == "__main__":

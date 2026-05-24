@@ -205,15 +205,29 @@ impl BrowserClient {
             // Get captcha image (wait for it to actually load)
             let img_src: String = {
                 let mut last_src = String::new();
-                for _ in 0..20 {
+                for _ in 0..30 {
                     let src: String = page.evaluate_expression(
                         r#"(function() {
                             const img = document.getElementById('captchaImage');
                             if (!img) return '';
+
+                            // Wait for image to actually finish loading
+                            if (!img.complete || img.naturalWidth === 0) return '';
+
                             const s = img.getAttribute('src') || '';
-                            // Only return non-placeholder, non-empty images
                             if (s && !s.includes('svg+xml') && s.length > 100) return s;
-                            return '';
+
+                            // Fallback: try to read from canvas if src is a data URI
+                            try {
+                                const c = document.createElement('canvas');
+                                c.width = img.naturalWidth;
+                                c.height = img.naturalHeight;
+                                const ctx = c.getContext('2d');
+                                ctx.drawImage(img, 0, 0);
+                                return c.toDataURL('image/png');
+                            } catch(e) {
+                                return '';
+                            }
                         })()"#
                     ).await.map_err(|e| format!("获取验证码失败: {}", e))?
                         .into_value().unwrap_or_default();

@@ -211,55 +211,57 @@ impl eframe::App for GaokaoApp {
 
             // matched table
             if !self.matched_records.is_empty() {
-                ui.label(egui::RichText::new(format!(
-                    "📋 匹配结果（共 {} 条）", self.matched_records.len()
-                )).strong());
-                ui.add_space(4.0);
+                ui.push_id("matched_section", |ui| {
+                    ui.label(egui::RichText::new(format!(
+                        "📋 匹配结果（共 {} 条）", self.matched_records.len()
+                    )).strong());
+                    ui.add_space(4.0);
 
-                egui::ScrollArea::vertical().id_source("matched_table").max_height(180.0).show(ui, |ui| {
-                    TableBuilder::new(ui).id_source("matched")
-                        .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .header(20.0, |mut h| {
-                            h.col(|ui| { ui.label("姓名"); });
-                            h.col(|ui| { ui.label("报名号"); });
-                            h.col(|ui| { ui.label("身份证号"); });
-                            h.col(|ui| { ui.label("报考信息"); });
-                            h.col(|ui| { ui.label("状态"); });
-                        })
-                        .body(|body| {
-                            body.rows(20.0, self.matched_records.len(), |mut row| {
-                                let i = row.index();
-                                if let Some(r) = self.matched_records.get(i) {
-                                    row.col(|ui| { ui.label(&r.name); });
-                                    row.col(|ui| { ui.label(&r.baominghao); });
-                                    row.col(|ui| {
-                                        let t = match &r.status {
-                                            MatchStatus::Matched(s) => s.clone(),
-                                            MatchStatus::Multiple => format!("同名{}人", r.shenfenzheng_candidates.len()),
-                                            MatchStatus::NotFound => "未找到".into(),
-                                            MatchStatus::Pending => "待匹配".into(),
-                                        };
-                                        ui.label(t);
-                                    });
-                                    row.col(|ui| { ui.label(&r.baokao_info); });
-                                    row.col(|ui| {
-                                        let (t, c) = match &r.status {
-                                            MatchStatus::Matched(_) => ("已匹配", egui::Color32::GREEN),
-                                            MatchStatus::Multiple => ("同名需穷举", egui::Color32::YELLOW),
-                                            MatchStatus::NotFound => ("未找到", egui::Color32::RED),
-                                            MatchStatus::Pending => ("待匹配", egui::Color32::GRAY),
-                                        };
-                                        ui.label(egui::RichText::new(t).color(c));
-                                    });
-                                }
+                    egui::ScrollArea::vertical().id_source("matched_table").max_height(180.0).show(ui, |ui| {
+                        TableBuilder::new(ui).id_source("matched")
+                            .striped(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .header(20.0, |mut h| {
+                                h.col(|ui| { ui.label("姓名"); });
+                                h.col(|ui| { ui.label("报名号"); });
+                                h.col(|ui| { ui.label("身份证号"); });
+                                h.col(|ui| { ui.label("报考信息"); });
+                                h.col(|ui| { ui.label("状态"); });
+                            })
+                            .body(|body| {
+                                body.rows(20.0, self.matched_records.len(), |mut row| {
+                                    let i = row.index();
+                                    if let Some(r) = self.matched_records.get(i) {
+                                        row.col(|ui| { ui.label(&r.name); });
+                                        row.col(|ui| { ui.label(&r.baominghao); });
+                                        row.col(|ui| {
+                                            let t = match &r.status {
+                                                MatchStatus::Matched(s) => s.clone(),
+                                                MatchStatus::Multiple => format!("同名{}人", r.shenfenzheng_candidates.len()),
+                                                MatchStatus::NotFound => "未找到".into(),
+                                                MatchStatus::Pending => "待匹配".into(),
+                                            };
+                                            ui.label(t);
+                                        });
+                                        row.col(|ui| { ui.label(&r.baokao_info); });
+                                        row.col(|ui| {
+                                            let (t, c) = match &r.status {
+                                                MatchStatus::Matched(_) => ("已匹配", egui::Color32::GREEN),
+                                                MatchStatus::Multiple => ("同名需穷举", egui::Color32::YELLOW),
+                                                MatchStatus::NotFound => ("未找到", egui::Color32::RED),
+                                                MatchStatus::Pending => ("待匹配", egui::Color32::GRAY),
+                                            };
+                                            ui.label(egui::RichText::new(t).color(c));
+                                        });
+                                    }
+                                });
                             });
-                        });
+                    });
                 });
             }
 
@@ -312,7 +314,7 @@ impl eframe::App for GaokaoApp {
             }
 
             // progress
-            {
+            ui.push_id("progress_section", |ui| {
                 if let Ok(p) = self.progress.try_lock() {
                     if p.total > 0 {
                         ui.add_space(8.0);
@@ -326,7 +328,7 @@ impl eframe::App for GaokaoApp {
                         ));
                     }
                 }
-            }
+            });
 
             if !self.status_message.is_empty() {
                 ui.add_space(8.0);
@@ -337,59 +339,61 @@ impl eframe::App for GaokaoApp {
 
             // results table
             if !self.displayed_results.is_empty() {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new("📊 查询结果").strong());
-                ui.add_space(4.0);
+                ui.push_id("results_section", |ui| {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("📊 查询结果").strong());
+                    ui.add_space(4.0);
 
-                egui::ScrollArea::vertical().id_source("results_table").max_height(200.0).show(ui, |ui| {
-                    TableBuilder::new(ui).id_source("results")
-                        .striped(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .column(Column::auto().resizable(true))
-                        .header(20.0, |mut h| {
-                            h.col(|ui| { ui.label("姓名"); });
-                            h.col(|ui| { ui.label("高考报名号"); });
-                            h.col(|ui| { ui.label("身份证号"); });
-                            h.col(|ui| { ui.label("科目名称"); });
-                            h.col(|ui| { ui.label("考点名称"); });
-                            h.col(|ui| { ui.label("状态/错误"); });
-                        })
-                        .body(|body| {
-                            body.rows(20.0, self.displayed_results.len(), |mut row| {
-                                let i = row.index();
-                                if let Some(r) = self.displayed_results.get(i) {
-                                    row.col(|ui| { ui.label(&r.name); });
-                                    row.col(|ui| { ui.label(&r.baominghao); });
-                                    row.col(|ui| { ui.label(&r.shenfenzheng); });
-                                    row.col(|ui| { ui.label(&r.kemumingcheng); });
-                                    row.col(|ui| { ui.label(&r.kaodianmingcheng); });
-                                    row.col(|ui| {
-                                        match &r.status {
-                                            QueryStatus::Success => {
-                                                ui.label(egui::RichText::new("✅ 成功").color(egui::Color32::GREEN));
+                    egui::ScrollArea::vertical().id_source("results_table").max_height(200.0).show(ui, |ui| {
+                        TableBuilder::new(ui).id_source("results")
+                            .striped(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .header(20.0, |mut h| {
+                                h.col(|ui| { ui.label("姓名"); });
+                                h.col(|ui| { ui.label("高考报名号"); });
+                                h.col(|ui| { ui.label("身份证号"); });
+                                h.col(|ui| { ui.label("科目名称"); });
+                                h.col(|ui| { ui.label("考点名称"); });
+                                h.col(|ui| { ui.label("状态/错误"); });
+                            })
+                            .body(|body| {
+                                body.rows(20.0, self.displayed_results.len(), |mut row| {
+                                    let i = row.index();
+                                    if let Some(r) = self.displayed_results.get(i) {
+                                        row.col(|ui| { ui.label(&r.name); });
+                                        row.col(|ui| { ui.label(&r.baominghao); });
+                                        row.col(|ui| { ui.label(&r.shenfenzheng); });
+                                        row.col(|ui| { ui.label(&r.kemumingcheng); });
+                                        row.col(|ui| { ui.label(&r.kaodianmingcheng); });
+                                        row.col(|ui| {
+                                            match &r.status {
+                                                QueryStatus::Success => {
+                                                    ui.label(egui::RichText::new("✅ 成功").color(egui::Color32::GREEN));
+                                                }
+                                                QueryStatus::Failed(e) => {
+                                                    ui.label(egui::RichText::new(format!("❌ {}", e)).color(egui::Color32::RED));
+                                                }
+                                                _ => {}
                                             }
-                                            QueryStatus::Failed(e) => {
-                                                ui.label(egui::RichText::new(format!("❌ {}", e)).color(egui::Color32::RED));
-                                            }
-                                            _ => {}
-                                        }
-                                    });
-                                }
+                                        });
+                                    }
+                                });
                             });
-                        });
-                });
+                    });
 
-                ui.add_space(8.0);
-                if ui.button("💾 保存结果到文件").clicked() {
-                    self.save_results();
-                }
+                    ui.add_space(8.0);
+                    if ui.button("💾 保存结果到文件").clicked() {
+                        self.save_results();
+                    }
+                });
             }
 
             if self.query_state == QueryState::Running || self.query_state == QueryState::Paused {
