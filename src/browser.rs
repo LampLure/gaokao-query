@@ -52,7 +52,9 @@ impl BrowserClient {
             .arg("--disable-blink-features=AutomationControlled");
 
         if hide_browser {
-            builder = builder.arg("--window-position=10000,10000");
+            builder = builder.arg("--window-size=1280,720");
+            builder = builder.arg("--window-position=-32000,-32000");
+            builder = builder.arg("--start-minimized");
         }
 
         let config = builder.build()
