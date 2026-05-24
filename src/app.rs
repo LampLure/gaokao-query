@@ -910,71 +910,85 @@ impl GaokaoApp {
                 }
             };
 
+            let mut handles = Vec::new();
             for record in &matched {
                 if *cancel.lock().await { break; }
 
-                {
-                    let mut p = progress.lock().await;
-                    p.current_name = record.name.clone();
-                }
+                let pool = pool.clone();
+                let results = results.clone();
+                let progress = progress.clone();
+                let cancel = cancel.clone();
+                let logs = logs.clone();
+                let record = record.clone();
+                let delay = delay;
 
-                let candidates = if record.shenfenzheng_candidates.is_empty() {
-                    vec![String::new()]
-                } else {
-                    record.shenfenzheng_candidates.clone()
-                };
+                handles.push(tokio::spawn(async move {
+                    if *cancel.lock().await { return; }
 
-                let mut ok = false;
-                let mut last_err = String::new();
+                    {
+                        let mut p = progress.lock().await;
+                        p.current_name = record.name.clone();
+                    }
 
-                for (ci, sfz) in candidates.iter().enumerate() {
-                    if *cancel.lock().await { break; }
+                    let candidates = if record.shenfenzheng_candidates.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        record.shenfenzheng_candidates.clone()
+                    };
 
-                    let bkh = record.baominghao.clone();
-                    let id = sfz.clone();
-                    let pool = pool.clone();
+                    let mut ok = false;
+                    let mut last_err = String::new();
 
-                    let (permit, client) = pool.acquire().await;
-                    let result = client.query_single(&bkh, &id).await;
-                    pool.release(permit, client);
+                    for (ci, sfz) in candidates.iter().enumerate() {
+                        if *cancel.lock().await { break; }
 
-                    match result {
-                        Ok(mut r) => {
-                            r.shenfenzheng = sfz.clone();
-                            let mut r_lock = results.lock().await;
-                            r_lock.push(r);
-                            ok = true;
-                            break;
+                        let (permit, client) = pool.acquire().await;
+
+                        if ci > 0 {
+                            let _ = client.go_home().await;
                         }
-                        Err(e) => {
-                            last_err = format!("候选{}失败: {}", ci + 1, e);
-                            continue;
+
+                        let result = client.query_single(&record.baominghao, sfz).await;
+                        pool.release(permit, client);
+
+                        match result {
+                            Ok(mut r) => {
+                                r.shenfenzheng = sfz.clone();
+                                let mut r_lock = results.lock().await;
+                                r_lock.push(r);
+                                ok = true;
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = format!("候选{}失败: {}", ci + 1, e);
+                                continue;
+                            }
                         }
                     }
-                }
 
-                if !ok {
-                    let mut r_lock = results.lock().await;
-                    r_lock.push(QueryResult {
-                        name: record.name.clone(),
-                        baominghao: record.baominghao.clone(),
-                        shenfenzheng: String::new(),
-                        kemumingcheng: String::new(),
-                        kaodianmingcheng: String::new(),
-                        status: QueryStatus::Failed(last_err.clone()),
-                        error: last_err.clone(),
-                    });
-                }
+                    if !ok {
+                        let mut r_lock = results.lock().await;
+                        r_lock.push(QueryResult {
+                            name: record.name.clone(),
+                            baominghao: record.baominghao.clone(),
+                            shenfenzheng: String::new(),
+                            kemumingcheng: String::new(),
+                            kaodianmingcheng: String::new(),
+                            status: QueryStatus::Failed(last_err.clone()),
+                            error: last_err.clone(),
+                        });
+                    }
 
-                {
-                    let mut p = progress.lock().await;
-                    p.completed += 1;
-                    if ok { p.success += 1; } else { p.failed += 1; }
-                }
+                    {
+                        let mut p = progress.lock().await;
+                        p.completed += 1;
+                        if ok { p.success += 1; } else { p.failed += 1; }
+                    }
 
-                if delay > 0 && !*cancel.lock().await {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
+                    if delay > 0 && !*cancel.lock().await {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    }
+                }));
             }
         });
     }
