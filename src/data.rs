@@ -140,12 +140,12 @@ pub enum PredictedStatus {
 
 #[derive(Debug, Clone, Default)]
 pub struct PredictionProgress {
-    pub total: usize,
-    pub matched: usize,
-    pub not_found: usize,
+    pub total: usize,       // 当前班级总人数
+    pub matched: usize,     // 已成功匹配人数
+    pub not_found: usize,   // 扫射完仍未找到的人数
     pub current_name: String,
     pub current_exam: String,
-    pub current_batch: String,
+    pub current_batch: String, // 用于 UI 实时显示："[雷达阶段] 正在探测考号: ..." 或 "[扫射阶段] ..."
 }
 
 #[derive(Debug, Clone)]
