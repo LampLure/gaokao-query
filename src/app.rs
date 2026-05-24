@@ -146,7 +146,7 @@ impl eframe::App for GaokaoApp {
                 .resizable(true)
                 .vscroll(true)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::vertical().id_source("debug_logs")
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
@@ -216,8 +216,8 @@ impl eframe::App for GaokaoApp {
                 )).strong());
                 ui.add_space(4.0);
 
-                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                    TableBuilder::new(ui)
+                egui::ScrollArea::vertical().id_source("matched_table").max_height(180.0).show(ui, |ui| {
+                    TableBuilder::new(ui).id_source("matched")
                         .striped(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                         .column(Column::auto().resizable(true))
@@ -339,8 +339,8 @@ impl eframe::App for GaokaoApp {
                 ui.label(egui::RichText::new("📊 查询结果").strong());
                 ui.add_space(4.0);
 
-                egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                    TableBuilder::new(ui)
+                egui::ScrollArea::vertical().id_source("results_table").max_height(200.0).show(ui, |ui| {
+                    TableBuilder::new(ui).id_source("results")
                         .striped(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                         .column(Column::auto().resizable(true))
