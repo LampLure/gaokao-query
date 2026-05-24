@@ -67,7 +67,7 @@ async fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| {
             configure_fonts(cc);
-            Ok(Box::new(app::GaokaoApp::default()))
+            Ok(Box::new(app::GaokaoApp::new()))
         }),
     )
 }

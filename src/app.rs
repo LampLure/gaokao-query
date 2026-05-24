@@ -47,10 +47,10 @@ pub struct QueryProgress {
     pub current_name: String,
 }
 
-impl Default for GaokaoApp {
-    fn default() -> Self {
+impl GaokaoApp {
+    pub fn new() -> Self {
         let cfg = config::load();
-        Self {
+        let mut app = Self {
             baokao_path: if cfg.baokao_path.is_empty() { None } else { Some(cfg.baokao_path.clone()) },
             sfz_path: if cfg.sfz_path.is_empty() { None } else { Some(cfg.sfz_path.clone()) },
             config: cfg.clone(),
@@ -67,7 +67,12 @@ impl Default for GaokaoApp {
             debug_logs: Arc::new(Mutex::new(Vec::new())),
             displayed_logs: Vec::new(),
             cancel_flag: Arc::new(Mutex::new(false)),
+        };
+        // auto-parse if saved paths exist
+        if app.baokao_path.is_some() && app.sfz_path.is_some() {
+            app.parse_and_match();
         }
+        app
     }
 }
 
