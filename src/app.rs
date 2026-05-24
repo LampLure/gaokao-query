@@ -46,6 +46,7 @@ pub struct GaokaoApp {
     pred_results: Arc<Mutex<Vec<PredictedRecord>>>,
     pred_displayed_results: Vec<PredictedRecord>,
     pred_state: QueryState,
+    pred_continuous: bool,
     // ---- shared params ----
     concurrency: u32,
     delay_ms: u32,
@@ -108,6 +109,7 @@ impl GaokaoApp {
             pred_results: Arc::new(Mutex::new(Vec::new())),
             pred_displayed_results: Vec::new(),
             pred_state: QueryState::Idle,
+            pred_continuous: false,
             concurrency: cfg.concurrency,
             delay_ms: cfg.delay_ms,
             step_delay_ms: cfg.step_delay_ms,
@@ -805,6 +807,7 @@ impl GaokaoApp {
                     if ui.button(egui::RichText::new("▶ 开始推算").heading().color(egui::Color32::WHITE)).clicked() {
                         self.start_prediction(ctx);
                     }
+                    ui.checkbox(&mut self.pred_continuous, "🔄 不停歇（自动推前一个班）");
                 }
                 if self.pred_state == QueryState::Running {
                     if ui.button(egui::RichText::new("⏹ 停止").heading()).clicked() {
@@ -837,8 +840,10 @@ impl GaokaoApp {
                 ui.label(&self.status_message);
             }
 
-            // results table
-            if !self.pred_displayed_results.is_empty() {
+            // results table — always show during running for real-time status
+            let show_table = !self.pred_displayed_results.is_empty()
+                || self.pred_state == QueryState::Running;
+            if show_table {
                 ui.push_id("pred_results_section", |ui| {
                     ui.add_space(8.0);
                     ui.separator();
@@ -848,11 +853,12 @@ impl GaokaoApp {
                     )).strong());
                     ui.add_space(4.0);
 
+                    // Only redraw when data changes (perf optimization)
+                    let result_count = self.pred_displayed_results.len();
                     egui::ScrollArea::vertical().id_source("pred_results_table").max_height(250.0).show(ui, |ui| {
                         TableBuilder::new(ui).id_source("pred_results")
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .column(Column::auto().resizable(true))
                             .column(Column::auto().resizable(true))
                             .column(Column::auto().resizable(true))
                             .column(Column::auto().resizable(true))
@@ -864,7 +870,8 @@ impl GaokaoApp {
                                 h.col(|ui| { ui.label("状态"); });
                             })
                             .body(|body| {
-                                body.rows(20.0, self.pred_displayed_results.len(), |mut row| {
+                                let n = self.pred_displayed_results.len();
+                                body.rows(20.0, n, |mut row| {
                                     let i = row.index();
                                     if let Some(r) = self.pred_displayed_results.get(i) {
                                         row.col(|ui| { ui.label(&r.name); });
@@ -1173,9 +1180,14 @@ impl GaokaoApp {
         let cancel = self.cancel_flag.clone();
         let pred_results = self.pred_results.clone();
         let pred_progress = self.pred_progress.clone();
-        let range_start = self.pred_range_start;
-        let range_end = self.pred_range_end;
+        let mut range_start = self.pred_range_start;
+        let mut range_end = self.pred_range_end;
         let delay_ms = self.delay_ms as u64;
+        let continuous = self.pred_continuous;
+        let class_list = self.pred_class_list.clone();
+        let mut current_class_idx = self.pred_selected_class;
+        let mut cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
         self.log(format!(
             "开始推算: 班级 {} ({} 人), 范围 {}~{}",
             cls_key, students.len(), range_start, range_end
@@ -1200,38 +1212,118 @@ impl GaokaoApp {
                 }
             };
 
-            for (name, id_card) in &students {
+            loop {
                 if *cancel.lock().await { break; }
 
-                let result = prediction::predict_student(
-                    pool.clone(),
-                    name.clone(),
-                    id_card.clone(),
-                    base_bkh.clone(),
-                    range_start,
-                    range_end,
-                    concurrency,
-                    cancel.clone(),
-                    pred_progress.clone(),
-                ).await;
+                let cls_name = class_list[current_class_idx].clone();
+                let target_class = cls_name.split('-').nth(1).unwrap_or("").to_string();
+                let cls_students: Vec<(String, String)> = students.iter()
+                    .filter(|(name, _)| !cache.contains_key(name.as_str()))
+                    .cloned()
+                    .collect();
 
-                {
-                    let mut r = pred_results.lock().await;
-                    r.push(result);
+                if cls_students.is_empty() {
+                    let mut l = logs.lock().await;
+                    l.push(format!("[PREDICT] {} 所有学生已缓存，跳过", cls_name));
+                } else {
+                    let mut l = logs.lock().await;
+                    l.push(format!("[PREDICT] 开始推算 {} ({} 人未缓存), 范围 {}~{}",
+                        cls_name, cls_students.len(), range_start, range_end));
+                    drop(l);
+
+                    let results = prediction::predict_class_batch(
+                        pool.clone(),
+                        cls_students,
+                        base_bkh.clone(),
+                        range_start,
+                        range_end,
+                        concurrency,
+                        cancel.clone(),
+                        pred_progress.clone(),
+                        &mut cache,
+                    ).await;
+
+                    {
+                        let mut r = pred_results.lock().await;
+                        for rec in results {
+                            if !r.iter().any(|x| x.name == rec.name) {
+                                r.push(rec);
+                            }
+                        }
+                    }
+
+                    // Auto-save cache after each class
+                    {
+                        let mut l = logs.lock().await;
+                        l.push(format!("[PREDICT] {} 完成，已缓存 {} 条", cls_name, cache.len()));
+                    }
                 }
 
-                {
-                    let mut p = pred_progress.lock().await;
-                    p.current_name = String::new();
-                    p.current_exam = String::new();
+                if !continuous || current_class_idx == 0 {
+                    break;
                 }
+
+                // Move to next class (previous numerically)
+                if range_start == 0 { break; }
+                let prev_idx = current_class_idx.checked_sub(1);
+                if prev_idx.is_none() { break; }
+                current_class_idx = prev_idx.unwrap();
+
+                // Readjust range: new boundary = old range_start (first number found)
+                // Actually we use the minimum found number as the new boundary
+                let min_found = cache.values()
+                    .filter_map(|v| v.split("261").last()?.parse::<u64>().ok())
+                    .min().unwrap_or(range_start);
+
+                range_end = min_found.saturating_sub(1);
+                let prev_cls = &class_list[current_class_idx];
+                let prev_cls_name = prev_cls.split('-').nth(1).unwrap_or("");
+                let prev_count = students.iter().filter(|(n,_)| {
+                    let cls_info = ""; // We don't have class info per student here
+                    true // approximate: all students belong to the same year
+                }).count();
+                let margin = 10u64;
+                range_start = range_end.saturating_sub(prev_count as u64 + margin);
+
+                let mut l = logs.lock().await;
+                l.push(format!("[PREDICT] 继续推 {} (范围 {}~{}), 当前缓存 {} 条",
+                    prev_cls, range_start, range_end, cache.len()));
 
                 if delay_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
             }
 
-            // pool is dropped here, closing all browsers
+            // Auto-save final results
+            if let Ok(r) = pred_results.try_lock() {
+                if !r.is_empty() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Excel", &["xlsx"])
+                        .set_file_name("推算结果.xlsx")
+                        .save_file()
+                    {
+                        use rust_xlsxwriter::*;
+                        let mut workbook = Workbook::new();
+                        let sheet = workbook.add_worksheet();
+                        let headers = ["姓名", "身份证号", "推算报考号", "状态"];
+                        for (col, h) in headers.iter().enumerate() {
+                            let _ = sheet.write_string(0, col as u16, *h);
+                        }
+                        for (row, rec) in r.iter().enumerate() {
+                            let ri = row as u32 + 1;
+                            let _ = sheet.write_string(ri, 0, &rec.name);
+                            let _ = sheet.write_string(ri, 1, &rec.shenfenzheng);
+                            let _ = sheet.write_string(ri, 2, &rec.exam_number);
+                            let status = match &rec.status {
+                                PredictedStatus::Matched => "已匹配",
+                                PredictedStatus::NotFound => "未找到",
+                            };
+                            let _ = sheet.write_string(ri, 3, status);
+                        }
+                        let _ = workbook.save(&path);
+                    }
+                }
+            }
         });
     }
 

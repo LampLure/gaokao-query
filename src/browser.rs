@@ -454,7 +454,6 @@ impl BrowserClient {
                     self.perf_event("OCR完成");
                     r
                 }
-                Ok(r) => r,
                 Err(e) => {
                     self.log_msg(&format!("OCR失败: {}, 准备重试", e));
                     // Save failed captcha for debugging

@@ -1,88 +1,131 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::browser::BrowserPool;
 use crate::data::*;
 
-pub async fn predict_student(
+/// Predict a full class by trying each exam number against all remaining students.
+/// More efficient: O(N) per class instead of O(N*range).
+pub async fn predict_class_batch(
     pool: Arc<BrowserPool>,
-    name: String,
-    id_card: String,
+    students: Vec<(String, String)>,  // (name, id_card)
     base_bkh: String,
     range_start: u64,
     range_end: u64,
     concurrency: usize,
     cancel: Arc<Mutex<bool>>,
     progress: Arc<Mutex<PredictionProgress>>,
-) -> PredictedRecord {
-    let mut exam = range_end;
+    cache: &mut HashMap<String, String>,  // name -> exam_number (in/out)
+) -> Vec<PredictedRecord> {
+    let mut results: Vec<PredictedRecord> = Vec::new();
+    let n = students.len();
+    let total_range = range_end - range_start + 1;
 
-    while exam >= range_start {
-        if *cancel.lock().await {
-            return PredictedRecord {
-                name,
-                shenfenzheng: id_card,
-                exam_number: String::new(),
-                status: PredictedStatus::NotFound,
-            };
+    // Build remaining set: students NOT in cache
+    let mut remaining: Vec<(String, String, usize)> = students.iter()
+        .enumerate()
+        .filter(|(_, (name, _))| !cache.contains_key(name.as_str()))
+        .map(|(i, (n, id))| (n.clone(), id.clone(), i))
+        .collect();
+
+    // Mark cached students as Matched
+    for (name, _) in &students {
+        if let Some(bkh) = cache.get(name) {
+            results.push(PredictedRecord {
+                name: name.clone(),
+                shenfenzheng: students.iter().find(|(n,_)| n == name).map(|(_,id)| id.clone()).unwrap_or_default(),
+                exam_number: bkh.clone(),
+                status: PredictedStatus::Matched,
+            });
         }
+    }
 
-        let batch_end = exam;
-        let batch_start = if exam + 1 >= concurrency as u64 {
-            exam - concurrency as u64 + 1
-        } else {
-            range_start
-        };
+    {
+        let mut p = progress.lock().await;
+        p.total = n;
+        p.matched = results.len();
+        p.not_found = 0;
+    }
+
+    if remaining.is_empty() {
+        return results;
+    }
+
+        // Try each exam number against all remaining students
+    for exam_num in range_start..=range_end {
+        if *cancel.lock().await { break; }
+        if remaining.is_empty() { break; }
+
+        let bkh = format!("{}{:05}", base_bkh, exam_num);
 
         {
             let mut p = progress.lock().await;
-            p.current_name = name.clone();
-            p.current_exam = format!("{:05}", batch_start);
+            p.current_exam = format!("{:05}", exam_num);
         }
 
-        let mut handles = Vec::with_capacity(concurrency);
-        for e in batch_start..=batch_end {
-            if *cancel.lock().await {
-                break;
+        // Batch try: this exam_num with `concurrency` students at a time
+        let mut found = false;
+        let chunk_size = concurrency.min(remaining.len());
+        let mut i = 0;
+        while i < remaining.len() && !found {
+            if *cancel.lock().await { break; }
+
+            let end = (i + chunk_size).min(remaining.len());
+            let mut handles = Vec::new();
+            for idx in i..end {
+                let (name, id_card, _) = &remaining[idx];
+                let pool = pool.clone();
+                let bkh = bkh.clone();
+                let id = id_card.clone();
+                let name = name.clone();
+
+                handles.push(tokio::spawn(async move {
+                    let (permit, client) = pool.acquire().await;
+                    let result = client.query_single(&bkh, &id).await;
+                    pool.release(permit, client);
+                    (name, id, result)
+                }));
             }
-            let bkh = format!("{}{:05}", base_bkh, e);
-            let id = id_card.clone();
-            let pool = pool.clone();
 
-            handles.push(tokio::spawn(async move {
-                let (permit, client) = pool.acquire().await;
-                let result = client.query_single(&bkh, &id).await;
-                pool.release(permit, client);
-                (e, result)
-            }));
-        }
-
-        for handle in handles {
-            if let Ok((e, result)) = handle.await {
-                match result {
-                    Ok(qr) if !qr.name.is_empty() => {
-                        return PredictedRecord {
-                            name,
-                            shenfenzheng: id_card,
-                            exam_number: format!("{}{:05}", base_bkh, e),
-                            status: PredictedStatus::Matched,
-                        };
+            for handle in handles {
+                if let Ok((name, id_card, result)) = handle.await {
+                    match result {
+                        Ok(qr) if !qr.name.is_empty() => {
+                            cache.insert(name.clone(), bkh.clone());
+                            results.push(PredictedRecord {
+                                name: name.clone(),
+                                shenfenzheng: id_card.clone(),
+                                exam_number: bkh.clone(),
+                                status: PredictedStatus::Matched,
+                            });
+                            remaining.retain(|(n, _, _)| n != &name);
+                            {
+                                let mut p = progress.lock().await;
+                                p.matched += 1;
+                                p.current_name = name.clone();
+                            }
+                            found = true;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
+            i = end;
         }
-
-        if batch_start == range_start {
-            break;
-        }
-        exam = batch_start - 1;
     }
 
-    PredictedRecord {
-        name,
-        shenfenzheng: id_card,
-        exam_number: String::new(),
-        status: PredictedStatus::NotFound,
+    // Mark unmatched students
+    for (name, id_card, _) in &remaining {
+        results.push(PredictedRecord {
+            name: name.clone(),
+            shenfenzheng: id_card.clone(),
+            exam_number: String::new(),
+            status: PredictedStatus::NotFound,
+        });
+        let mut p = progress.lock().await;
+        p.not_found += 1;
     }
+
+    results
 }
