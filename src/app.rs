@@ -101,8 +101,8 @@ impl GaokaoApp {
             pred_class_list: Vec::new(),
             pred_selected_class: 0,
             pred_year_filter: 2023.0,
-            pred_boundary_str: String::new(),
-            pred_boundary: 0,
+            pred_boundary_str: cfg.pred_boundary.clone(),
+            pred_boundary: cfg.pred_boundary.parse().unwrap_or(0),
             pred_range_start: 0,
             pred_range_end: 0,
             pred_search_margin: 10,
@@ -157,6 +157,7 @@ impl GaokaoApp {
         self.config.sfz_path = self.sfz_path.as_ref().cloned().unwrap_or_default();
         self.config.pred_sfz_path = self.pred_sfz_path.as_ref().cloned().unwrap_or_default();
         self.config.pred_bkh_path = self.pred_bkh_path.as_ref().cloned().unwrap_or_default();
+        self.config.pred_boundary = self.pred_boundary_str.clone();
         self.config.target_url = self.target_url.clone();
         self.config.concurrency = self.concurrency;
         self.config.delay_ms = self.delay_ms;
