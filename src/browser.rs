@@ -64,17 +64,12 @@ impl BrowserClient {
     }
 
     async fn sleep_step(&self, factor: f64) {
-        let ms = if self.turbo {
-            50u64
-        } else {
-            (self.step_delay_ms as f64 * factor) as u64
-        };
+        let ms = (self.step_delay_ms as f64 * factor) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(ms.max(50))).await;
     }
 
     async fn sleep_critical(&self, ms: u64) {
-        let actual = if self.turbo { ms.min(500) } else { ms };
-        tokio::time::sleep(std::time::Duration::from_millis(actual)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 
     pub async fn new_with_log(
@@ -500,16 +495,10 @@ impl BrowserClient {
                 self.sleep_step(0.3).await;
             }
 
-            // Poll for captcha modal to close or result to appear (15s timeout)
+            // Server verification takes time - wait then check
+            self.sleep_critical(2000).await;
+
             self.perf_event("验证码点击完成");
-            self.poll_true(page,
-                r#"(function() {
-                    const m = document.getElementById('captchaModal');
-                    const r = document.querySelector('[data-value="xm"]');
-                    const a = document.getElementById('alertModal');
-                    if (m && !m.classList.contains('hidden')) return false;
-                    return (r && r.textContent.trim()) || (a && !a.classList.contains('hidden'));
-                })()"#, 15000).await;
 
             // After poll, check current state
             let still_visible: bool = page.evaluate_expression(
