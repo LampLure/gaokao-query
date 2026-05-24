@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Command;
 
 pub struct ClickPoint {
@@ -10,6 +11,11 @@ pub struct OcrResult {
     pub debug_info: String,
 }
 
+fn python_path() -> PathBuf {
+    let venv = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".venv").join("bin").join("python3");
+    if venv.exists() { venv } else { PathBuf::from("python3") }
+}
+
 pub fn solve_captcha(
     image_path: &str,
     expected_chars: &[String],
@@ -17,7 +23,7 @@ pub fn solve_captcha(
     _container_height: f64,
 ) -> Result<OcrResult, String> {
     let expected = expected_chars.join(" ");
-    let output = Command::new("python3")
+    let output = Command::new(python_path())
         .arg("ocr_helper.py")
         .arg(image_path)
         .arg(&expected)
