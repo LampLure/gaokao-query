@@ -795,15 +795,15 @@ impl GaokaoApp {
 
             ui.add_space(4.0);
 
-            // 盲推锚点定位状态提示（替换原有的边界输入框）
+            // 无边界盲推引擎状态提示
             ui.horizontal(|ui| {
-                ui.label("🛰️ 盲推锚点定位：");
+                ui.label("🛰️ 无边界盲推引擎：");
                 if self.pred_boundary > 0 {
-                    ui.label(egui::RichText::new(format!("已自动定位初始锚点考号尾数：{}", self.pred_boundary)).color(egui::Color32::GREEN));
+                    ui.label(egui::RichText::new(format!("已通过已知表格串号分析自动锚定首个考号尾数：{}", self.pred_boundary)).color(egui::Color32::GREEN));
                 } else if !self.pred_known_bkh.is_empty() {
-                    ui.label("正在解析主串号群...");
+                    ui.label("正在扫描计算主串号群群首...");
                 } else {
-                    ui.label(egui::RichText::new("请先加载【已知报考号表格】以获取启动锚点").color(egui::Color32::YELLOW));
+                    ui.label(egui::RichText::new("请先加载【已知报考号表格】以激活自动定位锚点").color(egui::Color32::YELLOW));
                 }
             });
 
@@ -885,7 +885,6 @@ impl GaokaoApp {
                     ui.add_space(4.0);
 
                     // Only redraw when data changes (perf optimization)
-                    let _result_count = self.pred_displayed_results.len();
                     egui::ScrollArea::vertical().id_source("pred_results_table").max_height(250.0).show(ui, |ui| {
                         TableBuilder::new(ui).id_source("pred_results")
                             .striped(true)
@@ -1170,9 +1169,9 @@ impl GaokaoApp {
 // 报考号推算 逻辑
 // ============================================================
 impl GaokaoApp {
-    fn start_prediction(&mut self, _ctx: &egui::Context) {
+    fn start_prediction(&mut self, ctx: &egui::Context) {
         if self.pred_boundary == 0 {
-            self.status_message = "未知报考号表格为空，无法定位雷达启动锚点".to_string();
+            self.status_message = "未知报考号表格为空，无法自动化定位雷达启动锚点".to_string();
             return;
         }
 
@@ -1197,16 +1196,14 @@ impl GaokaoApp {
         let delay_ms = self.delay_ms as u64;
         let continuous = self.pred_continuous;
         
-        // 基础学生全量库（供自动跨班时筛选）
         let all_sfz_records = self.pred_sfz_records.clone();
         let class_list = self.pred_class_list.clone();
         let mut current_class_idx = self.pred_selected_class;
         
-        // 动态雷达初始锚点
+        // 动态雷达自适应运行锚点
         let mut radar_anchor = self.pred_boundary;
 
         tokio::spawn(async move {
-            // 1. 初始化高并发浏览器池
             let pool = match crate::browser::BrowserPool::new(
                 concurrency, hide_browser, step_delay, captcha_retries, captcha_wait_ms,
                 &target_url, Some(logs.clone()), turbo,
@@ -1219,7 +1216,7 @@ impl GaokaoApp {
                 }
             };
 
-            // 跨班级级联多米诺循环
+            // 自动化多米诺连推级联循环
             loop {
                 if *cancel.lock().await { break; }
                 if current_class_idx >= class_list.len() { break; }
@@ -1228,7 +1225,7 @@ impl GaokaoApp {
                 let target_class = cls_name.split('-').nth(1).unwrap_or("").to_string();
                 let target_year = cls_name.split('-').nth(0).unwrap_or("").parse::<f64>().unwrap_or(2023.0) as u32;
 
-                // 提取当前要攻克的预备班级全体学生（按身份证名单）
+                // 获取该班级的全体学生的身份证预备队列
                 let mut students: Vec<(String, String)> = all_sfz_records.iter()
                     .filter(|r| {
                         let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
@@ -1241,8 +1238,6 @@ impl GaokaoApp {
                     .collect();
 
                 if students.is_empty() {
-                    let mut l = logs.lock().await;
-                    l.push(format!("[跳过] 班级 {} 没有学生数据", cls_name));
                     if continuous && current_class_idx > 0 {
                         current_class_idx -= 1;
                         continue;
@@ -1258,19 +1253,18 @@ impl GaokaoApp {
 
                 let mut l = logs.lock().await;
                 l.push(format!("=================================================="));
-                l.push(format!("[🔥开始攻克] 目标班级：{} | 全班总人数：{}人", cls_name, class_size));
+                l.push(format!("[🔥开始盲推] 当前攻克班级：{} | 全班总人数：{}人", cls_name, class_size));
                 drop(l);
 
-                // ====================================================
-                // 阶段一：动态雷达盲推探测 (基于班级人数砍半平分算法)
-                // ====================================================
+                // ----------------------------------------------------
+                // 第一阶段：分布式大步长雷达盲推（覆盖性探测，不容易踩空）
+                // ----------------------------------------------------
                 let search_span = class_size / 2;
                 let radar_step = (search_span / 3).max(1) as u64;
 
                 let mut base_hit_bkh: Option<u64> = None;
                 let mut current_radar_base = radar_anchor;
 
-                // 雷达推进死循环，直到撞中基地，或被外部取消
                 loop {
                     if *cancel.lock().await { break; }
 
@@ -1281,17 +1275,12 @@ impl GaokaoApp {
 
                     let probes = vec![(probe_1, 1), (probe_2, 2), (probe_3, 3)];
                     
-                    let mut l = logs.lock().await;
-                    l.push(format!("[雷达组装] 步长={}, 正在发射探针群：[#{}]-{}, [#{}]-{}, [#{}]-{}", 
-                        radar_step, probes[0].1, probes[0].0, probes[1].1, probes[1].0, probes[2].1, probes[2].0));
-                    drop(l);
-
                     {
                         let mut p = pred_progress.lock().await;
-                        p.current_batch = format!("[雷达阶段] 正在用探针号群 [{}, {}, {}] 广播全班...", probe_1, probe_2, probe_3);
+                        p.current_batch = format!("[雷达阶段] 步长：{}, 发射分布式探针号：[{}, {}, {}]", radar_step, probe_1, probe_2, probe_3);
                     }
 
-                    if let Some((hit_bkh, hit_probe_depth)) = crate::prediction::run_radar_probes(
+                    if let Some((hit_bkh, depth_label)) = crate::prediction::run_radar_probes(
                         pool.clone(),
                         &students,
                         &base_bkh,
@@ -1301,38 +1290,38 @@ impl GaokaoApp {
                         logs.clone()
                     ).await {
                         base_hit_bkh = Some(hit_bkh);
-                        
                         let mut l = logs.lock().await;
-                        l.push(format!("🎉 [雷达回波成功!] 撞中基地考号：{}{} (来自#{}号探针)", base_bkh, hit_bkh, hit_probe_depth));
+                        l.push(format!("🎉 [基地捕获!] 成功撞中基地有效号尾数：{} (来自 #{} 号探针)", hit_bkh, depth_label));
                         drop(l);
                         break;
                     }
 
                     if next_radar_base == 0 || next_radar_base == current_radar_base {
                         let mut l = logs.lock().await;
-                        l.push(format!("[警告] 雷达探测已达尾数 0 极限，未发现任何匹配，班级推算被迫挂起"));
+                        l.push(format!("[中断] 考号向下探查已达物理 0 值极限，未能捕捉到新班级入口。"));
                         break;
                     }
                     current_radar_base = next_radar_base;
                 }
 
-                // ====================================================
-                // 阶段二：基地锁定后的【大规模矩阵扫射清洗】
-                // ====================================================
+                // ----------------------------------------------------
+                // 第二阶段：基地锁定后的【矩阵式一网打尽扫射清洗】
+                // ----------------------------------------------------
                 if let Some(hit_number) = base_hit_bkh {
+                    // 安全生成能够完全包围包含全班大部分人的无序纯连续珍珠串号池
                     let scan_start = hit_number.saturating_sub(class_size as u64 + 25);
-                    let scan_end = hit_number + 45;
+                    let scan_end = hit_number + 45; 
                     
                     let mut bkh_pool: Vec<u64> = (scan_start..=scan_end).collect();
-                    bkh_pool.reverse();
+                    bkh_pool.reverse(); 
 
                     let mut l = logs.lock().await;
-                    l.push(format!("[扫射准备] 锁定全班考号滑窗区间：{} ~ {} (共 {} 个预备号)", scan_start, scan_end, bkh_pool.len()));
+                    l.push(format!("[矩阵扫射] 部署全班高密度洗刷范围：{} ~ {} (共部署 {} 组流水号)", scan_start, scan_end, bkh_pool.len()));
                     drop(l);
 
                     let class_results = crate::prediction::run_matrix_sweep(
                         pool.clone(),
-                        &mut students,
+                        &mut students, 
                         &base_bkh,
                         bkh_pool,
                         concurrency,
@@ -1356,14 +1345,15 @@ impl GaokaoApp {
                         }
                     }
 
-                    // ====================================================
-                    // 阶段三：多米诺骨牌跨班滚动准备
-                    // ====================================================
+                    // ----------------------------------------------------
+                    // 第三阶段：多米诺骨牌跨班级级联向前滚动
+                    // ----------------------------------------------------
                     if continuous && current_class_idx > 0 {
                         if min_resolved_bkh != u64::MAX {
+                            // 新班级的启动探针锚点 = 本班洗出的真实考号最小值 - 1
                             radar_anchor = min_resolved_bkh.saturating_sub(1);
                             let mut l = logs.lock().await;
-                            l.push(format!("🔄 [自动跨班推进] 本班清洗完毕，提取全班最小号尾数 {}，设定新雷达锚点为：{}，准备攻克上一个班级...", min_resolved_bkh, radar_anchor));
+                            l.push(format!("🔄 [连推模式触发] 班级攻克成功。全班考号极小尾数：{}，自动衍生下一班级雷达锚点为：{}，向前推进中...", min_resolved_bkh, radar_anchor));
                         } else {
                             radar_anchor = current_radar_base.saturating_sub(class_size as u64);
                         }
@@ -1375,11 +1365,11 @@ impl GaokaoApp {
                     }
                 }
 
-                break;
+                break; 
             }
             
             let mut l = logs.lock().await;
-            l.push(format!("🏁 所有可预测推算任务全部结束。"));
+            l.push(format!("🏁 所有的自动化可预测盲推流程全部收工。"));
         });
     }
 
