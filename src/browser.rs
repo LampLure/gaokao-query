@@ -20,6 +20,7 @@ pub struct BrowserClient {
     log: Option<Arc<Mutex<Vec<String>>>>,
     step_delay_ms: u64,
     captcha_retries: u32,
+    captcha_wait_ms: u64,
 }
 
 impl BrowserClient {
@@ -37,10 +38,14 @@ impl BrowserClient {
         log: Option<Arc<Mutex<Vec<String>>>>,
         step_delay_ms: u64,
         captcha_retries: u32,
+        captcha_wait_ms: u64,
         hide_browser: bool,
     ) -> Result<Self, String> {
         let chrome_path = find_chrome()
             .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
+
+        let chrome_name = chrome_path.file_stem()
+            .and_then(|s| s.to_str()).unwrap_or("chrome").to_string();
 
         let instance_id = INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
         let user_data_dir = format!("/tmp/chromiumoxide-runner-{}", instance_id);
@@ -69,6 +74,24 @@ impl BrowserClient {
         let browser_clone = browser.clone();
         tokio::spawn(async move { loop { let _ = handler.next().await; } });
 
+        // On Linux, try to hide/minimize Chrome window via external tools
+        if hide_browser {
+            let cn = chrome_name.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                for args in &[
+                    vec!["search", "--name", &cn, "windowminimize"],
+                    vec!["search", "--class", &cn, "windowminimize"],
+                    vec!["search", "--name", "chromium", "windowminimize"],
+                    vec!["search", "--class", "chromium-browser", "windowminimize"],
+                ] {
+                    let _ = std::process::Command::new("xdotool").args(args).output();
+                }
+                let _ = std::process::Command::new("wmctrl")
+                    .args(["-a", &cn, "-b", "add,hidden"]).output();
+            });
+        }
+
         let page = browser_clone
             .new_page(TARGET_URL)
             .await
@@ -82,6 +105,7 @@ impl BrowserClient {
             log,
             step_delay_ms,
             captcha_retries,
+            captcha_wait_ms,
         })
     }
 
@@ -231,7 +255,7 @@ impl BrowserClient {
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
             // Wait for captcha image to render before polling
-            Self::sleep_critical(2000).await;
+            Self::sleep_critical(self.captcha_wait_ms).await;
 
             // Get captcha image (wait for it to actually load)
             let img_src: String = {

@@ -67,6 +67,7 @@ pub struct AppConfig {
     pub delay_ms: u32,
     pub step_delay_ms: u32,
     pub captcha_retries: u32,
+    pub captcha_wait_ms: u32,
     pub hide_browser: bool,
     pub debug_mode: bool,
 }
@@ -80,6 +81,7 @@ impl Default for AppConfig {
             delay_ms: 2000,
             step_delay_ms: 1000,
             captcha_retries: 5,
+            captcha_wait_ms: 2000,
             hide_browser: true,
             debug_mode: false,
         }

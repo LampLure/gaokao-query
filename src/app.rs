@@ -30,6 +30,7 @@ pub struct GaokaoApp {
     delay_ms: u32,
     step_delay_ms: u32,
     captcha_retries: u32,
+    captcha_wait_ms: u32,
     progress: Arc<Mutex<QueryProgress>>,
     status_message: String,
     // debug
@@ -66,6 +67,7 @@ impl GaokaoApp {
             delay_ms: cfg.delay_ms,
             step_delay_ms: cfg.step_delay_ms,
             captcha_retries: cfg.captcha_retries,
+            captcha_wait_ms: cfg.captcha_wait_ms,
             progress: Arc::new(Mutex::new(QueryProgress::default())),
             status_message: String::new(),
             debug_mode: cfg.debug_mode,
@@ -98,6 +100,7 @@ impl GaokaoApp {
         self.config.delay_ms = self.delay_ms;
         self.config.step_delay_ms = self.step_delay_ms;
         self.config.captcha_retries = self.captcha_retries;
+        self.config.captcha_wait_ms = self.captcha_wait_ms;
         self.config.hide_browser = self.hide_browser;
         self.config.debug_mode = self.debug_mode;
         config::save(&self.config);
@@ -304,6 +307,9 @@ impl eframe::App for GaokaoApp {
                 ui.horizontal(|ui| {
                     ui.label("验证码重试：");
                     ui.add(egui::Slider::new(&mut self.captcha_retries, 1..=10).text("次"));
+                    ui.add_space(16.0);
+                    ui.label("首次等待：");
+                    ui.add(egui::Slider::new(&mut self.captcha_wait_ms, 500..=10000).text("ms").suffix("ms"));
                 });
 
                 ui.add_space(8.0);
@@ -474,6 +480,7 @@ impl GaokaoApp {
         let delay = self.delay_ms as u64;
         let step_delay = self.step_delay_ms as u64;
         let captcha_retries = self.captcha_retries;
+        let captcha_wait_ms = self.captcha_wait_ms as u64;
         let progress = self.progress.clone();
         let results = self.results.clone();
         let cancel = self.cancel_flag.clone();
@@ -506,6 +513,7 @@ impl GaokaoApp {
                 let delay = delay;
                 let step_delay = step_delay;
                 let captcha_retries = captcha_retries;
+                let captcha_wait_ms = captcha_wait_ms;
                 let debug_mode = debug_mode;
                 let hide_browser = hide_browser;
                 let logs = logs.clone();
@@ -532,7 +540,7 @@ impl GaokaoApp {
                     let mut last_err = String::new();
 
                     // Open ONE browser per record, try all candidates
-                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay, captcha_retries, hide_browser).await {
+                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay, captcha_retries, captcha_wait_ms, hide_browser).await {
                         Ok(client) => {
                             for (ci, sfz) in candidates.iter().enumerate() {
                                 if *cancel_inner.lock().await { return; }
