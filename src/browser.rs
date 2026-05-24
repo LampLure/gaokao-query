@@ -1,5 +1,5 @@
 use chromiumoxide::{
-    browser::{Browser, BrowserConfig},
+    browser::{Browser, BrowserConfig, HeadlessMode},
     Page,
 };
 use futures_util::StreamExt;
@@ -17,17 +17,19 @@ pub struct BrowserClient {
 }
 
 impl BrowserClient {
-    pub async fn new() -> Result<Self, String> {
+    pub async fn new(headed: bool) -> Result<Self, String> {
         let chrome_path = find_chrome()
-            .ok_or_else(|| {
-                "未找到Chrome/Chromium浏览器。请安装Chrome后重试。\n\
-                 安装命令: sudo apt install chromium-browser\n\
-                 或从 https://www.google.com/chrome/ 下载"
-                    .to_string()
-            })?;
+            .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
+
+        let headless = if headed {
+            HeadlessMode::False
+        } else {
+            HeadlessMode::New
+        };
 
         let config = BrowserConfig::builder()
             .chrome_executable(chrome_path)
+            .headless_mode(headless)
             .build()
             .map_err(|e| format!("浏览器配置失败: {}", e))?;
 
@@ -54,169 +56,114 @@ impl BrowserClient {
     ) -> Result<QueryResult, String> {
         let page = self.page.lock().await;
 
-        // Fill 报名号
-        let js = format!(
-            r#"(function() {{
-                const el = document.getElementById('zkzh');
-                if (!el) return 'no_zkzh';
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                setter.call(el, '{}');
-                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                return 'ok';
-            }})()"#,
-            baominghao
-        );
-        let _: String = page
-            .evaluate_function(js)
-            .await
-            .map_err(|e| format!("填写报名号失败: {}", e))?
-            .into_value()
-            .map_err(|e| format!("解析返回值失败: {}", e))?;
+        let js_fill = |id: &str, val: &str| -> String {
+            format!(
+                r#"(function() {{
+                    const el = document.getElementById('{}');
+                    if (!el) return 'no_' + '{}';
+                    const setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    ).set;
+                    setter.call(el, '{}');
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return 'ok';
+                }})()"#,
+                id, id, val
+            )
+        };
 
-        // Fill 身份证号
-        let js = format!(
-            r#"(function() {{
-                const el = document.getElementById('sfzh');
-                if (!el) return 'no_sfzh';
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value'
-                ).set;
-                setter.call(el, '{}');
-                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                return 'ok';
-            }})()"#,
-            shenfenzheng
-        );
-        let _: String = page
-            .evaluate_function(js)
-            .await
-            .map_err(|e| format!("填写身份证失败: {}", e))?
-            .into_value()
-            .map_err(|e| format!("解析返回值失败: {}", e))?;
+        let _: Result<String, _> = page.evaluate_function(js_fill("zkzh", baominghao))
+            .await.map_err(|e| format!("填报名号失败: {}", e))?
+            .into_value();
+
+        let _: Result<String, _> = page.evaluate_function(js_fill("sfzh", shenfenzheng))
+            .await.map_err(|e| format!("填身份证号失败: {}", e))?
+            .into_value();
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        // Click submit button
-        let _ = page
-            .evaluate_function(
-                r#"(function() {
-                    const btn = document.querySelector('button[type="submit"]');
-                    if (btn) { btn.click(); return 'clicked'; }
-                    return 'no_button';
-                })()"#,
-            )
-            .await;
+        let _ = page.evaluate_function(
+            r#"(function() {
+                const btn = document.querySelector('button[type="submit"]');
+                if (btn) { btn.click(); return 'clicked'; }
+                return 'no_button';
+            })()"#
+        ).await;
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        // Check and solve captcha
-        let captcha_visible: bool = page
-            .evaluate_function(
-                r#"(function() {
-                    const m = document.getElementById('captchaModal');
-                    return m ? !m.classList.contains('hidden') : false;
-                })()"#,
-            )
-            .await
-            .map(|r| r.into_value().unwrap_or(false))
-            .unwrap_or(false);
+        let captcha_visible: bool = page.evaluate_function(
+            r#"(function() {
+                const m = document.getElementById('captchaModal');
+                return m ? !m.classList.contains('hidden') : false;
+            })()"#
+        ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
         if captcha_visible {
-            self.solve_captcha_modal(&page).await?;
-            // Wait for result after captcha
+            if let Err(e) = self.solve_captcha_modal(&page).await {
+                return Err(format!("验证码处理失败: {}", e));
+            }
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
-        // Check for error alert
-        let has_error: bool = page
-            .evaluate_function(
-                r#"(function() {
-                    const m = document.getElementById('alertModal');
-                    return m ? !m.classList.contains('hidden') : false;
-                })()"#,
-            )
-            .await
-            .map(|r| r.into_value().unwrap_or(false))
-            .unwrap_or(false);
+        let has_error: bool = page.evaluate_function(
+            r#"(function() {
+                const m = document.getElementById('alertModal');
+                return m ? !m.classList.contains('hidden') : false;
+            })()"#
+        ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
         if has_error {
-            let err_msg: String = page
-                .evaluate_function(
-                    r#"(function() {
-                        const el = document.getElementById('alertMessage');
-                        return el ? el.textContent || '' : '';
-                    })()"#,
-                )
-                .await
-                .map(|r| r.into_value().unwrap_or_default())
-                .unwrap_or_default();
+            let err_msg: String = page.evaluate_function(
+                r#"(function() {
+                    const el = document.getElementById('alertMessage');
+                    return el ? el.textContent || '' : '';
+                })()"#
+            ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-            // Dismiss alert
-            let _ = page
-                .evaluate_function(
-                    r#"(function() {
-                        const btn = document.getElementById('alertOkButton');
-                        if (btn) btn.click();
-                    })()"#,
-                )
-                .await;
+            let _ = page.evaluate_function(
+                r#"(function() {
+                    const btn = document.getElementById('alertOkButton');
+                    if (btn) btn.click();
+                })()"#
+            ).await;
 
-            return Err(format!("查询失败: {}", err_msg));
+            return Err(err_msg);
         }
 
-        // Extract result
-        let name: String = page
-            .evaluate_function(
-                r#"(function() {
-                    const el = document.querySelector('[data-value="xm"]');
-                    return el ? el.textContent.trim() : '';
-                })()"#,
-            )
-            .await
-            .map_err(|e| format!("获取姓名失败: {}", e))?
-            .into_value()
-            .unwrap_or_default();
+        let name: String = page.evaluate_function(
+            r#"(function() {
+                const el = document.querySelector('[data-value="xm"]');
+                return el ? el.textContent.trim() : '';
+            })()"#
+        ).await.map_err(|e| format!("获取结果失败: {}", e))?
+            .into_value().unwrap_or_default();
 
         if name.is_empty() {
             return Err("未找到查询结果".to_string());
         }
 
-        let bmh: String = page
-            .evaluate_function(
-                r#"(function() {
-                    const el = document.querySelector('[data-value="ksh"]');
-                    return el ? el.textContent.trim() : '';
-                })()"#,
-            )
-            .await
-            .map(|r| r.into_value().unwrap_or_default())
-            .unwrap_or_default();
+        let bmh: String = page.evaluate_function(
+            r#"(function() {
+                const el = document.querySelector('[data-value="ksh"]');
+                return el ? el.textContent.trim() : '';
+            })()"#
+        ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-        let kemu: String = page
-            .evaluate_function(
-                r#"(function() {
-                    const el = document.querySelector('[data-value="kmmc"]');
-                    return el ? el.textContent.trim() : '';
-                })()"#,
-            )
-            .await
-            .map(|r| r.into_value().unwrap_or_default())
-            .unwrap_or_default();
+        let kemu: String = page.evaluate_function(
+            r#"(function() {
+                const el = document.querySelector('[data-value="kmmc"]');
+                return el ? el.textContent.trim() : '';
+            })()"#
+        ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-        let kd: String = page
-            .evaluate_function(
-                r#"(function() {
-                    const el = document.querySelector('[data-value="kdmc"]');
-                    return el ? el.textContent.trim() : '';
-                })()"#,
-            )
-            .await
-            .map(|r| r.into_value().unwrap_or_default())
-            .unwrap_or_default();
+        let kd: String = page.evaluate_function(
+            r#"(function() {
+                const el = document.querySelector('[data-value="kdmc"]');
+                return el ? el.textContent.trim() : '';
+            })()"#
+        ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
         Ok(QueryResult {
             name,
@@ -225,48 +172,37 @@ impl BrowserClient {
             kemumingcheng: kemu,
             kaodianmingcheng: kd,
             status: QueryStatus::Success,
+            error: String::new(),
         })
     }
 
     async fn solve_captcha_modal(&self, page: &Page) -> Result<(), String> {
-        // Get captcha image base64
-        let img_src: String = page
-            .evaluate_function(
-                r#"(function() {
-                    const img = document.getElementById('captchaImage');
-                    return img ? img.getAttribute('src') || '' : '';
-                })()"#,
-            )
-            .await
-            .map_err(|e| format!("获取验证码图片失败: {}", e))?
-            .into_value()
-            .unwrap_or_default();
+        let img_src: String = page.evaluate_function(
+            r#"(function() {
+                const img = document.getElementById('captchaImage');
+                return img ? img.getAttribute('src') || '' : '';
+            })()"#
+        ).await.map_err(|e| format!("获取验证码失败: {}", e))?
+            .into_value().unwrap_or_default();
 
         if img_src.is_empty() {
             return Err("验证码图片为空".to_string());
         }
 
-        // Get expected characters
-        let chars_text: String = page
-            .evaluate_function(
-                r#"(function() {
-                    const spans = document.querySelectorAll('#captchaChars span');
-                    return Array.from(spans).map(s => s.textContent.trim()).join(' ');
-                })()"#,
-            )
-            .await
-            .map_err(|e| format!("获取验证码文字失败: {}", e))?
-            .into_value()
-            .unwrap_or_default();
+        let chars_text: String = page.evaluate_function(
+            r#"(function() {
+                const spans = document.querySelectorAll('#captchaChars span');
+                return Array.from(spans).map(s => s.textContent.trim()).join(' ');
+            })()"#
+        ).await.map_err(|e| format!("获取验证码文字失败: {}", e))?
+            .into_value().unwrap_or_default();
 
         let expected_chars: Vec<String> =
             chars_text.split_whitespace().map(|s| s.to_string()).collect();
-
         if expected_chars.len() != 3 {
             return Err(format!("验证码字符数错误: {}", expected_chars.len()));
         }
 
-        // Decode base64 and save
         let b64_data = img_src
             .strip_prefix("data:image/png;base64,")
             .or_else(|| img_src.strip_prefix("data:image/jpeg;base64,"))
@@ -274,36 +210,29 @@ impl BrowserClient {
 
         use base64::Engine;
         let img_bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64_data)
-            .map_err(|e| format!("base64解码失败: {}", e))?;
+            .decode(b64_data).map_err(|e| format!("base64解码失败: {}", e))?;
 
         let temp_path = "/tmp/gaokao_captcha.png";
         std::fs::write(temp_path, &img_bytes)
             .map_err(|e| format!("保存验证码图片失败: {}", e))?;
 
-        // Get container dimensions for click coordinate scaling
-        let dims_json: String = page
-            .evaluate_function(
-                r#"(function() {
-                    const el = document.getElementById('captchaContainer');
-                    if (!el) return JSON.stringify({w:300, h:150});
-                    const rect = el.getBoundingClientRect();
-                    return JSON.stringify({w: rect.width, h: rect.height});
-                })()"#,
-            )
-            .await
-            .map(|r| r.into_value().unwrap_or_else(|_| r#"{"w":300,"h":150}"#.to_string()))
+        let dims_json: String = page.evaluate_function(
+            r#"(function() {
+                const el = document.getElementById('captchaContainer');
+                if (!el) return JSON.stringify({w:300, h:150});
+                const rect = el.getBoundingClientRect();
+                return JSON.stringify({w: rect.width, h: rect.height});
+            })()"#
+        ).await.map(|r| r.into_value().unwrap_or_else(|_| r#"{"w":300,"h":150}"#.to_string()))
             .unwrap_or_else(|_| r#"{"w":300,"h":150}"#.to_string());
 
         let dims: serde_json::Value =
-            serde_json::from_str(&dims_json).unwrap_or(serde_json::json!({"w": 300, "h": 150}));
+            serde_json::from_str(&dims_json).unwrap_or(serde_json::json!({"w":300,"h":150}));
         let cw = dims["w"].as_f64().unwrap_or(300.0);
         let ch = dims["h"].as_f64().unwrap_or(150.0);
 
-        // Solve captcha (OCR returns coordinates as fractions 0.0-1.0)
         let points = ocr::solve_captcha(temp_path, &expected_chars, cw, ch)?;
 
-        // Click points (OCR returns fractions, scale to container)
         for point in &points {
             let click_js = format!(
                 r#"(function() {{
@@ -317,8 +246,7 @@ impl BrowserClient {
                     }}));
                     return 'clicked';
                 }})()"#,
-                point.x * cw,
-                point.y * ch
+                point.x * cw, point.y * ch
             );
             let _ = page.evaluate_function(&click_js).await;
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -330,7 +258,7 @@ impl BrowserClient {
 }
 
 fn find_chrome() -> Option<std::path::PathBuf> {
-    let candidates = [
+    for p in &[
         "/usr/bin/chromium-browser",
         "/usr/bin/chromium",
         "/usr/bin/google-chrome",
@@ -339,8 +267,7 @@ fn find_chrome() -> Option<std::path::PathBuf> {
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
         "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-    ];
-    for p in &candidates {
+    ] {
         let path = std::path::Path::new(p);
         if path.exists() {
             return Some(path.to_path_buf());

@@ -56,6 +56,28 @@ pub struct QueryResult {
     pub kemumingcheng: String,
     pub kaodianmingcheng: String,
     pub status: QueryStatus,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub baokao_path: String,
+    pub sfz_path: String,
+    pub concurrency: u32,
+    pub delay_ms: u32,
+    pub debug_mode: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            baokao_path: String::new(),
+            sfz_path: String::new(),
+            concurrency: 3,
+            delay_ms: 2000,
+            debug_mode: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
