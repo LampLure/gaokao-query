@@ -11,7 +11,6 @@ use crate::data::QueryResult;
 use crate::data::QueryStatus;
 use crate::ocr;
 
-const TARGET_URL: &str = "https://cx.hbea.edu.cn/gkkd/2026/eb3f6190-590c-4f79-9b88-81a1d0aa0a2b";
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct BrowserClient {
@@ -21,6 +20,7 @@ pub struct BrowserClient {
     step_delay_ms: u64,
     captcha_retries: u32,
     captcha_wait_ms: u64,
+    target_url: String,
 }
 
 impl BrowserClient {
@@ -40,6 +40,7 @@ impl BrowserClient {
         captcha_retries: u32,
         captcha_wait_ms: u64,
         hide_browser: bool,
+        target_url: &str,
     ) -> Result<Self, String> {
         let chrome_path = find_chrome()
             .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
@@ -92,8 +93,9 @@ impl BrowserClient {
             });
         }
 
+        let url = target_url.to_string();
         let page = browser_clone
-            .new_page(TARGET_URL)
+            .new_page(&url)
             .await
             .map_err(|e| format!("打开页面失败: {}", e))?;
 
@@ -106,12 +108,13 @@ impl BrowserClient {
             step_delay_ms,
             captcha_retries,
             captcha_wait_ms,
+            target_url: url,
         })
     }
 
     pub async fn go_home(&self) -> Result<(), String> {
         let page = self.page.lock().await;
-        page.goto(TARGET_URL)
+        page.goto(&self.target_url)
             .await
             .map_err(|e| format!("导航回首页失败: {}", e))?;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

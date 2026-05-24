@@ -63,6 +63,7 @@ pub struct QueryResult {
 pub struct AppConfig {
     pub baokao_path: String,
     pub sfz_path: String,
+    pub target_url: String,
     pub concurrency: u32,
     pub delay_ms: u32,
     pub step_delay_ms: u32,
@@ -77,6 +78,7 @@ impl Default for AppConfig {
         Self {
             baokao_path: String::new(),
             sfz_path: String::new(),
+            target_url: "https://cx.hbea.edu.cn/gkkd/2026/eb3f6190-590c-4f79-9b88-81a1d0aa0a2b".into(),
             concurrency: 1,
             delay_ms: 2000,
             step_delay_ms: 1000,
@@ -85,6 +87,22 @@ impl Default for AppConfig {
             hide_browser: true,
             debug_mode: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Scene {
+    ExamRoomQuery,
+}
+
+impl Scene {
+    pub fn name(&self) -> &str {
+        match self {
+            Scene::ExamRoomQuery => "考场查询",
+        }
+    }
+    pub fn all() -> Vec<Scene> {
+        vec![Scene::ExamRoomQuery]
     }
 }
 

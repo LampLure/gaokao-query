@@ -19,6 +19,9 @@ pub struct GaokaoApp {
     // config persistence
     config: AppConfig,
     config_dirty: bool,
+    // scene
+    scene: Scene,
+    target_url: String,
     // state
     baokao_path: Option<String>,
     sfz_path: Option<String>,
@@ -59,6 +62,8 @@ impl GaokaoApp {
             sfz_path: if cfg.sfz_path.is_empty() { None } else { Some(cfg.sfz_path.clone()) },
             config: cfg.clone(),
             config_dirty: false,
+            scene: Scene::ExamRoomQuery,
+            target_url: cfg.target_url.clone(),
             matched_records: Vec::new(),
             results: Arc::new(Mutex::new(Vec::new())),
             displayed_results: Vec::new(),
@@ -96,6 +101,7 @@ impl GaokaoApp {
         if !self.config_dirty { return; }
         self.config.baokao_path = self.baokao_path.as_ref().cloned().unwrap_or_default();
         self.config.sfz_path = self.sfz_path.as_ref().cloned().unwrap_or_default();
+        self.config.target_url = self.target_url.clone();
         self.config.concurrency = self.concurrency;
         self.config.delay_ms = self.delay_ms;
         self.config.step_delay_ms = self.step_delay_ms;
@@ -127,7 +133,7 @@ impl eframe::App for GaokaoApp {
         // auto save
         self.auto_save_config();
 
-        // === sidebar ===
+        // === sidebar: scene navigation ===
         egui::SidePanel::left("sidebar")
             .resizable(false)
             .default_width(180.0)
@@ -137,24 +143,23 @@ impl eframe::App for GaokaoApp {
                     ui.label(egui::RichText::new("高考查询系统").heading().strong());
                     ui.separator();
                     ui.add_space(8.0);
-                    ui.label("查询功能");
-                    ui.label("  ▶ 报名号+身份证查询");
+                    ui.label("场景导航");
+                    ui.add_space(4.0);
+                    for s in Scene::all() {
+                        let selected = self.scene == s;
+                        let text = if selected { format!("📌 {}", s.name()) } else { format!("  {}", s.name()) };
+                        if ui.selectable_label(selected, text).clicked() && !selected {
+                            self.scene = s;
+                            self.log(format!("切换到场景: {}", self.scene.name()));
+                        }
+                    }
                     ui.separator();
                     ui.add_space(8.0);
-
-                    ui.add_space(4.0);
-                    let hw = self.hide_browser;
-                    ui.checkbox(&mut self.hide_browser, "🙈 隐藏浏览器");
-                    if hw != self.hide_browser {
-                        self.config_dirty = true;
-                        self.log(if self.hide_browser { "浏览器将隐藏" } else { "浏览器将可见" });
+                    if let Some(p) = &self.baokao_path {
+                        ui.label(format!("📁 报名号: {}", p.split('/').last().unwrap_or("")));
                     }
-                    ui.add_space(4.0);
-                    let was = self.debug_mode;
-                    ui.checkbox(&mut self.debug_mode, "🔧 调试模式");
-                    if was != self.debug_mode {
-                        self.config_dirty = true;
-                        self.log(if self.debug_mode { "调试模式已开启" } else { "调试模式已关闭" });
+                    if let Some(p) = &self.sfz_path {
+                        ui.label(format!("📁 身份证: {}", p.split('/').last().unwrap_or("")));
                     }
                 });
             });
@@ -180,11 +185,30 @@ impl eframe::App for GaokaoApp {
 
         // === central panel ===
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("报名号 + 身份证号 查询报考信息");
+            ui.horizontal(|ui| {
+                ui.heading(self.scene.name());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let hw = self.hide_browser;
+                    ui.checkbox(&mut self.hide_browser, "🙈 隐藏浏览器");
+                    if hw != self.hide_browser { self.config_dirty = true; }
+                    let dm = self.debug_mode;
+                    ui.checkbox(&mut self.debug_mode, "🔧 调试模式");
+                    if dm != self.debug_mode { self.config_dirty = true; }
+                });
+            });
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(4.0);
 
-            // file selection
+            // URL input
+            ui.horizontal(|ui| {
+                ui.label("目标网址：");
+                let mut url = self.target_url.clone();
+                if ui.add_sized([ui.available_width() - 60.0, 0.0], egui::TextEdit::singleline(&mut url)).changed() {
+                    self.target_url = url;
+                    self.config_dirty = true;
+                }
+            });
+            ui.add_space(8.0);
             egui::Grid::new("upload_grid")
                 .num_columns(3)
                 .striped(true)
@@ -486,6 +510,7 @@ impl GaokaoApp {
         let cancel = self.cancel_flag.clone();
         let debug_mode = self.debug_mode;
         let hide_browser = self.hide_browser;
+        let target_url = self.target_url.clone();
         let logs = self.debug_logs.clone();
 
         {
@@ -516,6 +541,7 @@ impl GaokaoApp {
                 let captcha_wait_ms = captcha_wait_ms;
                 let debug_mode = debug_mode;
                 let hide_browser = hide_browser;
+                let target_url = target_url.clone();
                 let logs = logs.clone();
 
                 tokio::spawn(async move {
@@ -540,7 +566,7 @@ impl GaokaoApp {
                     let mut last_err = String::new();
 
                     // Open ONE browser per record, try all candidates
-                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay, captcha_retries, captcha_wait_ms, hide_browser).await {
+                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay, captcha_retries, captcha_wait_ms, hide_browser, &target_url).await {
                         Ok(client) => {
                             for (ci, sfz) in candidates.iter().enumerate() {
                                 if *cancel_inner.lock().await { return; }
