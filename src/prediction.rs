@@ -117,7 +117,7 @@ pub async fn run_matrix_sweep(
     perf_logs: Arc<Mutex<Vec<Vec<PerfEvent>>>>,
 ) -> Vec<PredictedRecord> {
 
-    let mut final_records = Vec::new();
+    let mut final_records: Vec<PredictedRecord> = Vec::new();
     
     // 将待清查的学生身份证封装进共享的互斥线程安全池中
     let active_students = Arc::new(Mutex::new(students.clone()));
