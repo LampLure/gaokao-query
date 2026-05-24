@@ -193,16 +193,33 @@ impl BrowserClient {
             })()"#
         ).await;
 
-        Self::sleep_critical(2000).await;
+        // Poll for captcha modal or error (200ms interval, max 5s)
         self.perf_event("等待验证码");
-
-        let captcha_visible: bool = page.evaluate_expression(
-            r#"(function() {
-                const m = document.getElementById('captchaModal');
-                return m ? !m.classList.contains('hidden') : false;
-            })()"#
-        ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
-
+        let mut captcha_visible = false;
+        for _ in 0..25 {
+            let cv: bool = page.evaluate_expression(
+                r#"(function() {
+                    const m = document.getElementById('captchaModal');
+                    const a = document.getElementById('alertModal');
+                    if (a && !a.classList.contains('hidden')) return false;
+                    return m ? !m.classList.contains('hidden') : false;
+                })()"#
+            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+            if cv {
+                captcha_visible = true;
+                break;
+            }
+            let has_err: bool = page.evaluate_expression(
+                r#"(function() {
+                    const a = document.getElementById('alertModal');
+                    return a ? !a.classList.contains('hidden') : false;
+                })()"#
+            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+            if has_err {
+                break;
+            }
+            Self::sleep_critical(200).await;
+        }
         if captcha_visible {
             self.perf_event("验证码弹窗出现");
             if let Err(e) = self.solve_captcha_modal(&page).await {
