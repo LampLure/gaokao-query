@@ -18,7 +18,7 @@ pub fn solve_captcha(
 ) -> Result<OcrResult, String> {
     let expected = expected_chars.join(" ");
     let output = Command::new("python3")
-        .arg("/tmp/gaokao_env/ocr_helper.py")
+        .arg("ocr_helper.py")
         .arg(image_path)
         .arg(&expected)
         .output()
