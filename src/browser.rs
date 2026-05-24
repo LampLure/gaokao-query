@@ -193,18 +193,34 @@ impl BrowserClient {
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
-            // Get captcha image
-            let img_src: String = page.evaluate_expression(
-                r#"(function() {
-                    const img = document.getElementById('captchaImage');
-                    return img ? img.getAttribute('src') || '' : '';
-                })()"#
-            ).await.map_err(|e| format!("获取验证码失败: {}", e))?
-                .into_value().unwrap_or_default();
+            // Get captcha image (wait for it to actually load)
+            let img_src: String = {
+                let mut last_src = String::new();
+                for _ in 0..20 {
+                    let src: String = page.evaluate_expression(
+                        r#"(function() {
+                            const img = document.getElementById('captchaImage');
+                            if (!img) return '';
+                            const s = img.getAttribute('src') || '';
+                            // Only return non-placeholder, non-empty images
+                            if (s && !s.includes('svg+xml') && s.length > 100) return s;
+                            return '';
+                        })()"#
+                    ).await.map_err(|e| format!("获取验证码失败: {}", e))?
+                        .into_value().unwrap_or_default();
 
-            if img_src.is_empty() {
-                return Err("验证码图片为空".to_string());
-            }
+                    if !src.is_empty() {
+                        last_src = src;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+
+                if last_src.is_empty() {
+                    return Err("验证码图片加载超时".to_string());
+                }
+                last_src
+            };
 
             // Get expected chars
             let chars_text: String = page.evaluate_expression(

@@ -26,6 +26,19 @@ def solve(image_path, expected_chars):
     log("--- OCR Debug ---")
     log(f"Expected click order: {' → '.join(expected_chars)}")
 
+    # Preprocess: ensure image has good contrast for OCR
+    try:
+        img = Image.open(image_path)
+        if img.mode == 'RGBA':
+            img = img.convert('RGB')
+        gray = img.convert('L')
+        # Auto-level contrast
+        from PIL import ImageOps
+        gray = ImageOps.autocontrast(gray, cutoff=5)
+        gray.save(image_path)
+    except Exception as e:
+        log(f"Preprocess warning: {e}")
+
     api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
     try:
         api.SetImageFile(image_path)
