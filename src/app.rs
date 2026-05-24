@@ -1103,7 +1103,7 @@ impl GaokaoApp {
                         if ok { p.success += 1; } else { p.failed += 1; }
                     }
 
-                    if delay > 0 && !*cancel.lock().await {
+                    if !turbo && delay > 0 && !*cancel.lock().await {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     }
                 }));
@@ -1309,7 +1309,7 @@ impl GaokaoApp {
                 l.push(format!("[PREDICT] 继续推 {} (范围 {}~{}), 当前缓存 {} 条",
                     prev_cls, range_start, range_end, cache.len()));
 
-                if delay_ms > 0 {
+                if !turbo && delay_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
             }

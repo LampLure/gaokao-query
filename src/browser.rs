@@ -64,12 +64,17 @@ impl BrowserClient {
     }
 
     async fn sleep_step(&self, factor: f64) {
-        let ms = (self.step_delay_ms as f64 * factor) as u64;
-        tokio::time::sleep(std::time::Duration::from_millis(ms.max(50))).await;
+        let ms = if self.turbo {
+            30u64
+        } else {
+            (self.step_delay_ms as f64 * factor) as u64
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(ms.max(30))).await;
     }
 
     async fn sleep_critical(&self, ms: u64) {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        let actual = if self.turbo { ms.min(1500) } else { ms };
+        tokio::time::sleep(std::time::Duration::from_millis(actual)).await;
     }
 
     pub async fn new_with_log(
@@ -347,7 +352,15 @@ impl BrowserClient {
                         return 'no_btn';
                     })()"#
                 ).await;
-                self.sleep_critical(3000).await;
+                // Poll for captcha image element after refresh (up to 3s)
+                let interval = if self.turbo { 100u64 } else { 300u64 };
+                for _ in 0..(3000 / interval).max(5) {
+                    let has_img: bool = page.evaluate_expression(
+                        r#"!!document.getElementById('captchaImage')"#
+                    ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+                    if has_img { break; }
+                    self.sleep_critical(interval).await;
+                }
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
@@ -494,18 +507,23 @@ impl BrowserClient {
                 self.sleep_step(0.3).await;
             }
 
-            // Server verification takes time - wait then check
-            self.sleep_critical(2000).await;
-
+            // Poll for verification result (200ms interval, server usually responds in 0.5-2s)
             self.perf_event("验证码点击完成");
-
-            // After poll, check current state
-            let still_visible: bool = page.evaluate_expression(
-                r#"(function() {
-                    const m = document.getElementById('captchaModal');
-                    return m ? !m.classList.contains('hidden') : false;
-                })()"#
-            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+            let interval = if self.turbo { 100u64 } else { 200u64 };
+            let mut still_visible = true;
+            for _ in 0..15 {  // max 1.5s (turbo) or 3s (normal)
+                let r: bool = page.evaluate_expression(
+                    r#"(function() {
+                        const m = document.getElementById('captchaModal');
+                        return m ? !m.classList.contains('hidden') : false;
+                    })()"#
+                ).await.map(|v| v.into_value().unwrap_or(true)).unwrap_or(true);
+                if !r {
+                    still_visible = false;
+                    break;
+                }
+                self.sleep_critical(interval).await;
+            }
 
             if !still_visible {
                 // Captcha passed
