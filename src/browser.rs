@@ -24,21 +24,15 @@ impl BrowserClient {
     }
 
     pub async fn new_with_log(
-        headed: bool,
+        _headed: bool,
         log: Option<Arc<Mutex<Vec<String>>>>,
     ) -> Result<Self, String> {
         let chrome_path = find_chrome()
             .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
 
-        let headless = if headed {
-            HeadlessMode::False
-        } else {
-            HeadlessMode::New
-        };
-
         let config = BrowserConfig::builder()
             .chrome_executable(chrome_path)
-            .headless_mode(headless)
+            .headless_mode(HeadlessMode::False)
             .build()
             .map_err(|e| format!("浏览器配置失败: {}", e))?;
 
@@ -211,23 +205,50 @@ impl BrowserClient {
                             const img = document.getElementById('captchaImage');
                             if (!img) return '';
 
-                            // Wait for image to actually finish loading
-                            if (!img.complete || img.naturalWidth === 0) return '';
+                            // Check if image has loaded
+                            const loaded = img.complete && img.naturalWidth > 0;
 
+                            // Try src attribute first (works when loaded)
                             const s = img.getAttribute('src') || '';
                             if (s && !s.includes('svg+xml') && s.length > 100) return s;
 
-                            // Fallback: try to read from canvas if src is a data URI
-                            try {
-                                const c = document.createElement('canvas');
-                                c.width = img.naturalWidth;
-                                c.height = img.naturalHeight;
-                                const ctx = c.getContext('2d');
-                                ctx.drawImage(img, 0, 0);
-                                return c.toDataURL('image/png');
-                            } catch(e) {
-                                return '';
+                            // If loaded but src is a URL (not data URI), fetch via XHR
+                            if (loaded && s && s.startsWith('http')) {
+                                try {
+                                    const xhr = new XMLHttpRequest();
+                                    xhr.open('GET', s, false);
+                                    xhr.responseType = 'blob';
+                                    xhr.send();
+                                    const reader = new FileReaderSync();
+                                    return reader.readAsDataURL(xhr.response);
+                                } catch(e) {}
                             }
+
+                            // Fallback: read from canvas if loaded
+                            if (loaded) {
+                                try {
+                                    const c = document.createElement('canvas');
+                                    c.width = img.naturalWidth;
+                                    c.height = img.naturalHeight;
+                                    const ctx = c.getContext('2d');
+                                    ctx.drawImage(img, 0, 0);
+                                    const data = c.toDataURL('image/png');
+                                    if (data && data.length > 200) return data;
+                                } catch(e) {}
+                            }
+
+                            // Last resort: check for background-image on parent
+                            try {
+                                const parent = img.parentElement;
+                                if (parent) {
+                                    const bg = getComputedStyle(parent).backgroundImage;
+                                    if (bg && bg.startsWith('url("data:image')) {
+                                        return bg.slice(5, -2);
+                                    }
+                                }
+                            } catch(e) {}
+
+                            return '';
                         })()"#
                     ).await.map_err(|e| format!("获取验证码失败: {}", e))?
                         .into_value().unwrap_or_default();
