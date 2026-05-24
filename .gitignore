@@ -15,12 +15,6 @@ vendor/
 # Logs and temp files
 *.log
 *.tmp
-*.swp
-
-# Environment
-.env
-.env.local
-.env.*
 
 # Editors
 .vscode/
@@ -28,20 +22,8 @@ vendor/
 *.swp
 *.swo
 
-# Coverage
-coverage/
-htmlcov/
-.coverage
-
-# OS
-.DS_Store
-Thumbs.db
-```
-
-Wait, let me reconsider this. The file changes only show Rust source files (.rs) being modified, which are source code files. There are no build artifacts, dependency directories, or temporary files in the change list that would require adding to .gitignore.
-
-Since only source files (.rs) are being modified and no build artifacts or other ignorable files are present in the changes, the correct output is empty.
-
-```rust
-
+# Environment
+.env
+.env.local
+*.env.*
 ```
