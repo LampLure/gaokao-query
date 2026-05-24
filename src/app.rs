@@ -884,7 +884,6 @@ impl GaokaoApp {
         let progress = self.progress.clone();
         let results = self.results.clone();
         let cancel = self.cancel_flag.clone();
-        let debug_mode = self.debug_mode;
         let hide_browser = self.hide_browser;
         let target_url = self.target_url.clone();
         let logs = self.debug_logs.clone();
@@ -897,99 +896,84 @@ impl GaokaoApp {
 
         self.log(format!("开始查询: {} 条记录, 并发 {}, 间隔 {}ms", matched.len(), concurrency, delay));
 
-        let cancel_check = cancel.clone();
         tokio::spawn(async move {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            let pool = match crate::browser::BrowserPool::new(
+                concurrency, hide_browser, step_delay, captcha_retries, captcha_wait_ms,
+                &target_url, Some(logs.clone()),
+            ).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let mut l = logs.lock().await;
+                    l.push(format!("[ERROR] 浏览器池启动失败: {}", e));
+                    return;
+                }
+            };
 
             for record in &matched {
-                if *cancel_check.lock().await { break; }
+                if *cancel.lock().await { break; }
 
-                let sem = semaphore.clone();
-                let progress = progress.clone();
-                let results = results.clone();
-                let record = record.clone();
-                let cancel_inner = cancel_check.clone();
-                let delay = delay;
-                let step_delay = step_delay;
-                let captcha_retries = captcha_retries;
-                let captcha_wait_ms = captcha_wait_ms;
-                let debug_mode = debug_mode;
-                let hide_browser = hide_browser;
-                let target_url = target_url.clone();
-                let logs = logs.clone();
+                {
+                    let mut p = progress.lock().await;
+                    p.current_name = record.name.clone();
+                }
 
-                tokio::spawn(async move {
-                    let _permit = sem.acquire().await.unwrap();
-                    if *cancel_inner.lock().await { return; }
+                let candidates = if record.shenfenzheng_candidates.is_empty() {
+                    vec![String::new()]
+                } else {
+                    record.shenfenzheng_candidates.clone()
+                };
 
-                    {
-                        let mut p = progress.lock().await;
-                        p.current_name = record.name.clone();
-                    }
+                let mut ok = false;
+                let mut last_err = String::new();
 
-                    let candidates = if record.shenfenzheng_candidates.is_empty() {
-                        vec![String::new()]
-                    } else {
-                        record.shenfenzheng_candidates.clone()
-                    };
+                for (ci, sfz) in candidates.iter().enumerate() {
+                    if *cancel.lock().await { break; }
 
-                    let mut ok = false;
-                    let mut last_err = String::new();
+                    let bkh = record.baominghao.clone();
+                    let id = sfz.clone();
+                    let pool = pool.clone();
 
-                    match crate::browser::BrowserClient::new_with_log(
-                        debug_mode, Some(logs.clone()), step_delay, captcha_retries, captcha_wait_ms, hide_browser, &target_url
-                    ).await {
-                        Ok(client) => {
-                            for (ci, sfz) in candidates.iter().enumerate() {
-                                if *cancel_inner.lock().await { return; }
-                                if ci > 0 {
-                                    let _ = client.go_home().await;
-                                    tokio::time::sleep(std::time::Duration::from_millis(step_delay)).await;
-                                }
-                                match client.query_single(&record.baominghao, sfz).await {
-                                    Ok(mut r) => {
-                                        r.shenfenzheng = sfz.clone();
-                                        let mut r_lock = results.lock().await;
-                                        r_lock.push(r);
-                                        ok = true;
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        last_err = format!("候选{}失败: {}", ci + 1, e);
-                                        continue;
-                                    }
-                                }
-                            }
+                    let (permit, client) = pool.acquire().await;
+                    let result = client.query_single(&bkh, &id).await;
+                    pool.release(permit, client);
+
+                    match result {
+                        Ok(mut r) => {
+                            r.shenfenzheng = sfz.clone();
+                            let mut r_lock = results.lock().await;
+                            r_lock.push(r);
+                            ok = true;
+                            break;
                         }
                         Err(e) => {
-                            last_err = format!("浏览器启动失败: {}", e);
+                            last_err = format!("候选{}失败: {}", ci + 1, e);
+                            continue;
                         }
                     }
+                }
 
-                    if !ok {
-                        let mut r_lock = results.lock().await;
-                        r_lock.push(QueryResult {
-                            name: record.name.clone(),
-                            baominghao: record.baominghao.clone(),
-                            shenfenzheng: String::new(),
-                            kemumingcheng: String::new(),
-                            kaodianmingcheng: String::new(),
-                            status: QueryStatus::Failed(last_err.clone()),
-                            error: last_err.clone(),
-                        });
-                    }
+                if !ok {
+                    let mut r_lock = results.lock().await;
+                    r_lock.push(QueryResult {
+                        name: record.name.clone(),
+                        baominghao: record.baominghao.clone(),
+                        shenfenzheng: String::new(),
+                        kemumingcheng: String::new(),
+                        kaodianmingcheng: String::new(),
+                        status: QueryStatus::Failed(last_err.clone()),
+                        error: last_err.clone(),
+                    });
+                }
 
-                    {
-                        let mut p = progress.lock().await;
-                        p.completed += 1;
-                        if ok { p.success += 1; } else { p.failed += 1; }
-                    }
+                {
+                    let mut p = progress.lock().await;
+                    p.completed += 1;
+                    if ok { p.success += 1; } else { p.failed += 1; }
+                }
 
-                    drop(_permit);
-                    if delay > 0 && !*cancel_inner.lock().await {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    }
-                });
+                if delay > 0 && !*cancel.lock().await {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
             }
         });
     }
@@ -1089,7 +1073,7 @@ impl GaokaoApp {
         ));
 
         tokio::spawn(async move {
-            let pool = match prediction::BrowserPool::new(
+            let pool = match crate::browser::BrowserPool::new(
                 concurrency,
                 hide_browser,
                 step_delay,
