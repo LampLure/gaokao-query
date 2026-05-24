@@ -65,6 +65,7 @@ pub struct AppConfig {
     pub sfz_path: String,
     pub concurrency: u32,
     pub delay_ms: u32,
+    pub step_delay_ms: u32,
     pub debug_mode: bool,
 }
 
@@ -73,8 +74,9 @@ impl Default for AppConfig {
         Self {
             baokao_path: String::new(),
             sfz_path: String::new(),
-            concurrency: 3,
+            concurrency: 1,
             delay_ms: 2000,
+            step_delay_ms: 1000,
             debug_mode: false,
         }
     }

@@ -28,6 +28,7 @@ pub struct GaokaoApp {
     query_state: QueryState,
     concurrency: u32,
     delay_ms: u32,
+    step_delay_ms: u32,
     progress: Arc<Mutex<QueryProgress>>,
     status_message: String,
     // debug
@@ -61,6 +62,7 @@ impl GaokaoApp {
             query_state: QueryState::Idle,
             concurrency: cfg.concurrency,
             delay_ms: cfg.delay_ms,
+            step_delay_ms: cfg.step_delay_ms,
             progress: Arc::new(Mutex::new(QueryProgress::default())),
             status_message: String::new(),
             debug_mode: cfg.debug_mode,
@@ -90,6 +92,7 @@ impl GaokaoApp {
         self.config.sfz_path = self.sfz_path.as_ref().cloned().unwrap_or_default();
         self.config.concurrency = self.concurrency;
         self.config.delay_ms = self.delay_ms;
+        self.config.step_delay_ms = self.step_delay_ms;
         self.config.debug_mode = self.debug_mode;
         config::save(&self.config);
         self.config_dirty = false;
@@ -271,10 +274,16 @@ impl eframe::App for GaokaoApp {
             if !self.matched_records.is_empty() && self.query_state != QueryState::Running {
                 ui.horizontal(|ui| {
                     ui.label("并发数：");
-                    ui.add(egui::Slider::new(&mut self.concurrency, 1..=10).text("个"));
+                    ui.add(egui::Slider::new(&mut self.concurrency, 1..=5).text("个"));
                     ui.add_space(16.0);
                     ui.label("查询间隔：");
                     ui.add(egui::Slider::new(&mut self.delay_ms, 0..=10000).text("毫秒").suffix("ms"));
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("操作速度：");
+                    ui.add(egui::Slider::new(&mut self.step_delay_ms, 100..=5000).text("ms/步").suffix("ms"));
+                    ui.label(format!("(每步等待 {:.1}s)", self.step_delay_ms as f64 / 1000.0));
                 });
 
                 ui.add_space(8.0);
@@ -439,6 +448,7 @@ impl GaokaoApp {
         let matched = self.matched_records.clone();
         let concurrency = self.concurrency as usize;
         let delay = self.delay_ms as u64;
+        let step_delay = self.step_delay_ms as u64;
         let progress = self.progress.clone();
         let results = self.results.clone();
         let cancel = self.cancel_flag.clone();
@@ -468,6 +478,7 @@ impl GaokaoApp {
                 let record = record.clone();
                 let cancel_inner = cancel_check.clone();
                 let delay = delay;
+                let step_delay = step_delay;
                 let debug_mode = debug_mode;
                 let logs = logs.clone();
 
@@ -493,7 +504,7 @@ impl GaokaoApp {
                     let mut last_err = String::new();
                     for sfz in &candidates {
                         if *cancel_inner.lock().await { return; }
-                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone())).await {
+                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay).await {
                             Ok(client) => {
                                 match client.query_single(&record.baominghao, sfz).await {
                                     Ok(mut r) => {

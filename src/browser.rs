@@ -3,6 +3,7 @@ use chromiumoxide::{
     Page,
 };
 use futures_util::StreamExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -11,28 +12,40 @@ use crate::data::QueryStatus;
 use crate::ocr;
 
 const TARGET_URL: &str = "https://cx.hbea.edu.cn/gkkd/2026/eb3f6190-590c-4f79-9b88-81a1d0aa0a2b";
+static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct BrowserClient {
     _browser: Arc<Browser>,
     page: Arc<Mutex<Page>>,
     log: Option<Arc<Mutex<Vec<String>>>>,
+    step_delay_ms: u64,
 }
 
 impl BrowserClient {
-    pub async fn new(headed: bool) -> Result<Self, String> {
-        Self::new_with_log(headed, None).await
+    pub async fn new(step_delay_ms: u64) -> Result<Self, String> {
+        Self::new_with_log(false, None, step_delay_ms).await
+    }
+
+    async fn sleep_ms(&self, factor: f64) {
+        let ms = (self.step_delay_ms as f64 * factor) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(ms.max(50))).await;
     }
 
     pub async fn new_with_log(
         _headed: bool,
         log: Option<Arc<Mutex<Vec<String>>>>,
+        step_delay_ms: u64,
     ) -> Result<Self, String> {
         let chrome_path = find_chrome()
             .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
 
+        let instance_id = INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let user_data_dir = format!("/tmp/chromiumoxide-runner-{}", instance_id);
+
         let config = BrowserConfig::builder()
             .chrome_executable(chrome_path)
             .headless_mode(HeadlessMode::False)
+            .user_data_dir(&user_data_dir)
             .build()
             .map_err(|e| format!("浏览器配置失败: {}", e))?;
 
@@ -56,6 +69,7 @@ impl BrowserClient {
             _browser: browser,
             page: Arc::new(Mutex::new(page)),
             log,
+            step_delay_ms,
         })
     }
 
@@ -81,7 +95,7 @@ impl BrowserClient {
             .await.map_err(|e| format!("填身份证号失败: {}", e))?
             .into_value().map_err(|_| "填身份证返回值解析失败".to_string())?;
 
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        self.sleep_ms(0.5).await;
 
         let _ = page.evaluate_expression(
             r#"(function() {
@@ -91,7 +105,7 @@ impl BrowserClient {
             })()"#
         ).await;
 
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        self.sleep_ms(1.0).await;
 
         let captcha_visible: bool = page.evaluate_expression(
             r#"(function() {
@@ -104,7 +118,7 @@ impl BrowserClient {
             if let Err(e) = self.solve_captcha_modal(&page).await {
                 return Err(format!("验证码处理失败: {}", e));
             }
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            self.sleep_ms(2.0).await;
         }
 
         let has_error: bool = page.evaluate_expression(
@@ -191,8 +205,7 @@ impl BrowserClient {
                         return 'no_btn';
                     })()"#
                 ).await;
-                // Wait for new captcha to load
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                self.sleep_ms(2.0).await;
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
@@ -257,7 +270,7 @@ impl BrowserClient {
                         last_src = src;
                         break;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    self.sleep_ms(0.5).await;
                 }
 
                 if last_src.is_empty() {
@@ -349,11 +362,10 @@ impl BrowserClient {
                     point.x * cw, point.y * ch
                 );
                 let _ = page.evaluate_expression(&click_js).await;
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                self.sleep_ms(0.3).await;
             }
 
-            // Wait for verification result
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            self.sleep_ms(1.5).await;
 
             // Check if captcha modal is still visible (verification failed)
             let still_visible: bool = page.evaluate_expression(
@@ -387,7 +399,7 @@ impl BrowserClient {
                 })()"#
             ).await;
 
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            self.sleep_ms(0.5).await;
         }
 
         Err(format!("验证码连续失败 {} 次，已放弃", max_retries))
