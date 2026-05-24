@@ -3,6 +3,12 @@
 OCR helper: given a captcha image and 3 expected characters in order,
 use tesseract to identify each character in the image,
 then reorder them to match the expected click order.
+
+Strategy:
+1. Use tesseract OCR to recognize text at each character position
+2. For each expected char, check if it was correctly recognized
+3. Assign recognized chars to their boxes, remaining boxes to unmatched chars
+4. If no chars are recognized, fall back to left-to-right position matching
 """
 
 import sys
@@ -11,10 +17,8 @@ from PIL import Image
 
 os.environ["TESSDATA_PREFIX"] = "/tmp"
 
-
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
-
 
 def solve(image_path, expected_chars):
     import tesserocr
@@ -25,7 +29,6 @@ def solve(image_path, expected_chars):
     api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
     try:
         api.SetImageFile(image_path)
-        api.SetVariable("tessedit_pageseg_mode", "6")
         api.Recognize()
 
         # Get symbol-level recognition results
@@ -34,11 +37,16 @@ def solve(image_path, expected_chars):
         if ri:
             level = tesserocr.RIL.SYMBOL
             while True:
-                text = ri.GetUTF8Text(level).strip()
+                try:
+                    text = ri.GetUTF8Text(level).strip()
+                except RuntimeError:
+                    text = ""
                 bbox = ri.BoundingBox(level)
-                if bbox and text:
+                if bbox and text and text.isprintable():
                     x1, y1, x2, y2 = bbox
-                    boxes.append((text, x1, y1, x2, y2))
+                    w, h = x2 - x1, y2 - y1
+                    if w >= 5 and h >= 5:
+                        boxes.append((text, x1, y1, x2, y2))
                 if not ri.Next(level):
                     break
 
@@ -47,74 +55,90 @@ def solve(image_path, expected_chars):
             log(f"  '{text}' at ({x1},{y1})-({x2},{y2})  size={x2-x1}x{y2-y1}")
 
         if len(boxes) < 3:
-            log(f"WARNING: Only {len(boxes)} symbols recognized, trying component boxes")
+            log(f"WARNING: Only {len(boxes)} symbols, trying CC fallback")
             comps = api.GetComponentImages(tesserocr.RIL.SYMBOL, True)
             boxes = []
             for _, b, _, _ in comps:
                 x1, y1 = b["x"], b["y"]
-                x2, y2 = x1 + b["w"], y1 + b["h"]
-                # Try to recognize each component
-                crop = api.GetImage().crop((x1, y1, x2, y2))
-                crop_api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
-                try:
-                    crop_api.SetImage(crop)
-                    crop_api.SetVariable("tessedit_pageseg_mode", "10")
-                    text = crop_api.GetUTF8Text().strip()
-                finally:
-                    crop_api.End()
-                boxes.append((text if text else "?", x1, y1, x2, y2))
-            log(f"Component boxes: {len(boxes)}")
-            for text, x1, y1, x2, y2 in boxes:
-                log(f"  '{text}' at ({x1},{y1})-({x2},{y2})")
+                w, h = b["w"], b["h"]
+                if w < 5 or h < 5:
+                    continue
+                boxes.append(("", x1, y1, x1 + w, y1 + h))
+            log(f"CC boxes: {len(boxes)}")
+            for _, x1, y1, x2, y2 in boxes:
+                log(f"  (?,?) at ({x1},{y1})-({x2},{y2})")
 
-        # If we have 3+ recognized symbols, use recognition-based matching
-        # Build a map from recognized character -> (box, position)
-        char_to_box = {}
+        if len(boxes) < 3:
+            log("ERROR: Could not find 3 character positions")
+            sys.exit(1)
+
+        # Take the 3 most confident/appropriate boxes
+        # Sort by x position, take first 3
+        boxes.sort(key=lambda b: b[1])  # sort by x
+        boxes = boxes[:3]
+
+        log(f"\nTop 3 boxes (left-to-right):")
         for text, x1, y1, x2, y2 in boxes:
-            for ch in text:
-                if ch.strip():
-                    char_to_box[ch] = (x1, y1, x2, y2)
+            log(f"  '{text}' at ({x1},{y1})-({x2},{y2})")
 
-        log(f"\nCharacter map: { {k: f'({v[0]},{v[1]})-({v[2]},{v[3]})' for k, v in char_to_box.items()} }")
+        # Strategy: best-effort matching
+        # For each expected char, check if it appears in any box
+        box_indices = list(range(len(boxes)))
+        assigned_boxes = {}  # expected_char -> box_index
+        used_indices = set()
+        unmatched_chars = []
 
-        # Match expected chars to positions
-        result_boxes = []
-        missing = []
         for ch in expected_chars:
-            if ch in char_to_box:
-                result_boxes.append(char_to_box[ch])
-            else:
-                missing.append(ch)
-                result_boxes.append(None)
+            found = False
+            for idx in box_indices:
+                if idx in used_indices:
+                    continue
+                # Check if this char is in the recognized text
+                # Also check if the recognized text contains only this char
+                recognized = boxes[idx][0]
+                if ch == recognized or (len(recognized) == 1 and ch == recognized):
+                    assigned_boxes[ch] = idx
+                    used_indices.add(idx)
+                    found = True
+                    break
+            if not found:
+                unmatched_chars.append(ch)
 
-        if missing:
-            log(f"WARNING: Characters {missing} not found in recognition results!")
-            log("Falling back to position-based matching (left-to-right)")
+        log(f"\nRecognition matching:")
+        for ch, idx in assigned_boxes.items():
+            log(f"  '{ch}' matched to box[{idx}] at ({boxes[idx][1]},{boxes[idx][2]})")
+        if unmatched_chars:
+            log(f"  Unmatched chars: {unmatched_chars}")
 
-        # Fill in missing slots with remaining boxes sorted by x
-        missing_indices = [i for i, b in enumerate(result_boxes) if b is None]
-        if missing_indices:
-            used = {id(b) for b in result_boxes if b}
-            remaining = sorted(
-                [(x1, y1, x2, y2) for _, x1, y1, x2, y2 in boxes
-                 if id((x1, y1, x2, y2)) not in used],
-                key=lambda b: b[0]
-            )
-            for idx, box in zip(missing_indices, remaining):
-                result_boxes[idx] = box
+        # Assign remaining boxes to unmatched chars
+        remaining_indices = [i for i in box_indices if i not in used_indices]
+        for ch, idx in zip(unmatched_chars, remaining_indices):
+            assigned_boxes[ch] = idx
+            log(f"  '{ch}' assigned to box[{idx}] (remaining)")
 
-        # Verify all slots filled
-        result_boxes = [b for b in result_boxes if b is not None]
+        # If still unmatched (shouldn't happen with 3 boxes and 3 chars)
+        if len(assigned_boxes) < 3:
+            log("WARNING: Not all chars matched, falling back to position-based")
+            for i, (ch, (_, x1, y1, x2, y2)) in enumerate(
+                zip(expected_chars, boxes[:3])
+            ):
+                assigned_boxes[ch] = i
 
-        log(f"\nFinal order:")
-        for i, (ch, (x1, y1, x2, y2)) in enumerate(zip(expected_chars, result_boxes)):
+        # Build result in expected order
+        result_boxes = []
+        for ch in expected_chars:
+            idx = assigned_boxes.get(ch, 0)
+            result_boxes.append(boxes[idx][1:5])
+
+        log(f"\nFinal click order:")
+        for i, ch in enumerate(expected_chars):
+            x1, y1, x2, y2 = result_boxes[i]
             log(f"  Click {i+1}: '{ch}' at ({x1},{y1})-({x2},{y2})")
 
         return result_boxes
 
     finally:
         api.End()
-
 
 def main():
     if len(sys.argv) < 3:
@@ -134,11 +158,13 @@ def main():
         log(f"ERROR: Only matched {len(matched)} positions")
         sys.exit(1)
 
-    img = Image.open(image_path)
-    iw, ih = img.size
-    log(f"Image dimensions: {iw}x{ih}")
+    try:
+        img = Image.open(image_path)
+        iw, ih = img.size
+    except Exception:
+        iw, ih = 300, 150
 
-    log(f"\nFinal click coordinates (fraction of {iw}x{ih}):")
+    log(f"\nFinal coordinates (fraction of {iw}x{ih}):")
     for i, (x1, y1, x2, y2) in enumerate(matched):
         cx = (x1 + x2) / 2.0 / iw
         cy = (y1 + y2) / 2.0 / ih
@@ -146,7 +172,6 @@ def main():
         print(f"{cx:.4f},{cy:.4f}")
 
     log("--- OCR Done ---")
-
 
 if __name__ == "__main__":
     main()
