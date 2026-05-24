@@ -204,7 +204,9 @@ impl BrowserClient {
         ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
         if captcha_visible {
+            self.perf_event("验证码弹窗出现");
             if let Err(e) = self.solve_captcha_modal(&page).await {
+                self.perf_event("总耗时");
                 return Err(format!("验证码处理失败: {}", e));
             }
             Self::sleep_critical(2000).await;
@@ -232,6 +234,7 @@ impl BrowserClient {
                 })()"#
             ).await;
 
+            self.perf_event("总耗时");
             return Err(err_msg);
         }
 
@@ -244,6 +247,7 @@ impl BrowserClient {
             .into_value().unwrap_or_default();
 
         if name.is_empty() {
+            self.perf_event("总耗时");
             return Err("未找到查询结果".to_string());
         }
         self.perf_event("获取查询结果");
@@ -268,6 +272,8 @@ impl BrowserClient {
                 return el ? el.textContent.trim() : '';
             })()"#
         ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
+
+        self.perf_event("总耗时");
 
         Ok(QueryResult {
             name,
@@ -307,26 +313,21 @@ impl BrowserClient {
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
-            // Wait for captcha image to render before polling
-            Self::sleep_critical(self.captcha_wait_ms).await;
-
-            // Get captcha image (wait for it to actually load)
+            // Poll for captcha image immediately (no blind wait)
+            // captcha_wait_ms becomes the max poll time
+            let max_poll = if self.captcha_wait_ms > 200 { self.captcha_wait_ms } else { 2000 };
+            let poll_step = 200u64;
+            let max_attempts = (max_poll / poll_step).max(5);
             let img_src: String = {
                 let mut last_src = String::new();
-                for _ in 0..30 {
+                for _ in 0..max_attempts {
                     let src: String = page.evaluate_expression(
                         r#"(function() {
                             const img = document.getElementById('captchaImage');
                             if (!img) return '';
-
-                            // Check if image has loaded
                             const loaded = img.complete && img.naturalWidth > 0;
-
-                            // Try src attribute first (works when loaded)
                             const s = img.getAttribute('src') || '';
                             if (s && !s.includes('svg+xml') && s.length > 100) return s;
-
-                            // If loaded but src is a URL (not data URI), fetch via XHR
                             if (loaded && s && s.startsWith('http')) {
                                 try {
                                     const xhr = new XMLHttpRequest();
@@ -337,8 +338,6 @@ impl BrowserClient {
                                     return reader.readAsDataURL(xhr.response);
                                 } catch(e) {}
                             }
-
-                            // Fallback: read from canvas if loaded
                             if (loaded) {
                                 try {
                                     const c = document.createElement('canvas');
@@ -350,8 +349,6 @@ impl BrowserClient {
                                     if (data && data.length > 200) return data;
                                 } catch(e) {}
                             }
-
-                            // Last resort: check for background-image on parent
                             try {
                                 const parent = img.parentElement;
                                 if (parent) {
@@ -361,24 +358,22 @@ impl BrowserClient {
                                     }
                                 }
                             } catch(e) {}
-
                             return '';
                         })()"#
                     ).await.map_err(|e| format!("获取验证码失败: {}", e))?
                         .into_value().unwrap_or_default();
-
                     if !src.is_empty() {
                         last_src = src;
                         break;
                     }
-                    Self::sleep_critical(500).await;
+                    Self::sleep_critical(poll_step).await;
                 }
-
                 if last_src.is_empty() {
                     return Err("验证码图片加载超时".to_string());
                 }
                 last_src
             };
+            self.perf_event("验证码图片加载完成");
 
             // Get expected chars
             let chars_text: String = page.evaluate_expression(
@@ -427,7 +422,12 @@ impl BrowserClient {
             self.perf_event("获取验证码图片");
 
             // Solve captcha via OCR
+            self.perf_event("OCR开始");
             let ocr_result = match ocr::solve_captcha(&temp_path, &expected_chars, cw, ch, self.instance_id).await {
+                Ok(r) => {
+                    self.perf_event("OCR完成");
+                    r
+                }
                 Ok(r) => r,
                 Err(e) => {
                     self.log_msg(&format!("OCR失败: {}, 准备重试", e));
@@ -449,6 +449,7 @@ impl BrowserClient {
             }
 
             // Click points
+            self.perf_event("验证码点击开始");
             for point in &ocr_result.points {
                 let click_js = format!(
                     r#"(function() {{
@@ -483,6 +484,7 @@ impl BrowserClient {
             if !still_visible {
                 // Captcha passed
                 self.log_msg("验证码通过");
+                self.perf_event("验证码验证通过");
                 return Ok(());
             }
 
