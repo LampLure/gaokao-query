@@ -710,6 +710,43 @@ impl GaokaoApp {
                         Ok(records) => {
                             let count = records.len();
                             self.pred_known_bkh = records;
+                            
+                            // 自动计算锚点：寻找最大串号群的第一个号
+                            if !self.pred_known_bkh.is_empty() {
+                                let mut sorted_bkh: Vec<u64> = self.pred_known_bkh.iter()
+                                    .filter_map(|r| r.baominghao.split("261").last()?.parse::<u64>().ok())
+                                    .collect();
+                                sorted_bkh.sort();
+
+                                // 寻找最大串号群 (相邻间隔 <= 10)
+                                let mut max_group = Vec::new();
+                                let mut current_group = Vec::new();
+                                
+                                for i in 0..sorted_bkh.len() {
+                                    if i == 0 {
+                                        current_group.push(sorted_bkh[i]);
+                                    } else {
+                                        if sorted_bkh[i] - sorted_bkh[i-1] <= 10 {
+                                            current_group.push(sorted_bkh[i]);
+                                        } else {
+                                            if current_group.len() > max_group.len() {
+                                                max_group = current_group.clone();
+                                            }
+                                            current_group = vec![sorted_bkh[i]];
+                                        }
+                                    }
+                                }
+                                if current_group.len() > max_group.len() {
+                                    max_group = current_group;
+                                }
+
+                                if let Some(&first_bkh) = max_group.first() {
+                                    self.pred_boundary = first_bkh;
+                                    self.pred_boundary_str = first_bkh.to_string();
+                                    self.log(format!("【算法启动】成功识别最大串号群（共{}人），锁定首个账号尾数 {} 为雷达启动锚点", max_group.len(), first_bkh));
+                                }
+                            }
+                            
                             self.status_message = format!("已加载 {} 条已知报考号", count);
                             self.log(&self.status_message);
                         }
@@ -755,60 +792,24 @@ impl GaokaoApp {
                 }
             });
 
+
             ui.add_space(4.0);
 
-            // boundary + range params
+            // 盲推锚点定位状态提示（替换原有的边界输入框）
             ui.horizontal(|ui| {
-                ui.label("已知边界报考号（后5位）：");
-                ui.add_sized([100.0, 0.0], egui::TextEdit::singleline(&mut self.pred_boundary_str));
-                if ui.button("应用").clicked() {
-                    self.pred_boundary = self.pred_boundary_str.trim().parse().unwrap_or(0);
-                    if self.pred_boundary > 0 && !self.pred_class_list.is_empty() {
-                        let cls_key = &self.pred_class_list[self.pred_selected_class].clone();
-                        let target_year = self.pred_year_filter as u32;
-                        let target_class = cls_key.split('-').nth(1).unwrap_or("").to_string();
-                        let count = self.pred_sfz_records.iter()
-                            .filter(|r| {
-                                let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
-                                if ruxue != target_year { return false; }
-                                if let Some((_, c, _)) = Self::extract_grade_class(&r.organization) {
-                                    c == target_class
-                                } else { false }
-                            }).count();
-                        let margin = self.pred_search_margin as u64;
-                        self.pred_range_end = self.pred_boundary - 1;
-                        self.pred_range_start = self.pred_range_end.saturating_sub(count as u64 + margin);
-                        self.log(format!("搜索范围: {} ~ {} (班级{} {}人)", self.pred_range_start, self.pred_range_end, target_class, count));
-                    }
+                ui.label("🛰️ 盲推锚点定位：");
+                if self.pred_boundary > 0 {
+                    ui.label(egui::RichText::new(format!("已自动定位初始锚点考号尾数：{}", self.pred_boundary)).color(egui::Color32::GREEN));
+                } else if !self.pred_known_bkh.is_empty() {
+                    ui.label("正在解析主串号群...");
+                } else {
+                    ui.label(egui::RichText::new("请先加载【已知报考号表格】以获取启动锚点").color(egui::Color32::YELLOW));
                 }
             });
-
-            if self.pred_boundary > 0 {
-                ui.horizontal(|ui| {
-                    ui.label(format!(
-                        "搜索范围：{} ~ {}（{}~{}人）",
-                        self.pred_range_start,
-                        self.pred_range_end,
-                        self.pred_range_end - self.pred_range_start + 1,
-                        self.pred_class_list.get(self.pred_selected_class).map(|c| {
-                            self.pred_sfz_records.iter()
-                                .filter(|r| {
-                                    if let Some((g, cls, _)) = Self::extract_grade_class(&r.organization) {
-                                        format!("{}-{}", g, cls) == *c
-                                    } else { false }
-                                }).count()
-                        }).unwrap_or(0)
-                    ));
-                    ui.add_space(16.0);
-                    ui.label("容错边界：");
-                    ui.add(egui::Slider::new(&mut self.pred_search_margin, 0..=100).text("个号"));
-                });
-            }
 
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
-
             // params (concurrency etc.)
             ui.horizontal(|ui| {
                 ui.label("并发浏览器数：");
@@ -1171,26 +1172,7 @@ impl GaokaoApp {
 impl GaokaoApp {
     fn start_prediction(&mut self, _ctx: &egui::Context) {
         if self.pred_boundary == 0 {
-            self.status_message = "请先输入边界报考号".to_string();
-            return;
-        }
-
-        let cls_key = &self.pred_class_list[self.pred_selected_class].clone();
-        let target_year = self.pred_year_filter as u32;
-        let target_class = cls_key.split('-').nth(1).unwrap_or("").to_string();
-        let students: Vec<(String, String)> = self.pred_sfz_records.iter()
-            .filter(|r| {
-                let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
-                if ruxue != target_year { return false; }
-                if let Some((_, c, _)) = Self::extract_grade_class(&r.organization) {
-                    c == target_class
-                } else { false }
-            })
-            .map(|r| (r.name.clone(), r.shenfenzheng.clone()))
-            .collect();
-
-        if students.is_empty() {
-            self.status_message = "该班级没有学生".to_string();
+            self.status_message = "未知报考号表格为空，无法定位雷达启动锚点".to_string();
             return;
         }
 
@@ -1198,15 +1180,6 @@ impl GaokaoApp {
         *self.pred_results.try_lock().unwrap() = Vec::new();
         self.pred_displayed_results.clear();
         *self.cancel_flag.try_lock().unwrap() = false;
-
-        {
-            let mut p = self.pred_progress.try_lock().unwrap();
-            p.total = students.len();
-            p.matched = 0;
-            p.not_found = 0;
-            p.current_name = String::new();
-            p.current_exam = String::new();
-        }
 
         let base_bkh = "264211261".to_string();
         let concurrency = self.concurrency as usize;
@@ -1221,151 +1194,192 @@ impl GaokaoApp {
         let cancel = self.cancel_flag.clone();
         let pred_results = self.pred_results.clone();
         let pred_progress = self.pred_progress.clone();
-        let mut range_start = self.pred_range_start;
-        let mut range_end = self.pred_range_end;
         let delay_ms = self.delay_ms as u64;
         let continuous = self.pred_continuous;
+        
+        // 基础学生全量库（供自动跨班时筛选）
+        let all_sfz_records = self.pred_sfz_records.clone();
         let class_list = self.pred_class_list.clone();
         let mut current_class_idx = self.pred_selected_class;
-        let mut cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
-        self.log(format!(
-            "开始推算: 班级 {} ({} 人), 范围 {}~{}",
-            cls_key, students.len(), range_start, range_end
-        ));
+        
+        // 动态雷达初始锚点
+        let mut radar_anchor = self.pred_boundary;
 
         tokio::spawn(async move {
+            // 1. 初始化高并发浏览器池
             let pool = match crate::browser::BrowserPool::new(
-                concurrency,
-                hide_browser,
-                step_delay,
-                captcha_retries,
-                captcha_wait_ms,
-                &target_url,
-                Some(logs.clone()),
-                turbo,
+                concurrency, hide_browser, step_delay, captcha_retries, captcha_wait_ms,
+                &target_url, Some(logs.clone()), turbo,
             ).await {
                 Ok(p) => p,
                 Err(e) => {
                     let mut l = logs.lock().await;
-                    l.push(format!("[ERROR] 浏览器池启动失败: {}", e));
+                    l.push(format!("[ERROR] 浏览器池启动失败：{}", e));
                     return;
                 }
             };
 
+            // 跨班级级联多米诺循环
             loop {
                 if *cancel.lock().await { break; }
+                if current_class_idx >= class_list.len() { break; }
 
                 let cls_name = class_list[current_class_idx].clone();
                 let target_class = cls_name.split('-').nth(1).unwrap_or("").to_string();
-                let cls_students: Vec<(String, String)> = students.iter()
-                    .filter(|(name, _)| !cache.contains_key(name.as_str()))
-                    .cloned()
+                let target_year = cls_name.split('-').nth(0).unwrap_or("").parse::<f64>().unwrap_or(2023.0) as u32;
+
+                // 提取当前要攻克的预备班级全体学生（按身份证名单）
+                let mut students: Vec<(String, String)> = all_sfz_records.iter()
+                    .filter(|r| {
+                        let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
+                        if ruxue != target_year { return false; }
+                        if let Some((_, c, _)) = GaokaoApp::extract_grade_class(&r.organization) {
+                            c == target_class
+                        } else { false }
+                    })
+                    .map(|r| (r.name.clone(), r.shenfenzheng.clone()))
                     .collect();
 
-                if cls_students.is_empty() {
+                if students.is_empty() {
                     let mut l = logs.lock().await;
-                    l.push(format!("[PREDICT] {} 所有学生已缓存，跳过", cls_name));
-                } else {
+                    l.push(format!("[跳过] 班级 {} 没有学生数据", cls_name));
+                    if continuous && current_class_idx > 0 {
+                        current_class_idx -= 1;
+                        continue;
+                    } else { break; }
+                }
+
+                let class_size = students.len();
+                {
+                    let mut p = pred_progress.lock().await;
+                    p.total = class_size;
+                    p.matched = 0; p.not_found = 0;
+                }
+
+                let mut l = logs.lock().await;
+                l.push(format!("=================================================="));
+                l.push(format!("[🔥开始攻克] 目标班级：{} | 全班总人数：{}人", cls_name, class_size));
+                drop(l);
+
+                // ====================================================
+                // 阶段一：动态雷达盲推探测 (基于班级人数砍半平分算法)
+                // ====================================================
+                let search_span = class_size / 2;
+                let radar_step = (search_span / 3).max(1) as u64;
+
+                let mut base_hit_bkh: Option<u64> = None;
+                let mut current_radar_base = radar_anchor;
+
+                // 雷达推进死循环，直到撞中基地，或被外部取消
+                loop {
+                    if *cancel.lock().await { break; }
+
+                    let probe_1 = current_radar_base.saturating_sub(1);
+                    let probe_2 = current_radar_base.saturating_sub(1 + radar_step);
+                    let probe_3 = current_radar_base.saturating_sub(1 + radar_step * 2);
+                    let next_radar_base = current_radar_base.saturating_sub(radar_step * 3);
+
+                    let probes = vec![(probe_1, 1), (probe_2, 2), (probe_3, 3)];
+                    
                     let mut l = logs.lock().await;
-                    l.push(format!("[PREDICT] 开始推算 {} ({} 人未缓存), 范围 {}~{}",
-                        cls_name, cls_students.len(), range_start, range_end));
+                    l.push(format!("[雷达组装] 步长={}, 正在发射探针群：[#{}]-{}, [#{}]-{}, [#{}]-{}", 
+                        radar_step, probes[0].1, probes[0].0, probes[1].1, probes[1].0, probes[2].1, probes[2].0));
                     drop(l);
 
-                    let results = prediction::predict_class_batch(
+                    {
+                        let mut p = pred_progress.lock().await;
+                        p.current_batch = format!("[雷达阶段] 正在用探针号群 [{}, {}, {}] 广播全班...", probe_1, probe_2, probe_3);
+                    }
+
+                    if let Some((hit_bkh, hit_probe_depth)) = crate::prediction::run_radar_probes(
                         pool.clone(),
-                        cls_students,
-                        base_bkh.clone(),
-                        range_start,
-                        range_end,
+                        &students,
+                        &base_bkh,
+                        probes,
+                        concurrency,
+                        cancel.clone(),
+                        logs.clone()
+                    ).await {
+                        base_hit_bkh = Some(hit_bkh);
+                        
+                        let mut l = logs.lock().await;
+                        l.push(format!("🎉 [雷达回波成功!] 撞中基地考号：{}{} (来自#{}号探针)", base_bkh, hit_bkh, hit_probe_depth));
+                        drop(l);
+                        break;
+                    }
+
+                    if next_radar_base == 0 || next_radar_base == current_radar_base {
+                        let mut l = logs.lock().await;
+                        l.push(format!("[警告] 雷达探测已达尾数 0 极限，未发现任何匹配，班级推算被迫挂起"));
+                        break;
+                    }
+                    current_radar_base = next_radar_base;
+                }
+
+                // ====================================================
+                // 阶段二：基地锁定后的【大规模矩阵扫射清洗】
+                // ====================================================
+                if let Some(hit_number) = base_hit_bkh {
+                    let scan_start = hit_number.saturating_sub(class_size as u64 + 25);
+                    let scan_end = hit_number + 45;
+                    
+                    let mut bkh_pool: Vec<u64> = (scan_start..=scan_end).collect();
+                    bkh_pool.reverse();
+
+                    let mut l = logs.lock().await;
+                    l.push(format!("[扫射准备] 锁定全班考号滑窗区间：{} ~ {} (共 {} 个预备号)", scan_start, scan_end, bkh_pool.len()));
+                    drop(l);
+
+                    let class_results = crate::prediction::run_matrix_sweep(
+                        pool.clone(),
+                        &mut students,
+                        &base_bkh,
+                        bkh_pool,
                         concurrency,
                         cancel.clone(),
                         pred_progress.clone(),
-                        &mut cache,
-                        perf_logs.clone(),
+                        logs.clone(),
+                        perf_logs.clone()
                     ).await;
 
-                    {
-                        let mut r = pred_results.lock().await;
-                        for rec in results {
-                            if !r.iter().any(|x| x.name == rec.name) {
-                                r.push(rec);
+                    let mut r_lock = pred_results.lock().await;
+                    let mut min_resolved_bkh = u64::MAX;
+                    
+                    for rec in class_results {
+                        if rec.status == crate::data::PredictedStatus::Matched {
+                            if let Some(num) = rec.exam_number.split("261").last().and_then(|v| v.parse::<u64>().ok()) {
+                                if num < min_resolved_bkh { min_resolved_bkh = num; }
                             }
                         }
-                    }
-
-                    // Auto-save cache after each class
-                    {
-                        let mut l = logs.lock().await;
-                        l.push(format!("[PREDICT] {} 完成，已缓存 {} 条", cls_name, cache.len()));
-                    }
-                }
-
-                if !continuous || current_class_idx == 0 {
-                    break;
-                }
-
-                // Move to next class (previous numerically)
-                if range_start == 0 { break; }
-                let prev_idx = current_class_idx.checked_sub(1);
-                if prev_idx.is_none() { break; }
-                current_class_idx = prev_idx.unwrap();
-
-                // Readjust range: new boundary = old range_start (first number found)
-                // Actually we use the minimum found number as the new boundary
-                let min_found = cache.values()
-                    .filter_map(|v| v.split("261").last()?.parse::<u64>().ok())
-                    .min().unwrap_or(range_start);
-
-                range_end = min_found.saturating_sub(1);
-                let prev_cls = &class_list[current_class_idx];
-                let prev_cls_name = prev_cls.split('-').nth(1).unwrap_or("");
-                let prev_count = students.iter().filter(|(n,_)| {
-                    let cls_info = ""; // We don't have class info per student here
-                    true // approximate: all students belong to the same year
-                }).count();
-                let margin = 10u64;
-                range_start = range_end.saturating_sub(prev_count as u64 + margin);
-
-                let mut l = logs.lock().await;
-                l.push(format!("[PREDICT] 继续推 {} (范围 {}~{}), 当前缓存 {} 条",
-                    prev_cls, range_start, range_end, cache.len()));
-
-                if !turbo && delay_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                }
-            }
-
-            // Auto-save final results
-            if let Ok(r) = pred_results.try_lock() {
-                if !r.is_empty() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Excel", &["xlsx"])
-                        .set_file_name("推算结果.xlsx")
-                        .save_file()
-                    {
-                        use rust_xlsxwriter::*;
-                        let mut workbook = Workbook::new();
-                        let sheet = workbook.add_worksheet();
-                        let headers = ["姓名", "身份证号", "推算报考号", "状态"];
-                        for (col, h) in headers.iter().enumerate() {
-                            let _ = sheet.write_string(0, col as u16, *h);
+                        if !r_lock.iter().any(|x| x.name == rec.name) {
+                            r_lock.push(rec);
                         }
-                        for (row, rec) in r.iter().enumerate() {
-                            let ri = row as u32 + 1;
-                            let _ = sheet.write_string(ri, 0, &rec.name);
-                            let _ = sheet.write_string(ri, 1, &rec.shenfenzheng);
-                            let _ = sheet.write_string(ri, 2, &rec.exam_number);
-                            let status = match &rec.status {
-                                PredictedStatus::Matched => "已匹配",
-                                PredictedStatus::NotFound => "未找到",
-                            };
-                            let _ = sheet.write_string(ri, 3, status);
+                    }
+
+                    // ====================================================
+                    // 阶段三：多米诺骨牌跨班滚动准备
+                    // ====================================================
+                    if continuous && current_class_idx > 0 {
+                        if min_resolved_bkh != u64::MAX {
+                            radar_anchor = min_resolved_bkh.saturating_sub(1);
+                            let mut l = logs.lock().await;
+                            l.push(format!("🔄 [自动跨班推进] 本班清洗完毕，提取全班最小号尾数 {}，设定新雷达锚点为：{}，准备攻克上一个班级...", min_resolved_bkh, radar_anchor));
+                        } else {
+                            radar_anchor = current_radar_base.saturating_sub(class_size as u64);
                         }
-                        let _ = workbook.save(&path);
+                        current_class_idx -= 1;
+                        if !turbo && delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                        continue;
                     }
                 }
+
+                break;
             }
+            
+            let mut l = logs.lock().await;
+            l.push(format!("🏁 所有可预测推算任务全部结束。"));
         });
     }
 

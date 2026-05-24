@@ -1,5 +1,4 @@
-/target
-*.xlsx
-*.xls
-__pycache__/
-chars/
+```
+target/
+**/*.rs.bk
+```
