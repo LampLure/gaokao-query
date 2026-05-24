@@ -509,9 +509,12 @@ impl BrowserClient {
 
             // Poll for verification result (200ms interval, server usually responds in 0.5-2s)
             self.perf_event("验证码点击完成");
+            // Wait at least 2s total (matching original 2s blind sleep)
+            // but with polling so early success is detected faster
             let interval = if self.turbo { 100u64 } else { 200u64 };
+            let max_polls = (2000 / interval).max(5);
             let mut still_visible = true;
-            for _ in 0..15 {  // max 1.5s (turbo) or 3s (normal)
+            for _ in 0..max_polls {
                 let r: bool = page.evaluate_expression(
                     r#"(function() {
                         const m = document.getElementById('captchaModal');

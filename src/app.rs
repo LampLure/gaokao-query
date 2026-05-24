@@ -66,6 +66,7 @@ pub struct GaokaoApp {
     // performance profiling
     perf_logs: Arc<Mutex<Vec<Vec<PerfEvent>>>>,
     perf_stats: Vec<PerfRecord>,
+    captcha_stats: Arc<Mutex<(u64, u64)>>,  // (total, ok)
     // cancellation
     cancel_flag: Arc<Mutex<bool>>,
 }
@@ -125,6 +126,7 @@ impl GaokaoApp {
             displayed_logs: Vec::new(),
             perf_logs: Arc::new(Mutex::new(Vec::new())),
             perf_stats: Vec::new(),
+            captcha_stats: Arc::new(Mutex::new((0, 0))),
             cancel_flag: Arc::new(Mutex::new(false)),
         };
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
@@ -343,6 +345,15 @@ impl eframe::App for GaokaoApp {
                     let tb = self.config.turbo;
                     ui.checkbox(&mut self.config.turbo, "🔥 暴力");
                     if tb != self.config.turbo { self.config_dirty = true; }
+                    if let Ok(cs) = self.captcha_stats.try_lock() {
+                        let rate = if cs.0 > 0 {
+                            format!("验证码 {}/{} ({:.0}%)", cs.1, cs.0,
+                                cs.1 as f64 / cs.0 as f64 * 100.0)
+                        } else {
+                            "验证码 --%".to_string()
+                        };
+                        ui.label(rate);
+                    }
                 });
             });
             ui.separator();
@@ -976,6 +987,7 @@ impl GaokaoApp {
         let target_url = self.target_url.clone();
         let logs = self.debug_logs.clone();
         let perf_logs = self.perf_logs.clone();
+        let captcha_stats = self.captcha_stats.clone();
         let turbo = self.config.turbo;
 
         {
@@ -1001,6 +1013,7 @@ impl GaokaoApp {
             };
 
             let perf_logs = perf_logs.clone();
+            let captcha_stats = captcha_stats.clone();
             let mut handles = Vec::new();
             for record in &matched {
                 if *cancel.lock().await { break; }
@@ -1011,6 +1024,7 @@ impl GaokaoApp {
                 let cancel = cancel.clone();
                 let logs = logs.clone();
                 let perf_logs = perf_logs.clone();
+                let captcha_stats = captcha_stats.clone();
                 let record = record.clone();
                 let delay = delay;
 
@@ -1069,6 +1083,13 @@ impl GaokaoApp {
                         }
 
                         pool.release(permit, client);
+
+                        // Track captcha stats
+                        {
+                            let mut cs = captcha_stats.lock().await;
+                            cs.0 += 1;
+                            if result.is_ok() { cs.1 += 1; }
+                        }
 
                         match result {
                             Ok(mut r) => {
