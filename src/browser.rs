@@ -481,24 +481,23 @@ impl BrowserPool {
         target_url: &str,
         logs: Option<Arc<Mutex<Vec<String>>>>,
     ) -> Result<Arc<Self>, String> {
-        let mut clients = VecDeque::with_capacity(count);
+        let launch_delay = if step_delay_ms > 0 { step_delay_ms } else { 100 };
+        let mut handles = Vec::with_capacity(count);
         for i in 0..count {
-            let client = BrowserClient::new_with_log(
-                false,
-                logs.clone(),
-                step_delay_ms,
-                captcha_retries,
-                captcha_wait_ms,
-                hide_browser,
-                target_url,
-            )
-            .await
-            .map_err(|e| format!("第{}个浏览器启动失败: {}", i + 1, e))?;
-            clients.push_back(client);
+            let url = target_url.to_string();
+            let l = logs.clone();
+            handles.push(tokio::spawn(async move {
+                BrowserClient::new_with_log(false, l, step_delay_ms, captcha_retries, captcha_wait_ms, hide_browser, &url).await
+            }));
             if i + 1 < count {
-                let d = if step_delay_ms > 0 { step_delay_ms } else { 100 };
-                tokio::time::sleep(std::time::Duration::from_millis(d)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(launch_delay)).await;
             }
+        }
+        let mut clients = VecDeque::with_capacity(count);
+        for (i, h) in handles.into_iter().enumerate() {
+            let client = h.await.map_err(|_| "浏览器启动任务异常终止".to_string())?
+                .map_err(|e| format!("第{}个浏览器启动失败: {}", i + 1, e))?;
+            clients.push_back(client);
         }
         Ok(Arc::new(Self {
             clients: Mutex::new(clients),
