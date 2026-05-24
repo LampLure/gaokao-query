@@ -15,10 +15,18 @@ const TARGET_URL: &str = "https://cx.hbea.edu.cn/gkkd/2026/eb3f6190-590c-4f79-9b
 pub struct BrowserClient {
     _browser: Arc<Browser>,
     page: Arc<Mutex<Page>>,
+    log: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl BrowserClient {
     pub async fn new(headed: bool) -> Result<Self, String> {
+        Self::new_with_log(headed, None).await
+    }
+
+    pub async fn new_with_log(
+        headed: bool,
+        log: Option<Arc<Mutex<Vec<String>>>>,
+    ) -> Result<Self, String> {
         let chrome_path = find_chrome()
             .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
 
@@ -53,6 +61,7 @@ impl BrowserClient {
         Ok(Self {
             _browser: browser,
             page: Arc::new(Mutex::new(page)),
+            log,
         })
     }
 
@@ -228,7 +237,18 @@ impl BrowserClient {
         let cw = dims["w"].as_f64().unwrap_or(300.0);
         let ch = dims["h"].as_f64().unwrap_or(150.0);
 
-        let points = ocr::solve_captcha(temp_path, &expected_chars, cw, ch)?;
+        let ocr_result = ocr::solve_captcha(temp_path, &expected_chars, cw, ch)?;
+
+        // Log OCR debug info to debug window
+        if let Some(log) = &self.log {
+            if let Ok(mut l) = log.try_lock() {
+                for line in ocr_result.debug_info.lines() {
+                    l.push(format!("[OCR] {}", line));
+                }
+            }
+        }
+
+        let points = ocr_result.points;
 
         for point in &points {
             let click_js = format!(

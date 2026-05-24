@@ -489,7 +489,7 @@ impl GaokaoApp {
                     let mut last_err = String::new();
                     for sfz in &candidates {
                         if *cancel_inner.lock().await { return; }
-                        match crate::browser::BrowserClient::new(debug_mode).await {
+                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone())).await {
                             Ok(client) => {
                                 match client.query_single(&record.baominghao, sfz).await {
                                     Ok(mut r) => {
