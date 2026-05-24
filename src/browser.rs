@@ -19,6 +19,7 @@ pub struct BrowserClient {
     page: Arc<Mutex<Page>>,
     log: Option<Arc<Mutex<Vec<String>>>>,
     step_delay_ms: u64,
+    captcha_retries: u32,
 }
 
 impl BrowserClient {
@@ -35,6 +36,7 @@ impl BrowserClient {
         _headed: bool,
         log: Option<Arc<Mutex<Vec<String>>>>,
         step_delay_ms: u64,
+        captcha_retries: u32,
         hide_browser: bool,
     ) -> Result<Self, String> {
         let chrome_path = find_chrome()
@@ -78,6 +80,7 @@ impl BrowserClient {
             page: Arc::new(Mutex::new(page)),
             log,
             step_delay_ms,
+            captcha_retries,
         })
     }
 
@@ -208,7 +211,7 @@ impl BrowserClient {
     }
 
     async fn solve_captcha_modal(&self, page: &Page) -> Result<(), String> {
-        let max_retries = 3;
+        let max_retries = self.captcha_retries;
         let temp_path = "/tmp/gaokao_captcha.png";
 
         for attempt in 1..=max_retries {
