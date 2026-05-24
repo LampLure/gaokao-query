@@ -842,9 +842,12 @@ impl GaokaoApp {
                         let ratio = if p.total > 0 { completed as f32 / p.total as f32 } else { 0.0 };
                         ui.add(egui::ProgressBar::new(ratio).text(format!("{}/{}", completed, p.total)));
                         ui.label(format!(
-                            "✅ 已匹配: {}   ❌ 未找到: {}   📌 当前: {}   🔍 正在试号: {}",
-                            p.matched, p.not_found, p.current_name, p.current_exam
+                            "✅ {}  ❌ {}  📌 {}",
+                            p.matched, p.not_found, p.current_name
                         ));
+                        if !p.current_batch.is_empty() {
+                            ui.label(p.current_batch.clone());
+                        }
                     }
                 }
             });
@@ -1192,6 +1195,7 @@ impl GaokaoApp {
         let target_url = self.target_url.clone();
         let turbo = self.config.turbo;
         let logs = self.debug_logs.clone();
+        let perf_logs = self.perf_logs.clone();
         let cancel = self.cancel_flag.clone();
         let pred_results = self.pred_results.clone();
         let pred_progress = self.pred_progress.clone();
@@ -1256,6 +1260,7 @@ impl GaokaoApp {
                         cancel.clone(),
                         pred_progress.clone(),
                         &mut cache,
+                        perf_logs.clone(),
                     ).await;
 
                     {

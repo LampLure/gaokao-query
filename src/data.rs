@@ -143,6 +143,7 @@ pub struct PredictionProgress {
     pub not_found: usize,
     pub current_name: String,
     pub current_exam: String,
+    pub current_batch: String,
 }
 
 #[derive(Debug, Clone)]

@@ -17,6 +17,7 @@ pub async fn predict_class_batch(
     cancel: Arc<Mutex<bool>>,
     progress: Arc<Mutex<PredictionProgress>>,
     cache: &mut HashMap<String, String>,  // name -> exam_number (in/out)
+    perf_logs: Arc<Mutex<Vec<Vec<PerfEvent>>>>,
 ) -> Vec<PredictedRecord> {
     let mut results: Vec<PredictedRecord> = Vec::new();
     let n = students.len();
@@ -59,11 +60,6 @@ pub async fn predict_class_batch(
 
         let bkh = format!("{}{:05}", base_bkh, exam_num);
 
-        {
-            let mut p = progress.lock().await;
-            p.current_exam = format!("{:05}", exam_num);
-        }
-
         // Batch try: this exam_num with `concurrency` students at a time
         let mut found = false;
         let chunk_size = concurrency.min(remaining.len());
@@ -72,6 +68,18 @@ pub async fn predict_class_batch(
             if *cancel.lock().await { break; }
 
             let end = (i + chunk_size).min(remaining.len());
+
+            // Update batch display
+            {
+                let batch_names: Vec<String> = remaining[i..end].iter().map(|(n, _, _)| n.clone()).collect();
+                let mut p = progress.lock().await;
+                p.current_exam = format!("{:05}", exam_num);
+                p.current_batch = format!("正在用 {} 等 {} 人 碰撞报考号 {}",
+                    batch_names.first().map(|s| s.as_str()).unwrap_or("?"),
+                    batch_names.len(),
+                    p.current_exam);
+            }
+
             let mut handles = Vec::new();
             for idx in i..end {
                 let (name, id_card, _) = &remaining[idx];
@@ -79,10 +87,19 @@ pub async fn predict_class_batch(
                 let bkh = bkh.clone();
                 let id = id_card.clone();
                 let name = name.clone();
+                let perf = perf_logs.clone();
 
                 handles.push(tokio::spawn(async move {
-                    let (permit, client) = pool.acquire().await;
+                    let (permit, mut client) = pool.acquire().await;
+                    let record_perf: Arc<Mutex<Vec<PerfEvent>>> = Arc::new(Mutex::new(Vec::new()));
+                    client.set_perf(Some(record_perf.clone()));
                     let result = client.query_single(&bkh, &id).await;
+                    if let Ok(pdata) = record_perf.try_lock() {
+                        if !pdata.is_empty() {
+                            let mut pl = perf.lock().await;
+                            pl.push(pdata.clone());
+                        }
+                    }
                     pool.release(permit, client);
                     (name, id, result)
                 }));
