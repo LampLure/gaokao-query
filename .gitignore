@@ -1,3 +1,4 @@
 /target
 *.xlsx
 *.xls
+__pycache__/
