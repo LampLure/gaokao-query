@@ -45,18 +45,17 @@ impl BrowserClient {
         let instance_id = INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
         let user_data_dir = format!("/tmp/chromiumoxide-runner-{}", instance_id);
 
-        let headless = if hide_browser {
-            HeadlessMode::New
-        } else {
-            HeadlessMode::False
-        };
-
-        let config = BrowserConfig::builder()
+        let mut builder = BrowserConfig::builder()
             .chrome_executable(chrome_path)
-            .headless_mode(headless)
+            .headless_mode(HeadlessMode::False)
             .user_data_dir(&user_data_dir)
-            .arg("--disable-blink-features=AutomationControlled")
-            .build()
+            .arg("--disable-blink-features=AutomationControlled");
+
+        if hide_browser {
+            builder = builder.arg("--window-position=10000,10000");
+        }
+
+        let config = builder.build()
             .map_err(|e| format!("浏览器配置失败: {}", e))?;
 
         let (browser, mut handler) = Browser::launch(config)
