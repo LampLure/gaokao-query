@@ -79,7 +79,7 @@ impl Default for AppConfig {
             baokao_path: String::new(),
             sfz_path: String::new(),
             target_url: "https://cx.hbea.edu.cn/gkkd/2026/eb3f6190-590c-4f79-9b88-81a1d0aa0a2b".into(),
-            concurrency: 1,
+            concurrency: 3,
             delay_ms: 2000,
             step_delay_ms: 1000,
             captcha_retries: 5,
@@ -93,16 +93,18 @@ impl Default for AppConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scene {
     ExamRoomQuery,
+    NumberPrediction,
 }
 
 impl Scene {
     pub fn name(&self) -> &str {
         match self {
             Scene::ExamRoomQuery => "考场查询",
+            Scene::NumberPrediction => "报考号推算",
         }
     }
     pub fn all() -> Vec<Scene> {
-        vec![Scene::ExamRoomQuery]
+        vec![Scene::ExamRoomQuery, Scene::NumberPrediction]
     }
 }
 
@@ -112,4 +114,27 @@ pub enum QueryStatus {
     Querying,
     Success,
     Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct PredictedRecord {
+    pub name: String,
+    pub shenfenzheng: String,
+    pub exam_number: String,
+    pub status: PredictedStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PredictedStatus {
+    Matched,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PredictionProgress {
+    pub total: usize,
+    pub matched: usize,
+    pub not_found: usize,
+    pub current_name: String,
+    pub current_exam: String,
 }

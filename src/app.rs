@@ -7,6 +7,7 @@ use crate::config;
 use crate::data::*;
 use crate::matcher;
 use crate::parser;
+use crate::prediction;
 
 #[derive(Clone, PartialEq)]
 enum QueryState {
@@ -22,19 +23,38 @@ pub struct GaokaoApp {
     // scene
     scene: Scene,
     target_url: String,
-    // state
+    // ---- 考场查询 scene ----
     baokao_path: Option<String>,
     sfz_path: Option<String>,
     matched_records: Vec<MatchedRecord>,
     results: Arc<Mutex<Vec<QueryResult>>>,
     displayed_results: Vec<QueryResult>,
     query_state: QueryState,
+    // ---- 报考号推算 scene ----
+    pred_sfz_path: Option<String>,
+    pred_bkh_path: Option<String>,
+    pred_sfz_records: Vec<ShenFenZhengRecord>,
+    pred_known_bkh: Vec<BaoKaoHaoRecord>,
+    pred_class_list: Vec<String>,
+    pred_selected_class: usize,
+    pred_year_filter: f64,
+    pred_boundary_str: String,
+    pred_boundary: u64,
+    pred_range_start: u64,
+    pred_range_end: u64,
+    pred_search_margin: u32,
+    pred_results: Arc<Mutex<Vec<PredictedRecord>>>,
+    pred_displayed_results: Vec<PredictedRecord>,
+    pred_state: QueryState,
+    // ---- shared params ----
     concurrency: u32,
     delay_ms: u32,
     step_delay_ms: u32,
     captcha_retries: u32,
     captcha_wait_ms: u32,
+    // shared progress
     progress: Arc<Mutex<QueryProgress>>,
+    pred_progress: Arc<Mutex<PredictionProgress>>,
     status_message: String,
     // debug
     debug_mode: bool,
@@ -68,12 +88,29 @@ impl GaokaoApp {
             results: Arc::new(Mutex::new(Vec::new())),
             displayed_results: Vec::new(),
             query_state: QueryState::Idle,
+            // prediction
+            pred_sfz_path: None,
+            pred_bkh_path: None,
+            pred_sfz_records: Vec::new(),
+            pred_known_bkh: Vec::new(),
+            pred_class_list: Vec::new(),
+            pred_selected_class: 0,
+            pred_year_filter: 2023.0,
+            pred_boundary_str: String::new(),
+            pred_boundary: 0,
+            pred_range_start: 0,
+            pred_range_end: 0,
+            pred_search_margin: 10,
+            pred_results: Arc::new(Mutex::new(Vec::new())),
+            pred_displayed_results: Vec::new(),
+            pred_state: QueryState::Idle,
             concurrency: cfg.concurrency,
             delay_ms: cfg.delay_ms,
             step_delay_ms: cfg.step_delay_ms,
             captcha_retries: cfg.captcha_retries,
             captcha_wait_ms: cfg.captcha_wait_ms,
             progress: Arc::new(Mutex::new(QueryProgress::default())),
+            pred_progress: Arc::new(Mutex::new(PredictionProgress::default())),
             status_message: String::new(),
             debug_mode: cfg.debug_mode,
             hide_browser: cfg.hide_browser,
@@ -81,7 +118,6 @@ impl GaokaoApp {
             displayed_logs: Vec::new(),
             cancel_flag: Arc::new(Mutex::new(false)),
         };
-        // auto-parse if saved paths exist
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
             app.parse_and_match();
         }
@@ -112,16 +148,55 @@ impl GaokaoApp {
         config::save(&self.config);
         self.config_dirty = false;
     }
+
+    // ---- class grouping helper ----
+    fn extract_grade_class(org: &str) -> Option<(String, String, String)> {
+        let parts: Vec<&str> = org.split('-').collect();
+        if parts.len() >= 6 {
+            let grade = parts[4].to_string();
+            let class_name = parts[6].to_string();
+            let full_grade = parts[3].to_string();
+            Some((grade, class_name, full_grade))
+        } else {
+            None
+        }
+    }
+
+    fn build_class_list(&mut self) {
+        let year = self.pred_year_filter;
+        let mut classes: Vec<(u32, String)> = Vec::new();
+        for r in &self.pred_sfz_records {
+            let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
+            if ruxue != year as u32 { continue; }
+            if let Some((_, cls, _)) = Self::extract_grade_class(&r.organization) {
+                let num: u32 = cls.trim_end_matches("班").parse().unwrap_or(0);
+                let key = format!("{}-{}", ruxue, cls);
+                if !classes.iter().any(|(_, k)| k == &key) {
+                    classes.push((num, key));
+                }
+            }
+        }
+        classes.sort_by_key(|(num, _)| *num);
+        self.pred_class_list = classes.into_iter().map(|(_, k)| k).collect();
+        if !self.pred_class_list.is_empty() {
+            self.pred_selected_class = 0;
+        }
+    }
 }
 
 impl eframe::App for GaokaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // sync async results to ui (sorted by baominghao)
+        // sync results
         if let Ok(r) = self.results.try_lock() {
             if r.len() != self.displayed_results.len() {
                 let mut sorted = r.clone();
                 sorted.sort_by(|a, b| a.baominghao.cmp(&b.baominghao));
                 self.displayed_results = sorted;
+            }
+        }
+        if let Ok(r) = self.pred_results.try_lock() {
+            if r.len() != self.pred_displayed_results.len() {
+                self.pred_displayed_results = r.clone();
             }
         }
         if let Ok(l) = self.debug_logs.try_lock() {
@@ -130,10 +205,9 @@ impl eframe::App for GaokaoApp {
             }
         }
 
-        // auto save
         self.auto_save_config();
 
-        // === sidebar: scene navigation ===
+        // === sidebar ===
         egui::SidePanel::left("sidebar")
             .resizable(false)
             .default_width(180.0)
@@ -199,214 +273,521 @@ impl eframe::App for GaokaoApp {
             ui.separator();
             ui.add_space(4.0);
 
-            // URL input
-            ui.horizontal(|ui| {
-                ui.label("目标网址：");
-                let mut url = self.target_url.clone();
-                if ui.add_sized([ui.available_width() - 60.0, 0.0], egui::TextEdit::singleline(&mut url)).changed() {
-                    self.target_url = url;
+            match self.scene {
+                Scene::ExamRoomQuery => self.ui_exam_room_query(ctx, ui),
+                Scene::NumberPrediction => self.ui_number_prediction(ctx, ui),
+            }
+
+            if self.query_state == QueryState::Running || self.query_state == QueryState::Paused
+                || self.pred_state == QueryState::Running
+            {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        });
+    }
+}
+
+// ============================================================
+// 考场查询 UI
+// ============================================================
+impl GaokaoApp {
+    fn ui_exam_room_query(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        // URL input
+        ui.horizontal(|ui| {
+            ui.label("目标网址：");
+            let mut url = self.target_url.clone();
+            if ui.add_sized([ui.available_width() - 60.0, 0.0], egui::TextEdit::singleline(&mut url)).changed() {
+                self.target_url = url;
+                self.config_dirty = true;
+            }
+        });
+        ui.add_space(8.0);
+
+        egui::Grid::new("upload_grid").num_columns(3).striped(true).show(ui, |ui| {
+            ui.label("报考号表格：");
+            let fname = self.baokao_path.as_ref()
+                .and_then(|p| p.split('/').last()).unwrap_or("未选择文件");
+            ui.label(fname);
+            if ui.button("📁 选择文件").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Excel", &["xlsx", "xls"]).pick_file()
+                {
+                    let s = path.to_string_lossy().to_string();
+                    self.baokao_path = Some(s.clone());
+                    self.config.baokao_path = s;
                     self.config_dirty = true;
+                    self.log(format!("选择报考号表格: {}", self.baokao_path.as_ref().unwrap()));
+                    self.parse_and_match();
+                }
+            }
+            ui.end_row();
+
+            ui.label("身份证和信息表格：");
+            let fname2 = self.sfz_path.as_ref()
+                .and_then(|p| p.split('/').last()).unwrap_or("未选择文件");
+            ui.label(fname2);
+            if ui.button("📁 选择文件").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Excel", &["xlsx", "xls"]).pick_file()
+                {
+                    let s = path.to_string_lossy().to_string();
+                    self.sfz_path = Some(s.clone());
+                    self.config.sfz_path = s;
+                    self.config_dirty = true;
+                    self.log(format!("选择身份证表格: {}", self.sfz_path.as_ref().unwrap()));
+                    self.parse_and_match();
+                }
+            }
+            ui.end_row();
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // matched table
+        if !self.matched_records.is_empty() {
+            ui.push_id("matched_section", |ui| {
+                ui.label(egui::RichText::new(format!(
+                    "📋 匹配结果（共 {} 条）", self.matched_records.len()
+                )).strong());
+                ui.add_space(4.0);
+
+                egui::ScrollArea::vertical().id_source("matched_table").max_height(180.0).show(ui, |ui| {
+                    TableBuilder::new(ui).id_source("matched")
+                        .striped(true)
+                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                        .column(Column::auto().resizable(true))
+                        .column(Column::auto().resizable(true))
+                        .column(Column::auto().resizable(true))
+                        .column(Column::auto().resizable(true))
+                        .column(Column::auto().resizable(true))
+                        .header(20.0, |mut h| {
+                            h.col(|ui| { ui.label("姓名"); });
+                            h.col(|ui| { ui.label("报名号"); });
+                            h.col(|ui| { ui.label("身份证号"); });
+                            h.col(|ui| { ui.label("报考信息"); });
+                            h.col(|ui| { ui.label("状态"); });
+                        })
+                        .body(|body| {
+                            body.rows(20.0, self.matched_records.len(), |mut row| {
+                                let i = row.index();
+                                if let Some(r) = self.matched_records.get(i) {
+                                    row.col(|ui| { ui.label(&r.name); });
+                                    row.col(|ui| { ui.label(&r.baominghao); });
+                                    row.col(|ui| {
+                                        let t = match &r.status {
+                                            MatchStatus::Matched(s) => s.clone(),
+                                            MatchStatus::Multiple => format!("同名{}人", r.shenfenzheng_candidates.len()),
+                                            MatchStatus::NotFound => "未找到".into(),
+                                            MatchStatus::Pending => "待匹配".into(),
+                                        };
+                                        ui.label(t);
+                                    });
+                                    row.col(|ui| { ui.label(&r.baokao_info); });
+                                    row.col(|ui| {
+                                        let (t, c) = match &r.status {
+                                            MatchStatus::Matched(_) => ("已匹配", egui::Color32::GREEN),
+                                            MatchStatus::Multiple => ("同名需穷举", egui::Color32::YELLOW),
+                                            MatchStatus::NotFound => ("未找到", egui::Color32::RED),
+                                            MatchStatus::Pending => ("待匹配", egui::Color32::GRAY),
+                                        };
+                                        ui.label(egui::RichText::new(t).color(c));
+                                    });
+                                }
+                            });
+                        });
+                });
+            });
+        }
+
+        ui.add_space(8.0);
+
+        // query controls
+        if !self.matched_records.is_empty() && self.query_state != QueryState::Running {
+            self.ui_query_params(ui);
+            ui.add_space(8.0);
+            self.ui_query_buttons(ui, ctx);
+        }
+
+        self.ui_progress(ui);
+
+        if !self.status_message.is_empty() {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.label(&self.status_message);
+        }
+
+        // results table
+        if !self.displayed_results.is_empty() {
+            self.ui_results_table(ui);
+        }
+    }
+
+    fn ui_query_params(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("并发数：");
+            ui.add(egui::Slider::new(&mut self.concurrency, 1..=10).text("个"));
+            ui.add_space(16.0);
+            ui.label("查询间隔：");
+            ui.add(egui::Slider::new(&mut self.delay_ms, 0..=10000).text("毫秒").suffix("ms"));
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("操作速度：");
+            ui.add(egui::Slider::new(&mut self.step_delay_ms, 100..=5000).text("ms/步").suffix("ms"));
+            ui.label(format!("({:.1}s)", self.step_delay_ms as f64 / 1000.0));
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("验证码重试：");
+            ui.add(egui::Slider::new(&mut self.captcha_retries, 1..=10).text("次"));
+            ui.add_space(16.0);
+            ui.label("首次等待：");
+            ui.add(egui::Slider::new(&mut self.captcha_wait_ms, 500..=10000).text("ms").suffix("ms"));
+        });
+    }
+
+    fn ui_query_buttons(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.push_id("query_controls", |ui| {
+                if self.query_state == QueryState::Idle {
+                    if ui.button(egui::RichText::new("▶ 开始查询").heading().color(egui::Color32::WHITE)).clicked() {
+                        self.start_query(ctx);
+                    }
+                }
+                if self.query_state == QueryState::Paused {
+                    if ui.button("▶ 继续").clicked() {
+                        *self.cancel_flag.try_lock().unwrap() = false;
+                        self.query_state = QueryState::Running;
+                        self.log("查询继续");
+                        self.start_query(ctx);
+                    }
+                    if ui.button("⏹ 重新开始").clicked() {
+                        *self.cancel_flag.try_lock().unwrap() = true;
+                        self.query_state = QueryState::Idle;
+                        self.log("查询已终止，准备重新开始");
+                    }
                 }
             });
-            ui.add_space(8.0);
-            egui::Grid::new("upload_grid")
-                .num_columns(3)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label("报考号表格：");
-                    let fname = self.baokao_path.as_ref()
-                        .and_then(|p| p.split('/').last()).unwrap_or("未选择文件");
-                    ui.label(fname);
-                    if ui.button("📁 选择文件").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Excel", &["xlsx", "xls"]).pick_file()
-                        {
-                            let s = path.to_string_lossy().to_string();
-                            self.baokao_path = Some(s.clone());
-                            self.config.baokao_path = s;
-                            self.config_dirty = true;
-                            self.log(format!("选择报考号表格: {}", self.baokao_path.as_ref().unwrap()));
-                            self.parse_and_match();
-                        }
-                    }
-                    ui.end_row();
+        });
+        if self.query_state == QueryState::Running {
+            ui.push_id("pause_btn", |ui| {
+                if ui.button(egui::RichText::new("⏸ 暂停").heading()).clicked() {
+                    *self.cancel_flag.try_lock().unwrap() = true;
+                    self.query_state = QueryState::Paused;
+                    self.log("查询暂停");
+                }
+            });
+        }
+    }
 
-                    ui.label("身份证和信息表格：");
-                    let fname2 = self.sfz_path.as_ref()
-                        .and_then(|p| p.split('/').last()).unwrap_or("未选择文件");
-                    ui.label(fname2);
-                    if ui.button("📁 选择文件").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Excel", &["xlsx", "xls"]).pick_file()
-                        {
-                            let s = path.to_string_lossy().to_string();
-                            self.sfz_path = Some(s.clone());
-                            self.config.sfz_path = s;
-                            self.config_dirty = true;
-                            self.log(format!("选择身份证表格: {}", self.sfz_path.as_ref().unwrap()));
-                            self.parse_and_match();
+    fn ui_progress(&mut self, ui: &mut egui::Ui) {
+        ui.push_id("progress_section", |ui| {
+            if let Ok(p) = self.progress.try_lock() {
+                if p.total > 0 {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+                    let ratio = if p.total > 0 { p.completed as f32 / p.total as f32 } else { 0.0 };
+                    ui.add(egui::ProgressBar::new(ratio).text(format!("{}/{}", p.completed, p.total)));
+                    ui.label(format!(
+                        "✅ 成功: {}   ❌ 失败: {}   📌 当前: {}",
+                        p.success, p.failed, p.current_name
+                    ));
+                }
+            }
+        });
+    }
+
+    fn ui_results_table(&mut self, ui: &mut egui::Ui) {
+        ui.push_id("results_section", |ui| {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("📊 查询结果").strong());
+            ui.add_space(4.0);
+
+            egui::ScrollArea::vertical().id_source("results_table").max_height(200.0).show(ui, |ui| {
+                TableBuilder::new(ui).id_source("results")
+                    .striped(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::auto().resizable(true))
+                    .column(Column::auto().resizable(true))
+                    .column(Column::auto().resizable(true))
+                    .column(Column::auto().resizable(true))
+                    .column(Column::auto().resizable(true))
+                    .column(Column::auto().resizable(true))
+                    .header(20.0, |mut h| {
+                        h.col(|ui| { ui.label("姓名"); });
+                        h.col(|ui| { ui.label("高考报名号"); });
+                        h.col(|ui| { ui.label("身份证号"); });
+                        h.col(|ui| { ui.label("科目名称"); });
+                        h.col(|ui| { ui.label("考点名称"); });
+                        h.col(|ui| { ui.label("状态/错误"); });
+                    })
+                    .body(|body| {
+                        body.rows(20.0, self.displayed_results.len(), |mut row| {
+                            let i = row.index();
+                            if let Some(r) = self.displayed_results.get(i) {
+                                row.col(|ui| { ui.label(&r.name); });
+                                row.col(|ui| { ui.label(&r.baominghao); });
+                                row.col(|ui| { ui.label(&r.shenfenzheng); });
+                                row.col(|ui| { ui.label(&r.kemumingcheng); });
+                                row.col(|ui| { ui.label(&r.kaodianmingcheng); });
+                                row.col(|ui| {
+                                    match &r.status {
+                                        QueryStatus::Success => {
+                                            ui.label(egui::RichText::new("✅ 成功").color(egui::Color32::GREEN));
+                                        }
+                                        QueryStatus::Failed(e) => {
+                                            ui.label(egui::RichText::new(format!("❌ {}", e)).color(egui::Color32::RED));
+                                        }
+                                        _ => {}
+                                    }
+                                });
+                            }
+                        });
+                    });
+            });
+
+            ui.add_space(8.0);
+            if ui.button("💾 保存结果到文件").clicked() {
+                self.save_results();
+            }
+        });
+    }
+}
+
+// ============================================================
+// 报考号推算 UI
+// ============================================================
+impl GaokaoApp {
+    fn ui_number_prediction(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("目标网址：");
+            let mut url = self.target_url.clone();
+            if ui.add_sized([ui.available_width() - 60.0, 0.0], egui::TextEdit::singleline(&mut url)).changed() {
+                self.target_url = url;
+                self.config_dirty = true;
+            }
+        });
+        ui.add_space(8.0);
+
+        // file selection
+        egui::Grid::new("pred_upload_grid").num_columns(3).striped(true).show(ui, |ui| {
+            ui.label("身份证和信息表格：");
+            let fname = self.pred_sfz_path.as_ref()
+                .and_then(|p| p.split('/').last()).unwrap_or("未选择文件");
+            ui.label(fname);
+            if ui.button("📁 选择文件").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Excel", &["xlsx", "xls"]).pick_file()
+                {
+                    let s = path.to_string_lossy().to_string();
+                    self.pred_sfz_path = Some(s.clone());
+                    self.log(format!("选择身份证表格: {}", s));
+                    match parser::parse_shenfenzheng(&s) {
+                        Ok(records) => {
+                            self.pred_sfz_records = records;
+                            self.build_class_list();
+                            self.status_message = format!(
+                                "解析完成: {} 条记录, {} 个班级",
+                                self.pred_sfz_records.len(),
+                                self.pred_class_list.len()
+                            );
+                            self.log(&self.status_message);
+                        }
+                        Err(e) => {
+                            self.status_message = format!("解析失败: {}", e);
+                            self.log(&self.status_message);
                         }
                     }
-                    ui.end_row();
+                }
+            }
+            ui.end_row();
+
+            ui.label("已知报考号表格（可选）：");
+            let fname2 = self.pred_bkh_path.as_ref()
+                .and_then(|p| p.split('/').last()).unwrap_or("未选择文件（可选）");
+            ui.label(fname2);
+            if ui.button("📁 选择文件").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Excel", &["xlsx", "xls"]).pick_file()
+                {
+                    let s = path.to_string_lossy().to_string();
+                    self.pred_bkh_path = Some(s.clone());
+                    self.log(format!("选择报考号表格: {}", s));
+                    match parser::parse_baokao_hao(&s) {
+                        Ok(records) => {
+                            let count = records.len();
+                            self.pred_known_bkh = records;
+                            self.status_message = format!("已加载 {} 条已知报考号", count);
+                            self.log(&self.status_message);
+                        }
+                        Err(e) => {
+                            self.status_message = format!("解析失败: {}", e);
+                            self.log(&self.status_message);
+                        }
+                    }
+                }
+            }
+            ui.end_row();
+        });
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // class selection + parameters
+        if !self.pred_sfz_records.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label("入学年份：");
+                let mut y = self.pred_year_filter as u32;
+                if ui.add(egui::Slider::new(&mut y, 2022..=2025).text("年")).changed() {
+                    self.pred_year_filter = y as f64;
+                    self.build_class_list();
+                }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("选择班级：");
+                if !self.pred_class_list.is_empty() {
+                    let mut selected = self.pred_selected_class;
+                    egui::ComboBox::from_id_source("class_selector")
+                        .selected_text(&self.pred_class_list[selected])
+                        .show_ui(ui, |ui| {
+                            for (i, cls) in self.pred_class_list.iter().enumerate() {
+                                ui.selectable_value(&mut selected, i, cls);
+                            }
+                        });
+                    if selected != self.pred_selected_class {
+                        self.pred_selected_class = selected;
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // boundary + range params
+            ui.horizontal(|ui| {
+                ui.label("已知边界报考号（后5位）：");
+                ui.add_sized([100.0, 0.0], egui::TextEdit::singleline(&mut self.pred_boundary_str));
+                if ui.button("应用").clicked() {
+                    self.pred_boundary = self.pred_boundary_str.trim().parse().unwrap_or(0);
+                    if self.pred_boundary > 0 && !self.pred_class_list.is_empty() {
+                        let cls = &self.pred_class_list[self.pred_selected_class];
+                        let count = self.pred_sfz_records.iter()
+                            .filter(|r| {
+                                if let Some((g, c, _)) = Self::extract_grade_class(&r.organization) {
+                                    format!("{}-{}", g, c) == *cls
+                                } else { false }
+                            }).count();
+                        let margin = self.pred_search_margin as u64;
+                        self.pred_range_end = self.pred_boundary - 1;
+                        self.pred_range_start = self.pred_range_end - count as u64 - margin;
+                        self.log(format!("搜索范围: {} ~ {}", self.pred_range_start, self.pred_range_end));
+                    }
+                }
+            });
+
+            if self.pred_boundary > 0 {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "搜索范围：{} ~ {}（{}~{}人）",
+                        self.pred_range_start,
+                        self.pred_range_end,
+                        self.pred_range_end - self.pred_range_start + 1,
+                        self.pred_class_list.get(self.pred_selected_class).map(|c| {
+                            self.pred_sfz_records.iter()
+                                .filter(|r| {
+                                    if let Some((g, cls, _)) = Self::extract_grade_class(&r.organization) {
+                                        format!("{}-{}", g, cls) == *c
+                                    } else { false }
+                                }).count()
+                        }).unwrap_or(0)
+                    ));
+                    ui.add_space(16.0);
+                    ui.label("容错边界：");
+                    ui.add(egui::Slider::new(&mut self.pred_search_margin, 0..=100).text("个号"));
                 });
+            }
 
             ui.add_space(8.0);
             ui.separator();
             ui.add_space(8.0);
 
-            // matched table
-            if !self.matched_records.is_empty() {
-                ui.push_id("matched_section", |ui| {
-                    ui.label(egui::RichText::new(format!(
-                        "📋 匹配结果（共 {} 条）", self.matched_records.len()
-                    )).strong());
-                    ui.add_space(4.0);
-
-                    egui::ScrollArea::vertical().id_source("matched_table").max_height(180.0).show(ui, |ui| {
-                        TableBuilder::new(ui).id_source("matched")
-                            .striped(true)
-                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .header(20.0, |mut h| {
-                                h.col(|ui| { ui.label("姓名"); });
-                                h.col(|ui| { ui.label("报名号"); });
-                                h.col(|ui| { ui.label("身份证号"); });
-                                h.col(|ui| { ui.label("报考信息"); });
-                                h.col(|ui| { ui.label("状态"); });
-                            })
-                            .body(|body| {
-                                body.rows(20.0, self.matched_records.len(), |mut row| {
-                                    let i = row.index();
-                                    if let Some(r) = self.matched_records.get(i) {
-                                        row.col(|ui| { ui.label(&r.name); });
-                                        row.col(|ui| { ui.label(&r.baominghao); });
-                                        row.col(|ui| {
-                                            let t = match &r.status {
-                                                MatchStatus::Matched(s) => s.clone(),
-                                                MatchStatus::Multiple => format!("同名{}人", r.shenfenzheng_candidates.len()),
-                                                MatchStatus::NotFound => "未找到".into(),
-                                                MatchStatus::Pending => "待匹配".into(),
-                                            };
-                                            ui.label(t);
-                                        });
-                                        row.col(|ui| { ui.label(&r.baokao_info); });
-                                        row.col(|ui| {
-                                            let (t, c) = match &r.status {
-                                                MatchStatus::Matched(_) => ("已匹配", egui::Color32::GREEN),
-                                                MatchStatus::Multiple => ("同名需穷举", egui::Color32::YELLOW),
-                                                MatchStatus::NotFound => ("未找到", egui::Color32::RED),
-                                                MatchStatus::Pending => ("待匹配", egui::Color32::GRAY),
-                                            };
-                                            ui.label(egui::RichText::new(t).color(c));
-                                        });
-                                    }
-                                });
-                            });
-                    });
-                });
-            }
+            // params (concurrency etc.)
+            ui.horizontal(|ui| {
+                ui.label("并发浏览器数：");
+                ui.add(egui::Slider::new(&mut self.concurrency, 1..=10).text("个"));
+                ui.add_space(16.0);
+                ui.label("操作速度：");
+                ui.add(egui::Slider::new(&mut self.step_delay_ms, 100..=5000).text("ms/步").suffix("ms"));
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("验证码重试：");
+                ui.add(egui::Slider::new(&mut self.captcha_retries, 1..=10).text("次"));
+                ui.add_space(16.0);
+                ui.label("首次等待：");
+                ui.add(egui::Slider::new(&mut self.captcha_wait_ms, 500..=10000).text("ms").suffix("ms"));
+            });
 
             ui.add_space(8.0);
 
-            // query controls
-            if !self.matched_records.is_empty() && self.query_state != QueryState::Running {
-                ui.horizontal(|ui| {
-                    ui.label("并发数：");
-                    ui.add(egui::Slider::new(&mut self.concurrency, 1..=5).text("个"));
-                    ui.add_space(16.0);
-                    ui.label("查询间隔：");
-                    ui.add(egui::Slider::new(&mut self.delay_ms, 0..=10000).text("毫秒").suffix("ms"));
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("操作速度：");
-                    ui.add(egui::Slider::new(&mut self.step_delay_ms, 100..=5000).text("ms/步").suffix("ms"));
-                    ui.label(format!("({:.1}s)", self.step_delay_ms as f64 / 1000.0));
-                });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("验证码重试：");
-                    ui.add(egui::Slider::new(&mut self.captcha_retries, 1..=10).text("次"));
-                    ui.add_space(16.0);
-                    ui.label("首次等待：");
-                    ui.add(egui::Slider::new(&mut self.captcha_wait_ms, 500..=10000).text("ms").suffix("ms"));
-                });
-
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.push_id("query_controls", |ui| {
-                        if self.query_state == QueryState::Idle {
-                            if ui.button(egui::RichText::new("▶ 开始查询").heading().color(egui::Color32::WHITE)).clicked() {
-                                self.start_query(ctx);
-                            }
-                        }
-                        if self.query_state == QueryState::Paused {
-                            if ui.button("▶ 继续").clicked() {
-                                *self.cancel_flag.try_lock().unwrap() = false;
-                                self.query_state = QueryState::Running;
-                                self.log("查询继续");
-                                self.start_query(ctx);
-                            }
-                            if ui.button("⏹ 重新开始").clicked() {
-                                *self.cancel_flag.try_lock().unwrap() = true;
-                                self.query_state = QueryState::Idle;
-                                self.log("查询已终止，准备重新开始");
-                            }
-                        }
-                    });
-                });
-            }
-
-            if self.query_state == QueryState::Running {
-                ui.push_id("pause_btn", |ui| {
-                    if ui.button(egui::RichText::new("⏸ 暂停").heading()).clicked() {
-                        *self.cancel_flag.try_lock().unwrap() = true;
-                        self.query_state = QueryState::Paused;
-                        self.log("查询暂停");
+            // start / stop buttons
+            ui.horizontal(|ui| {
+                if self.pred_state == QueryState::Idle {
+                    if ui.button(egui::RichText::new("▶ 开始推算").heading().color(egui::Color32::WHITE)).clicked() {
+                        self.start_prediction(ctx);
                     }
-                });
-            }
+                }
+                if self.pred_state == QueryState::Running {
+                    if ui.button(egui::RichText::new("⏹ 停止").heading()).clicked() {
+                        *self.cancel_flag.try_lock().unwrap() = true;
+                        self.pred_state = QueryState::Idle;
+                        self.log("推算已停止");
+                    }
+                }
+            });
 
             // progress
-            ui.push_id("progress_section", |ui| {
-                if let Ok(p) = self.progress.try_lock() {
+            ui.push_id("pred_progress", |ui| {
+                if let Ok(p) = self.pred_progress.try_lock() {
                     if p.total > 0 {
                         ui.add_space(8.0);
-                        ui.separator();
-                        ui.add_space(8.0);
-                        let ratio = if p.total > 0 { p.completed as f32 / p.total as f32 } else { 0.0 };
-                        ui.add(egui::ProgressBar::new(ratio).text(format!("{}/{}", p.completed, p.total)));
+                        let completed = p.matched + p.not_found;
+                        let ratio = if p.total > 0 { completed as f32 / p.total as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(ratio).text(format!("{}/{}", completed, p.total)));
                         ui.label(format!(
-                            "✅ 成功: {}   ❌ 失败: {}   📌 当前: {}",
-                            p.success, p.failed, p.current_name
+                            "✅ 已匹配: {}   ❌ 未找到: {}   📌 当前: {}   🔍 正在试号: {}",
+                            p.matched, p.not_found, p.current_name, p.current_exam
                         ));
                     }
                 }
             });
 
+            // status
             if !self.status_message.is_empty() {
-                ui.add_space(8.0);
-                ui.separator();
                 ui.add_space(4.0);
                 ui.label(&self.status_message);
             }
 
             // results table
-            if !self.displayed_results.is_empty() {
-                ui.push_id("results_section", |ui| {
+            if !self.pred_displayed_results.is_empty() {
+                ui.push_id("pred_results_section", |ui| {
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("📊 查询结果").strong());
+                    ui.label(egui::RichText::new(format!(
+                        "📊 推算结果（共 {} 条）", self.pred_displayed_results.len()
+                    )).strong());
                     ui.add_space(4.0);
 
-                    egui::ScrollArea::vertical().id_source("results_table").max_height(200.0).show(ui, |ui| {
-                        TableBuilder::new(ui).id_source("results")
+                    egui::ScrollArea::vertical().id_source("pred_results_table").max_height(250.0).show(ui, |ui| {
+                        TableBuilder::new(ui).id_source("pred_results")
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .column(Column::auto().resizable(true))
@@ -414,33 +795,27 @@ impl eframe::App for GaokaoApp {
                             .column(Column::auto().resizable(true))
                             .column(Column::auto().resizable(true))
                             .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
                             .header(20.0, |mut h| {
                                 h.col(|ui| { ui.label("姓名"); });
-                                h.col(|ui| { ui.label("高考报名号"); });
                                 h.col(|ui| { ui.label("身份证号"); });
-                                h.col(|ui| { ui.label("科目名称"); });
-                                h.col(|ui| { ui.label("考点名称"); });
-                                h.col(|ui| { ui.label("状态/错误"); });
+                                h.col(|ui| { ui.label("推算报考号"); });
+                                h.col(|ui| { ui.label("状态"); });
                             })
                             .body(|body| {
-                                body.rows(20.0, self.displayed_results.len(), |mut row| {
+                                body.rows(20.0, self.pred_displayed_results.len(), |mut row| {
                                     let i = row.index();
-                                    if let Some(r) = self.displayed_results.get(i) {
+                                    if let Some(r) = self.pred_displayed_results.get(i) {
                                         row.col(|ui| { ui.label(&r.name); });
-                                        row.col(|ui| { ui.label(&r.baominghao); });
                                         row.col(|ui| { ui.label(&r.shenfenzheng); });
-                                        row.col(|ui| { ui.label(&r.kemumingcheng); });
-                                        row.col(|ui| { ui.label(&r.kaodianmingcheng); });
+                                        row.col(|ui| { ui.label(&r.exam_number); });
                                         row.col(|ui| {
                                             match &r.status {
-                                                QueryStatus::Success => {
-                                                    ui.label(egui::RichText::new("✅ 成功").color(egui::Color32::GREEN));
+                                                PredictedStatus::Matched => {
+                                                    ui.label(egui::RichText::new("✅ 已匹配").color(egui::Color32::GREEN));
                                                 }
-                                                QueryStatus::Failed(e) => {
-                                                    ui.label(egui::RichText::new(format!("❌ {}", e)).color(egui::Color32::RED));
+                                                PredictedStatus::NotFound => {
+                                                    ui.label(egui::RichText::new("❌ 未找到").color(egui::Color32::RED));
                                                 }
-                                                _ => {}
                                             }
                                         });
                                     }
@@ -449,19 +824,20 @@ impl eframe::App for GaokaoApp {
                     });
 
                     ui.add_space(8.0);
-                    if ui.button("💾 保存结果到文件").clicked() {
-                        self.save_results();
+                    if ui.button("💾 保存推算结果到文件").clicked() {
+                        self.save_prediction_results();
                     }
                 });
             }
-
-            if self.query_state == QueryState::Running || self.query_state == QueryState::Paused {
-                ctx.request_repaint_after(std::time::Duration::from_millis(500));
-            }
-        });
+        } else {
+            ui.label("请先选择身份证和信息表格");
+        }
     }
 }
 
+// ============================================================
+// 考场查询 逻辑
+// ============================================================
 impl GaokaoApp {
     fn parse_and_match(&mut self) {
         let bk_path = match &self.baokao_path { Some(p) => p.clone(), None => return };
@@ -489,7 +865,7 @@ impl GaokaoApp {
         }
     }
 
-    fn start_query(&mut self, ctx: &egui::Context) {
+    fn start_query(&mut self, _ctx: &egui::Context) {
         self.query_state = QueryState::Running;
         self.displayed_results.clear();
         *self.results.try_lock().unwrap() = Vec::new();
@@ -519,15 +895,13 @@ impl GaokaoApp {
             p.completed = 0; p.success = 0; p.failed = 0;
         }
 
-        self.log(format!("开始查询: {} 条记录, 并发 {}, 间隔 {}ms, 调试={}",
-            matched.len(), concurrency, delay, debug_mode));
+        self.log(format!("开始查询: {} 条记录, 并发 {}, 间隔 {}ms", matched.len(), concurrency, delay));
 
         let cancel_check = cancel.clone();
         tokio::spawn(async move {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
 
             for record in &matched {
-                // check cancel
                 if *cancel_check.lock().await { break; }
 
                 let sem = semaphore.clone();
@@ -546,14 +920,11 @@ impl GaokaoApp {
 
                 tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-
-                    // check cancel
                     if *cancel_inner.lock().await { return; }
 
                     {
                         let mut p = progress.lock().await;
                         p.current_name = record.name.clone();
-                        let _ = logs.lock().await;
                     }
 
                     let candidates = if record.shenfenzheng_candidates.is_empty() {
@@ -565,19 +936,16 @@ impl GaokaoApp {
                     let mut ok = false;
                     let mut last_err = String::new();
 
-                    // Open ONE browser per record, try all candidates
-                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay, captcha_retries, captcha_wait_ms, hide_browser, &target_url).await {
+                    match crate::browser::BrowserClient::new_with_log(
+                        debug_mode, Some(logs.clone()), step_delay, captcha_retries, captcha_wait_ms, hide_browser, &target_url
+                    ).await {
                         Ok(client) => {
                             for (ci, sfz) in candidates.iter().enumerate() {
                                 if *cancel_inner.lock().await { return; }
-
                                 if ci > 0 {
-                                    // Re-navigate to main page before next attempt
                                     let _ = client.go_home().await;
                                     tokio::time::sleep(std::time::Duration::from_millis(step_delay)).await;
                                 }
-
-                                let _ = logs.lock().await;
                                 match client.query_single(&record.baominghao, sfz).await {
                                     Ok(mut r) => {
                                         r.shenfenzheng = sfz.clone();
@@ -609,7 +977,6 @@ impl GaokaoApp {
                             status: QueryStatus::Failed(last_err.clone()),
                             error: last_err.clone(),
                         });
-                        let _ = logs.lock().await;
                     }
 
                     {
@@ -653,6 +1020,150 @@ impl GaokaoApp {
                     _ => String::new(),
                 };
                 let _ = sheet.write_string(ri, 5, &status);
+            }
+            let _ = workbook.save(&path);
+        }
+    }
+}
+
+// ============================================================
+// 报考号推算 逻辑
+// ============================================================
+impl GaokaoApp {
+    fn start_prediction(&mut self, _ctx: &egui::Context) {
+        if self.pred_boundary == 0 {
+            self.status_message = "请先输入边界报考号".to_string();
+            return;
+        }
+
+        let cls_key = &self.pred_class_list[self.pred_selected_class].clone();
+        let target_year = self.pred_year_filter as u32;
+        let target_class = cls_key.split('-').nth(1).unwrap_or("").to_string();
+        let students: Vec<(String, String)> = self.pred_sfz_records.iter()
+            .filter(|r| {
+                let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
+                if ruxue != target_year { return false; }
+                if let Some((_, c, _)) = Self::extract_grade_class(&r.organization) {
+                    c == target_class
+                } else { false }
+            })
+            .map(|r| (r.name.clone(), r.shenfenzheng.clone()))
+            .collect();
+
+        if students.is_empty() {
+            self.status_message = "该班级没有学生".to_string();
+            return;
+        }
+
+        self.pred_state = QueryState::Running;
+        *self.pred_results.try_lock().unwrap() = Vec::new();
+        self.pred_displayed_results.clear();
+        *self.cancel_flag.try_lock().unwrap() = false;
+
+        {
+            let mut p = self.pred_progress.try_lock().unwrap();
+            p.total = students.len();
+            p.matched = 0;
+            p.not_found = 0;
+            p.current_name = String::new();
+            p.current_exam = String::new();
+        }
+
+        let base_bkh = "264211261".to_string();
+        let concurrency = self.concurrency as usize;
+        let hide_browser = self.hide_browser;
+        let step_delay = self.step_delay_ms as u64;
+        let captcha_retries = self.captcha_retries;
+        let captcha_wait_ms = self.captcha_wait_ms as u64;
+        let target_url = self.target_url.clone();
+        let logs = self.debug_logs.clone();
+        let cancel = self.cancel_flag.clone();
+        let pred_results = self.pred_results.clone();
+        let pred_progress = self.pred_progress.clone();
+        let range_start = self.pred_range_start;
+        let range_end = self.pred_range_end;
+        let delay_ms = self.delay_ms as u64;
+        self.log(format!(
+            "开始推算: 班级 {} ({} 人), 范围 {}~{}",
+            cls_key, students.len(), range_start, range_end
+        ));
+
+        tokio::spawn(async move {
+            let pool = match prediction::BrowserPool::new(
+                concurrency,
+                hide_browser,
+                step_delay,
+                captcha_retries,
+                captcha_wait_ms,
+                &target_url,
+                Some(logs.clone()),
+            ).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let mut l = logs.lock().await;
+                    l.push(format!("[ERROR] 浏览器池启动失败: {}", e));
+                    return;
+                }
+            };
+
+            for (name, id_card) in &students {
+                if *cancel.lock().await { break; }
+
+                let result = prediction::predict_student(
+                    pool.clone(),
+                    name.clone(),
+                    id_card.clone(),
+                    base_bkh.clone(),
+                    range_start,
+                    range_end,
+                    concurrency,
+                    cancel.clone(),
+                    pred_progress.clone(),
+                ).await;
+
+                {
+                    let mut r = pred_results.lock().await;
+                    r.push(result);
+                }
+
+                {
+                    let mut p = pred_progress.lock().await;
+                    p.current_name = String::new();
+                    p.current_exam = String::new();
+                }
+
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+            }
+
+            // pool is dropped here, closing all browsers
+        });
+    }
+
+    fn save_prediction_results(&self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Excel", &["xlsx"])
+            .set_file_name("推算结果.xlsx")
+            .save_file()
+        {
+            use rust_xlsxwriter::*;
+            let mut workbook = Workbook::new();
+            let sheet = workbook.add_worksheet();
+            let headers = ["姓名", "身份证号", "推算报考号", "状态"];
+            for (col, h) in headers.iter().enumerate() {
+                let _ = sheet.write_string(0, col as u16, *h);
+            }
+            for (row, r) in self.pred_displayed_results.iter().enumerate() {
+                let ri = row as u32 + 1;
+                let _ = sheet.write_string(ri, 0, &r.name);
+                let _ = sheet.write_string(ri, 1, &r.shenfenzheng);
+                let _ = sheet.write_string(ri, 2, &r.exam_number);
+                let status = match &r.status {
+                    PredictedStatus::Matched => "已匹配",
+                    PredictedStatus::NotFound => "未找到",
+                };
+                let _ = sheet.write_string(ri, 3, status);
             }
             let _ = workbook.save(&path);
         }

@@ -5,6 +5,7 @@ mod parser;
 mod matcher;
 mod browser;
 mod ocr;
+mod prediction;
 
 use eframe::egui;
 use egui::FontDefinitions;
