@@ -22,6 +22,7 @@ pub async fn solve_captcha(
     expected_chars: &[String],
     _container_width: f64,
     _container_height: f64,
+    instance_id: u64,
 ) -> Result<OcrResult, String> {
     let expected = expected_chars.join(" ");
 
@@ -31,6 +32,7 @@ pub async fn solve_captcha(
             .arg("ocr_helper.py")
             .arg(image_path)
             .arg(&expected)
+            .arg(instance_id.to_string())
             .output(),
     )
     .await

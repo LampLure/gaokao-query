@@ -22,6 +22,7 @@ pub struct BrowserClient {
     captcha_retries: u32,
     captcha_wait_ms: u64,
     target_url: String,
+    instance_id: u64,
 }
 
 impl BrowserClient {
@@ -51,6 +52,7 @@ impl BrowserClient {
 
         let instance_id = INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
         let user_data_dir = format!("/tmp/chromiumoxide-runner-{}", instance_id);
+        let _ = std::fs::create_dir_all(format!("/tmp/gaokao-captcha-{}", instance_id));
 
         let mut builder = BrowserConfig::builder()
             .chrome_executable(chrome_path)
@@ -110,6 +112,7 @@ impl BrowserClient {
             captcha_retries,
             captcha_wait_ms,
             target_url: url,
+            instance_id,
         })
     }
 
@@ -239,9 +242,17 @@ impl BrowserClient {
         })
     }
 
+    fn captcha_dir(&self) -> String {
+        format!("/tmp/gaokao-captcha-{}", self.instance_id)
+    }
+
+    fn captcha_path(&self) -> String {
+        format!("{}/captcha.png", self.captcha_dir())
+    }
+
     async fn solve_captcha_modal(&self, page: &Page) -> Result<(), String> {
         let max_retries = self.captcha_retries;
-        let temp_path = "/tmp/gaokao_captcha.png";
+        let temp_path = self.captcha_path();
 
         for attempt in 1..=max_retries {
             if attempt > 1 {
@@ -356,7 +367,7 @@ impl BrowserClient {
             let img_bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64_data).map_err(|e| format!("base64解码失败: {}", e))?;
 
-            std::fs::write(temp_path, &img_bytes)
+            std::fs::write(&temp_path, &img_bytes)
                 .map_err(|e| format!("保存验证码图片失败: {}", e))?;
 
             // Get container dimensions
@@ -376,13 +387,13 @@ impl BrowserClient {
             let ch = dims["h"].as_f64().unwrap_or(150.0);
 
             // Solve captcha via OCR
-            let ocr_result = match ocr::solve_captcha(temp_path, &expected_chars, cw, ch).await {
+            let ocr_result = match ocr::solve_captcha(&temp_path, &expected_chars, cw, ch, self.instance_id).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.log_msg(&format!("OCR失败: {}, 准备重试", e));
                     // Save failed captcha for debugging
-                    let debug_path = format!("/tmp/gaokao_captcha_fail_{}.png", attempt);
-                    let _ = std::fs::copy(temp_path, &debug_path);
+                    let debug_path = format!("{}/fail_{}.png", self.captcha_dir(), attempt);
+                    let _ = std::fs::copy(&temp_path, &debug_path);
                     self.log_msg(&format!("已保存失败验证码到: {}", debug_path));
                     continue;
                 }
