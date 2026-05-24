@@ -3,7 +3,7 @@ import sys
 import os
 import threading
 import ddddocr
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 
 KILL_TIMER = None
 
@@ -24,10 +24,13 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 def preprocess(img):
+    if img.mode == 'RGBA':
+        img = img.convert('RGB')
     enh = ImageEnhance.Contrast(img)
-    img = enh.enhance(1.3)
+    img = enh.enhance(1.4)
     enh = ImageEnhance.Sharpness(img)
-    img = enh.enhance(1.5)
+    img = enh.enhance(2.0)
+    img = img.filter(ImageFilter.SHARPEN)
     return img
 
 def filter_boxes(bboxes, iw, ih):
@@ -43,62 +46,19 @@ def filter_boxes(bboxes, iw, ih):
     valid.sort(key=lambda b: b[0])
     return valid
 
-def match_and_reorder(bboxes, img_bytes, ocr, expected_chars, iw, ih, image_path, tmp_dir):
-    full_text = ocr.classification(img_bytes, png_fix=True).strip()
-    log(f"  全图OCR结果: [{full_text}]")
-
-    visual_chars = list(full_text) if len(full_text) == len(expected_chars) else []
-    if visual_chars and set(visual_chars) == set(expected_chars):
-        log(f"  视觉顺序: {visual_chars}")
-        box_order = [visual_chars.index(ch) for ch in expected_chars]
-        result = []
-        for idx in box_order:
-            if idx < len(bboxes):
-                b = bboxes[idx]
-                cx = (b[0] + b[2]) / 2.0 / iw
-                cy = (b[1] + b[3]) / 2.0 / ih
-                result.append((cx, cy))
-        if len(result) == len(expected_chars):
-            for i, ch in enumerate(expected_chars):
-                log(f"  → 第{i+1}次点击 [{ch}] 位置 ({result[i][0]:.4f}, {result[i][1]:.4f})")
-            return result
-
-    log("  全图OCR不匹配，降级到单字识别...")
-    char_to_pos = {}
-    used = set()
-    for i, box in enumerate(bboxes):
-        x1, y1, x2, y2 = box
-        crop = Image.open(image_path).crop((x1, y1, x2, y2))
-        crop_path = os.path.join(tmp_dir, f"char_{i}.png")
-        crop.save(crop_path)
-        with open(crop_path, 'rb') as f:
-            result = ocr.classification(f.read())
-        ch = result.strip()
-        if ch and ch not in used:
-            cx = (x1 + x2) / 2.0 / iw
-            cy = (y1 + y2) / 2.0 / ih
-            char_to_pos[ch] = (cx, cy)
-            used.add(ch)
-            log(f"  单字识别: [{ch}] -> ({cx:.4f}, {cy:.4f})")
-
-    result = []
-    fallback_idx = 0
-    fallback_list = [((b[0]+b[2])/2.0/iw, (b[1]+b[3])/2.0/ih) for b in bboxes]
-    for ch in expected_chars:
-        if ch in char_to_pos:
-            result.append(char_to_pos[ch])
+def try_full_ocr(ocr, img_bytes, expected_set):
+    for use_png_fix in [True, False]:
+        if use_png_fix:
+            result = ocr.classification(img_bytes, png_fix=True).strip()
         else:
-            fb = fallback_list[fallback_idx] if fallback_idx < len(fallback_list) else (0.5, 0.5)
-            log(f"  WARNING: 未找到字符 [{ch}]，使用第{fallback_idx+1}个框({fb[0]:.4f},{fb[1]:.4f})")
-            result.append(fb)
-            fallback_idx += 1
-
-    if len(result) != len(expected_chars):
-        log(f"  ERROR: 只匹配到 {len(result)}/{len(expected_chars)} 个字符")
-        return None
-    for i, ch in enumerate(expected_chars):
-        log(f"  → 第{i+1}次点击 [{ch}] 位置 ({result[i][0]:.4f}, {result[i][1]:.4f})")
-    return result
+            result = ocr.classification(img_bytes).strip()
+        result = result.replace(' ', '')
+        # Filter to keep only CJK characters
+        chars = [c for c in result if '\u4e00' <= c <= '\u9fff']
+        log(f"  全图OCR(png_fix={use_png_fix}): raw=[{result}] cjk={chars}")
+        if len(chars) == 3 and set(chars) == expected_set:
+            return chars
+    return None
 
 def detect(img_bytes, use_beta):
     det = ddddocr.DdddOcr(det=True, beta=use_beta, show_ad=False)
@@ -116,6 +76,7 @@ def main():
     os.makedirs(tmp_dir, exist_ok=True)
 
     n = len(expected_chars)
+    expected_set = set(expected_chars)
 
     if not os.path.exists(image_path):
         log(f"ERROR: Image not found: {image_path}")
@@ -129,48 +90,98 @@ def main():
         with open(image_path, 'rb') as f:
             raw_bytes = f.read()
 
+        # Detection (use preprocessed image if needed)
         bboxes = detect(raw_bytes, use_beta=True)
-
         if len(bboxes) < n:
-            log(f"Beta model found {len(bboxes)} boxes, retrying with default model...")
+            log(f"Beta found {len(bboxes)} boxes, trying default...")
             bboxes = detect(raw_bytes, use_beta=False)
-
         if len(bboxes) < n:
-            log(f"Default model also insufficient ({len(bboxes)}), retrying with preprocessed image...")
+            log(f"Default insufficient ({len(bboxes)}), trying enhanced image...")
             img = Image.open(image_path)
-            if img.mode == 'RGBA':
-                img = img.convert('RGB')
             processed = preprocess(img)
-            processed_path = os.path.join(tmp_dir, "processed.png")
-            processed.save(processed_path)
-            with open(processed_path, 'rb') as f:
+            proc_path = os.path.join(tmp_dir, "proc.png")
+            processed.save(proc_path)
+            with open(proc_path, 'rb') as f:
                 bboxes = detect(f.read(), use_beta=True)
 
-        log(f"Detection result: {len(bboxes)} character boxes.")
+        log(f"Detection: {len(bboxes)} boxes.")
 
         img = Image.open(image_path)
         iw, ih = img.size
         filtered = filter_boxes(bboxes, iw, ih)
-        log(f"After filtering: {len(filtered)} boxes.")
+        log(f"After filter: {len(filtered)} boxes for {n} chars.")
 
         if len(filtered) < n:
-            log(f"WARNING: Only {len(filtered)} valid boxes for {n} chars. Using fallback.")
+            log("WARNING: Not enough boxes, using fallback split.")
             for i in range(n):
                 cx = (i + 0.5) / n
-                cy = 0.5
+                print(f"{cx:.4f},{0.5:.4f}")
+                log(f"  [{expected_chars[i]}] ({cx:.4f}, {0.5:.4f})")
+            stop_kill_timer()
+            return
+
+        bboxes = filtered[:n]
+
+        # Strategy 1: Full-image OCR (try both default and beta model)
+        ocr_default = ddddocr.DdddOcr(show_ad=False)
+        ocr_beta = ddddocr.DdddOcr(beta=True, show_ad=False)
+
+        visual_chars = try_full_ocr(ocr_default, raw_bytes, expected_set)
+        if not visual_chars:
+            log("  尝试Beta模型全图OCR...")
+            visual_chars = try_full_ocr(ocr_beta, raw_bytes, expected_set)
+        ocr = ocr_beta  # prefer beta for single-char too
+
+        if visual_chars:
+            log(f"  ✓ 全图OCR视觉顺序: {visual_chars}")
+            box_order = [visual_chars.index(ch) for ch in expected_chars]
+            for i, ch in enumerate(expected_chars):
+                b = bboxes[box_order[i]]
+                cx = (b[0] + b[2]) / 2.0 / iw
+                cy = (b[1] + b[3]) / 2.0 / ih
+                log(f"  → 第{i+1}次点击 [{ch}] ({cx:.4f}, {cy:.4f})")
                 print(f"{cx:.4f},{cy:.4f}")
-                log(f"  [{expected_chars[i]}] ({cx:.4f}, {cy:.4f})")
-        else:
-            ocr = ddddocr.DdddOcr(show_ad=False)
-            coords = match_and_reorder(filtered[:n], raw_bytes, ocr, expected_chars, iw, ih, image_path, tmp_dir)
-            if coords is None:
-                log("ERROR: 字符匹配失败，使用x排序保底")
-                coords = [((b[0]+b[2])/2.0/iw, (b[1]+b[3])/2.0/ih) for b in filtered[:n]]
-            for cx, cy in coords:
-                print(f"{cx:.4f},{cy:.4f}")
+            log("--- OCR Completed (full image) ---")
+            stop_kill_timer()
+            return
+
+        # Strategy 2: Try single-char recognition with both models
+        log("  全图OCR不匹配，尝试单字识别...")
+        char_to_pos = {}
+        for i, box in enumerate(bboxes):
+            x1, y1, x2, y2 = box
+            # Crop with slight margin for better recognition
+            margin = 5
+            crop = img.crop((max(0,x1-margin), max(0,y1-margin),
+                           min(iw,x2+margin), min(ih,y2+margin)))
+            crop_path = os.path.join(tmp_dir, f"char_{i}.png")
+            crop.save(crop_path)
+            with open(crop_path, 'rb') as f:
+                ch = ocr.classification(f.read()).strip()
+            if ch and ch not in char_to_pos:
+                cx = (x1 + x2) / 2.0 / iw
+                cy = (y1 + y2) / 2.0 / ih
+                char_to_pos[ch] = (cx, cy)
+                log(f"  单字识别: [{ch}] -> ({cx:.4f}, {cy:.4f})")
+
+        # Build output in expected order
+        fallback_list = [((b[0]+b[2])/2.0/iw, (b[1]+b[3])/2.0/ih) for b in bboxes]
+        output = []
+        fb_idx = 0
+        for ch in expected_chars:
+            if ch in char_to_pos:
+                output.append(char_to_pos[ch])
+            else:
+                pos = fallback_list[fb_idx] if fb_idx < len(fallback_list) else (0.5, 0.5)
+                log(f"  WARNING: [{ch}] 未识别，使用框{fb_idx+1} ({pos[0]:.4f},{pos[1]:.4f})")
+                output.append(pos)
+                fb_idx += 1
+
+        for i, ch in enumerate(expected_chars):
+            log(f"  → 第{i+1}次点击 [{ch}] ({output[i][0]:.4f}, {output[i][1]:.4f})")
+            print(f"{output[i][0]:.4f},{output[i][1]:.4f}")
 
         log("--- OCR Completed ---")
-
         stop_kill_timer()
 
     except Exception as e:
