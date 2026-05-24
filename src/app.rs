@@ -94,8 +94,8 @@ impl GaokaoApp {
             displayed_results: Vec::new(),
             query_state: QueryState::Idle,
             // prediction
-            pred_sfz_path: None,
-            pred_bkh_path: None,
+            pred_sfz_path: if cfg.pred_sfz_path.is_empty() { None } else { Some(cfg.pred_sfz_path.clone()) },
+            pred_bkh_path: if cfg.pred_bkh_path.is_empty() { None } else { Some(cfg.pred_bkh_path.clone()) },
             pred_sfz_records: Vec::new(),
             pred_known_bkh: Vec::new(),
             pred_class_list: Vec::new(),
@@ -130,6 +130,15 @@ impl GaokaoApp {
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
             app.parse_and_match();
         }
+        if let Some(p) = &app.pred_sfz_path {
+            if let Ok(records) = parser::parse_shenfenzheng(p) {
+                app.pred_sfz_records = records;
+                app.build_class_list();
+            }
+        }
+        if let Some(p) = &app.pred_bkh_path {
+            let _ = parser::parse_baokao_hao(p).map(|r| app.pred_known_bkh = r);
+        }
         app
     }
 }
@@ -146,6 +155,8 @@ impl GaokaoApp {
         if !self.config_dirty { return; }
         self.config.baokao_path = self.baokao_path.as_ref().cloned().unwrap_or_default();
         self.config.sfz_path = self.sfz_path.as_ref().cloned().unwrap_or_default();
+        self.config.pred_sfz_path = self.pred_sfz_path.as_ref().cloned().unwrap_or_default();
+        self.config.pred_bkh_path = self.pred_bkh_path.as_ref().cloned().unwrap_or_default();
         self.config.target_url = self.target_url.clone();
         self.config.concurrency = self.concurrency;
         self.config.delay_ms = self.delay_ms;
@@ -741,17 +752,21 @@ impl GaokaoApp {
                 if ui.button("应用").clicked() {
                     self.pred_boundary = self.pred_boundary_str.trim().parse().unwrap_or(0);
                     if self.pred_boundary > 0 && !self.pred_class_list.is_empty() {
-                        let cls = &self.pred_class_list[self.pred_selected_class];
+                        let cls_key = &self.pred_class_list[self.pred_selected_class].clone();
+                        let target_year = self.pred_year_filter as u32;
+                        let target_class = cls_key.split('-').nth(1).unwrap_or("").to_string();
                         let count = self.pred_sfz_records.iter()
                             .filter(|r| {
-                                if let Some((g, c, _)) = Self::extract_grade_class(&r.organization) {
-                                    format!("{}-{}", g, c) == *cls
+                                let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
+                                if ruxue != target_year { return false; }
+                                if let Some((_, c, _)) = Self::extract_grade_class(&r.organization) {
+                                    c == target_class
                                 } else { false }
                             }).count();
                         let margin = self.pred_search_margin as u64;
                         self.pred_range_end = self.pred_boundary - 1;
-                        self.pred_range_start = self.pred_range_end - count as u64 - margin;
-                        self.log(format!("搜索范围: {} ~ {}", self.pred_range_start, self.pred_range_end));
+                        self.pred_range_start = self.pred_range_end.saturating_sub(count as u64 + margin);
+                        self.log(format!("搜索范围: {} ~ {} (班级{} {}人)", self.pred_range_start, self.pred_range_end, target_class, count));
                     }
                 }
             });
