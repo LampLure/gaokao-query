@@ -58,9 +58,13 @@ pub struct GaokaoApp {
     status_message: String,
     // debug
     debug_mode: bool,
+    show_perf: bool,
     hide_browser: bool,
     debug_logs: Arc<Mutex<Vec<String>>>,
     displayed_logs: Vec<String>,
+    // performance profiling
+    perf_logs: Arc<Mutex<Vec<Vec<PerfEvent>>>>,
+    perf_stats: Vec<PerfRecord>,
     // cancellation
     cancel_flag: Arc<Mutex<bool>>,
 }
@@ -113,9 +117,12 @@ impl GaokaoApp {
             pred_progress: Arc::new(Mutex::new(PredictionProgress::default())),
             status_message: String::new(),
             debug_mode: cfg.debug_mode,
+            show_perf: false,
             hide_browser: cfg.hide_browser,
             debug_logs: Arc::new(Mutex::new(Vec::new())),
             displayed_logs: Vec::new(),
+            perf_logs: Arc::new(Mutex::new(Vec::new())),
+            perf_stats: Vec::new(),
             cancel_flag: Arc::new(Mutex::new(false)),
         };
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
@@ -205,6 +212,23 @@ impl eframe::App for GaokaoApp {
             }
         }
 
+        // aggregate perf logs into stats
+        if let Ok(pl) = self.perf_logs.try_lock() {
+            if !pl.is_empty() {
+                let mut stats: std::collections::HashMap<&'static str, Vec<u64>> = std::collections::HashMap::new();
+                for record in pl.iter() {
+                    for event in record {
+                        stats.entry(event.label).or_default().push(event.elapsed_ms);
+                    }
+                }
+                let mut new_stats: Vec<PerfRecord> = stats.into_iter()
+                    .map(|(label, times_ms)| PerfRecord { label, times_ms })
+                    .collect();
+                new_stats.sort_by(|a, b| a.label.cmp(b.label));
+                self.perf_stats = new_stats;
+            }
+        }
+
         self.auto_save_config();
 
         // === sidebar ===
@@ -257,6 +281,36 @@ impl eframe::App for GaokaoApp {
                 });
         }
 
+        // === performance window ===
+        if self.show_perf {
+            let stats = self.perf_stats.clone();
+            egui::Window::new("⏱ 性能分析")
+                .default_size([500.0, 300.0])
+                .resizable(true)
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    if stats.is_empty() {
+                        ui.label("暂无性能数据，开始查询后自动记录");
+                    } else {
+                        egui::ScrollArea::vertical().id_source("perf_table").show(ui, |ui| {
+                            egui::Grid::new("perf_grid").striped(true).num_columns(5).show(ui, |ui| {
+                                ui.strong("操作"); ui.strong("次数"); ui.strong("平均(ms)"); ui.strong("最大(ms)"); ui.strong("最小(ms)");
+                                ui.end_row();
+                                for r in &stats {
+                                    if r.count() == 0 { continue; }
+                                    ui.label(r.label);
+                                    ui.label(r.count().to_string());
+                                    ui.label(format!("{:.0}", r.avg_ms()));
+                                    ui.label(r.max_ms().to_string());
+                                    ui.label(if r.min_ms() == u64::MAX { "0".into() } else { r.min_ms().to_string() });
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                    }
+                });
+        }
+
         // === central panel ===
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -268,6 +322,9 @@ impl eframe::App for GaokaoApp {
                     let dm = self.debug_mode;
                     ui.checkbox(&mut self.debug_mode, "🔧 调试模式");
                     if dm != self.debug_mode { self.config_dirty = true; }
+                    let sp = self.show_perf;
+                    ui.checkbox(&mut self.show_perf, "⏱ 性能");
+                    if sp != self.show_perf { self.config_dirty = true; }
                 });
             });
             ui.separator();
@@ -888,6 +945,7 @@ impl GaokaoApp {
         let hide_browser = self.hide_browser;
         let target_url = self.target_url.clone();
         let logs = self.debug_logs.clone();
+        let perf_logs = self.perf_logs.clone();
 
         {
             let mut p = progress.try_lock().unwrap();
@@ -910,6 +968,7 @@ impl GaokaoApp {
                 }
             };
 
+            let perf_logs = perf_logs.clone();
             let mut handles = Vec::new();
             for record in &matched {
                 if *cancel.lock().await { break; }
@@ -919,6 +978,7 @@ impl GaokaoApp {
                 let progress = progress.clone();
                 let cancel = cancel.clone();
                 let logs = logs.clone();
+                let perf_logs = perf_logs.clone();
                 let record = record.clone();
                 let delay = delay;
 
@@ -951,7 +1011,10 @@ impl GaokaoApp {
                             l.push(format!("[QUERY] {} 获取浏览器中...", record.name));
                         }
 
-                        let (permit, client) = pool.acquire().await;
+                        let (permit, mut client) = pool.acquire().await;
+
+                        let record_perf: Arc<Mutex<Vec<PerfEvent>>> = Arc::new(Mutex::new(Vec::new()));
+                        client.set_perf(Some(record_perf.clone()));
 
                         {
                             let mut l = logs.lock().await;
@@ -963,6 +1026,15 @@ impl GaokaoApp {
                         }
 
                         let result = client.query_single(&record.baominghao, sfz).await;
+
+                        // Collect perf data
+                        if let Ok(perf_data) = record_perf.try_lock() {
+                            if !perf_data.is_empty() {
+                                let mut pl = perf_logs.lock().await;
+                                pl.push(perf_data.clone());
+                            }
+                        }
+
                         pool.release(permit, client);
 
                         match result {

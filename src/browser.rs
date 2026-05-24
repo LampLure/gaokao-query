@@ -18,14 +18,31 @@ pub struct BrowserClient {
     _browser: Arc<Browser>,
     page: Arc<Mutex<Page>>,
     log: Option<Arc<Mutex<Vec<String>>>>,
+    perf: Option<Arc<Mutex<Vec<crate::data::PerfEvent>>>>,
     step_delay_ms: u64,
     captcha_retries: u32,
     captcha_wait_ms: u64,
     target_url: String,
     instance_id: u64,
+    start: std::time::Instant,
 }
 
 impl BrowserClient {
+    pub fn set_perf(&mut self, perf: Option<Arc<Mutex<Vec<crate::data::PerfEvent>>>>) {
+        self.perf = perf;
+        self.start = std::time::Instant::now();
+        self.perf_event("浏览器获取完成");
+    }
+
+    fn perf_event(&self, label: &'static str) {
+        let elapsed = self.start.elapsed().as_millis() as u64;
+        if let Some(p) = &self.perf {
+            if let Ok(mut perf) = p.try_lock() {
+                perf.push(crate::data::PerfEvent { label, elapsed_ms: elapsed });
+            }
+        }
+    }
+
     async fn sleep_step(&self, factor: f64) {
         let ms = (self.step_delay_ms as f64 * factor) as u64;
         tokio::time::sleep(std::time::Duration::from_millis(ms.max(50))).await;
@@ -38,6 +55,19 @@ impl BrowserClient {
     pub async fn new_with_log(
         _headed: bool,
         log: Option<Arc<Mutex<Vec<String>>>>,
+        step_delay_ms: u64,
+        captcha_retries: u32,
+        captcha_wait_ms: u64,
+        hide_browser: bool,
+        target_url: &str,
+    ) -> Result<Self, String> {
+        Self::new_with_perf(_headed, log, None, step_delay_ms, captcha_retries, captcha_wait_ms, hide_browser, target_url).await
+    }
+
+    pub async fn new_with_perf(
+        _headed: bool,
+        log: Option<Arc<Mutex<Vec<String>>>>,
+        perf: Option<Arc<Mutex<Vec<crate::data::PerfEvent>>>>,
         step_delay_ms: u64,
         captcha_retries: u32,
         captcha_wait_ms: u64,
@@ -104,15 +134,18 @@ impl BrowserClient {
 
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
+        let now = std::time::Instant::now();
         Ok(Self {
             _browser: browser,
             page: Arc::new(Mutex::new(page)),
             log,
+            perf,
             step_delay_ms,
             captcha_retries,
             captcha_wait_ms,
             target_url: url,
             instance_id,
+            start: now,
         })
     }
 
@@ -122,6 +155,7 @@ impl BrowserClient {
             .await
             .map_err(|e| format!("导航回首页失败: {}", e))?;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        self.perf_event("导航回首页");
         Ok(())
     }
 
@@ -130,6 +164,7 @@ impl BrowserClient {
         baominghao: &str,
         shenfenzheng: &str,
     ) -> Result<QueryResult, String> {
+        self.perf_event("开始查询");
         let page = self.page.lock().await;
 
         fn js_fill(id: &str, val: &str) -> String {
@@ -148,6 +183,7 @@ impl BrowserClient {
             .into_value().map_err(|_| "填身份证返回值解析失败".to_string())?;
 
         self.sleep_step(0.5).await;
+        self.perf_event("填写信息完成");
 
         let _ = page.evaluate_expression(
             r#"(function() {
@@ -158,6 +194,7 @@ impl BrowserClient {
         ).await;
 
         Self::sleep_critical(2000).await;
+        self.perf_event("等待验证码");
 
         let captcha_visible: bool = page.evaluate_expression(
             r#"(function() {
@@ -209,6 +246,7 @@ impl BrowserClient {
         if name.is_empty() {
             return Err("未找到查询结果".to_string());
         }
+        self.perf_event("获取查询结果");
 
         let bmh: String = page.evaluate_expression(
             r#"(function() {
@@ -386,6 +424,8 @@ impl BrowserClient {
             let cw = dims["w"].as_f64().unwrap_or(300.0);
             let ch = dims["h"].as_f64().unwrap_or(150.0);
 
+            self.perf_event("获取验证码图片");
+
             // Solve captcha via OCR
             let ocr_result = match ocr::solve_captcha(&temp_path, &expected_chars, cw, ch, self.instance_id).await {
                 Ok(r) => r,
@@ -437,6 +477,8 @@ impl BrowserClient {
                     return m ? !m.classList.contains('hidden') : false;
                 })()"#
             ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+
+            self.perf_event("验证码点击完成");
 
             if !still_visible {
                 // Captcha passed

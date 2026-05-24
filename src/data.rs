@@ -138,3 +138,25 @@ pub struct PredictionProgress {
     pub current_name: String,
     pub current_exam: String,
 }
+
+#[derive(Debug, Clone)]
+pub struct PerfEvent {
+    pub label: &'static str,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PerfRecord {
+    pub label: &'static str,
+    pub times_ms: Vec<u64>,
+}
+
+impl PerfRecord {
+    pub fn count(&self) -> usize { self.times_ms.len() }
+    pub fn avg_ms(&self) -> f64 {
+        let n = self.times_ms.len();
+        if n == 0 { 0.0 } else { self.times_ms.iter().sum::<u64>() as f64 / n as f64 }
+    }
+    pub fn max_ms(&self) -> u64 { self.times_ms.iter().copied().fold(0, u64::max) }
+    pub fn min_ms(&self) -> u64 { self.times_ms.iter().copied().fold(u64::MAX, u64::min) }
+}
