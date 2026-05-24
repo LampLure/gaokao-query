@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
 """
-OCR helper: given a captcha image and 3 expected characters in order,
-use tesseract to identify each character in the image,
-then reorder them to match the expected click order.
-
-Strategy:
-1. Use tesseract OCR to recognize text at each character position
-2. For each expected char, check if it was correctly recognized
-3. Assign recognized chars to their boxes, remaining boxes to unmatched chars
-4. If no chars are recognized, fall back to left-to-right position matching
+OCR helper: find captcha character positions via connected components,
+recognize each via tesseract, then reorder to match expected click order.
 """
 
 import sys
@@ -17,176 +10,201 @@ from PIL import Image
 
 os.environ["TESSDATA_PREFIX"] = "/tmp"
 
+
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
-def preprocess_image(image_path):
-    """Enhance image contrast and binarize for better OCR."""
+
+def find_char_boxes(image_path):
+    """Find character bounding boxes via connected components on binarized image."""
+    img = Image.open(image_path)
+    if img.mode == 'RGBA':
+        img = img.convert('RGB')
+    gray = img.convert('L')
+    iw, ih = img.size
+    log(f"Image size: {iw}x{ih}")
+
+    # Binarize: text is dark on light background
+    pixels = list(gray.getdata())
+    # Find a good threshold - look for the dark pixels
+    sorted_p = sorted(pixels)
+    threshold = sorted_p[len(sorted_p) * 20 // 100]  # top 20% dark
+    threshold = min(threshold, 160)
+    log(f"Threshold: {threshold}")
+
+    bw = gray.point(lambda x: 0 if x < threshold else 255)
+    bw.save("/tmp/gaokao_bw.png")
+    log("Saved binarized image to /tmp/gaokao_bw.png")
+
+    # Find connected components using scan-line flood fill
+    w, h = bw.size
+    visited = [[False] * w for _ in range(h)]
+    components = []
+
+    for y in range(h):
+        for x in range(w):
+            if visited[y][x]:
+                continue
+            if bw.getpixel((x, y)) != 0:  # not dark pixel
+                visited[y][x] = True
+                continue
+
+            # BFS flood fill for this component
+            stack = [(x, y)]
+            visited[y][x] = True
+            min_x, max_x = x, x
+            min_y, max_y = y, y
+            count = 0
+
+            while stack:
+                cx, cy = stack.pop()
+                count += 1
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                # Check 4-connected neighbors
+                for nx, ny in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)]:
+                    if 0 <= nx < w and 0 <= ny < h and not visited[ny][nx]:
+                        if bw.getpixel((nx, ny)) == 0:
+                            visited[ny][nx] = True
+                            stack.append((nx, ny))
+
+            cw = max_x - min_x + 1
+            ch = max_y - min_y + 1
+            # Filter: character-like components
+            if count >= 15 and cw >= 8 and ch >= 8 and cw <= iw * 0.4 and ch <= ih * 0.5:
+                components.append((min_x, min_y, max_x, max_y, count))
+
+    log(f"Found {len(components)} character-like components:")
+    for x1, y1, x2, y2, sz in components:
+        log(f"  ({x1},{y1})-({x2},{y2})  size={x2-x1}x{y2-y1}  pixels={sz}")
+
+    if len(components) < 3:
+        log(f"WARNING: Only {len(components)} components found, too few")
+        return []
+
+    # Sort by x position, take 3
+    components.sort(key=lambda c: c[0])
+    # If more than 3, try to pick the 3 most likely (by pixel count, position)
+    if len(components) > 3:
+        # Prefer components in the middle band (y = 25%-75% of height)
+        mid_y_low = ih * 0.25
+        mid_y_high = ih * 0.75
+        scored = []
+        for c in components:
+            cy = (c[1] + c[3]) / 2
+            y_score = 1.0 - abs(cy - ih / 2) / (ih / 2)  # closer to center = better
+            size_score = min(1.0, c[4] / 200)  # bigger = better up to a point
+            scored.append((y_score * 0.6 + size_score * 0.4, c))
+        scored.sort(key=lambda s: -s[0])
+        components = [c for _, c in scored[:3]]
+        components.sort(key=lambda c: c[0])
+
+    log(f"\nSelected 3 components (left-to-right):")
+    for x1, y1, x2, y2, sz in components:
+        log(f"  ({x1},{y1})-({x2},{y2})")
+
+    return [(x1, y1, x2, y2) for x1, y1, x2, y2, _ in components]
+
+
+def recognize_char(image_path, box):
+    """Crop and recognize a single character using tesseract."""
+    import tesserocr
+    x1, y1, x2, y2 = box
     try:
         img = Image.open(image_path)
-        if img.mode == 'RGBA':
-            img = img.convert('RGB')
-        gray = img.convert('L')
-        from PIL import ImageOps, ImageFilter, ImageEnhance
-        # Auto contrast
-        gray = ImageOps.autocontrast(gray, cutoff=3)
-        # Sharpen
-        gray = gray.filter(ImageFilter.SHARPEN)
-        # Binarize: apply threshold
-        gray = gray.point(lambda x: 0 if x < 180 else 255)
-        gray.save(image_path)
-        return True
-    except Exception as e:
-        log(f"Preprocess error: {e}")
-        return False
+        crop = img.crop((x1, y1, x2, y2))
+        crop_gray = crop.convert('L')
+        # Enlarge for better recognition
+        crop_big = crop_gray.resize((crop_gray.width * 3, crop_gray.height * 3), Image.LANCZOS)
 
-
-def try_ocr(image_path):
-    """Try OCR with multiple PSM modes, return first successful result."""
-    import tesserocr
-
-    psm_modes = [6, 3, 11, 12, 13, 4]
-    for psm in psm_modes:
+        api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
         try:
-            api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
-            try:
-                api.SetImageFile(image_path)
-                api.SetVariable("tessedit_pageseg_mode", str(psm))
-                api.Recognize()
-
-                boxes = []
-                ri = api.GetIterator()
-                if ri:
-                    level = tesserocr.RIL.SYMBOL
-                    while True:
-                        try:
-                            text = ri.GetUTF8Text(level).strip()
-                        except RuntimeError:
-                            text = ""
-                        bbox = ri.BoundingBox(level)
-                        if bbox and text and text.isprintable():
-                            x1, y1, x2, y2 = bbox
-                            w, h = x2 - x1, y2 - y1
-                            if w >= 5 and h >= 5:
-                                boxes.append((text, x1, y1, x2, y2))
-                        if not ri.Next(level):
-                            break
-                if len(boxes) >= 3:
-                    return boxes, psm
-            finally:
-                api.End()
-        except Exception as e:
-            log(f"PSM {psm} error: {e}")
-    return [], None
+            api.SetImage(crop_big)
+            api.SetVariable("tessedit_pageseg_mode", "10")  # single char
+            api.Recognize()
+            text = api.GetUTF8Text().strip()
+            if text:
+                # Take first char only
+                return text[0]
+        finally:
+            api.End()
+    except Exception as e:
+        log(f"  Recognize error: {e}")
+    return ""
 
 
 def solve(image_path, expected_chars):
-    import tesserocr
-
     log("--- OCR Debug ---")
     log(f"Expected click order: {' → '.join(expected_chars)}")
-    log(f"Image size: {Image.open(image_path).size}")
 
-    preprocess_image(image_path)
-
-    boxes, psm = try_ocr(image_path)
-    log(f"PSM mode: {psm}")
-    log(f"Tesseract recognized {len(boxes)} symbols:")
-    for text, x1, y1, x2, y2 in boxes:
-        log(f"  '{text}' at ({x1},{y1})-({x2},{y2})  size={x2-x1}x{y2-y1}")
+    # Step 1: find character positions via connected components
+    boxes = find_char_boxes(image_path)
 
     if len(boxes) < 3:
-        log(f"WARNING: Only {len(boxes)} symbols from OCR, trying CC fallback")
-        api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
-        try:
-            api.SetImageFile(image_path)
-            comps = api.GetComponentImages(tesserocr.RIL.SYMBOL, True)
-            boxes = []
-            for _, b, _, _ in comps:
-                x1, y1 = b["x"], b["y"]
-                w, h = b["w"], b["h"]
-                if w < 5 or h < 5:
-                    continue
-                boxes.append(("", x1, y1, x1 + w, y1 + h))
-            log(f"CC boxes: {len(boxes)}")
-            for _, x1, y1, x2, y2 in boxes:
-                log(f"  (?,?) at ({x1},{y1})-({x2},{y2})")
-        finally:
-            api.End()
+        log("ERROR: Could not find 3 character positions in image")
+        sys.exit(1)
 
-        if len(boxes) < 3:
-            log("ERROR: Could not find 3 character positions")
-            sys.exit(1)
+    # Step 2: recognize each character
+    log(f"\nCharacter recognition:")
+    recognized = []
+    for i, box in enumerate(boxes):
+        ch = recognize_char(image_path, box)
+        recognized.append(ch)
+        log(f"  Box[{i}] at ({box[0]},{box[1]})-({box[2]},{box[3]}): '{ch}'")
 
-        # Take the 3 most confident/appropriate boxes
-        # Sort by x position, take first 3
-        boxes.sort(key=lambda b: b[1])  # sort by x
-        boxes = boxes[:3]
+    # Step 3: match recognized chars to expected order
+    assigned = {}   # expected_char -> box_index
+    used = set()
+    unmatched = []
 
-        log(f"\nTop 3 boxes (left-to-right):")
-        for text, x1, y1, x2, y2 in boxes:
-            log(f"  '{text}' at ({x1},{y1})-({x2},{y2})")
+    for ch in expected_chars:
+        found = False
+        for idx, rch in enumerate(recognized):
+            if idx in used:
+                continue
+            if rch and (ch == rch or ch in rch or rch in ch):
+                assigned[ch] = idx
+                used.add(idx)
+                found = True
+                break
+        if not found:
+            unmatched.append(ch)
 
-        # Strategy: best-effort matching
-        # For each expected char, check if it appears in any box
-        box_indices = list(range(len(boxes)))
-        assigned_boxes = {}  # expected_char -> box_index
-        used_indices = set()
-        unmatched_chars = []
+    log(f"\nMatching results:")
+    for ch, idx in assigned.items():
+        log(f"  '{ch}' → box[{idx}] (recognized as '{recognized[idx]}')")
+    if unmatched:
+        log(f"  Unmatched: {unmatched}")
 
-        for ch in expected_chars:
-            found = False
-            for idx in box_indices:
-                if idx in used_indices:
-                    continue
-                # Check if this char is in the recognized text
-                # Also check if the recognized text contains only this char
-                recognized = boxes[idx][0]
-                if ch == recognized or (len(recognized) == 1 and ch == recognized):
-                    assigned_boxes[ch] = idx
-                    used_indices.add(idx)
-                    found = True
-                    break
-            if not found:
-                unmatched_chars.append(ch)
+    # Assign remaining boxes to unmatched chars
+    remaining = [i for i in range(len(boxes)) if i not in used]
+    for ch, idx in zip(unmatched, remaining):
+        assigned[ch] = idx
+        log(f"  '{ch}' → box[{idx}] (by position, recognized as '{recognized[idx]}')")
 
-        log(f"\nRecognition matching:")
-        for ch, idx in assigned_boxes.items():
-            log(f"  '{ch}' matched to box[{idx}] at ({boxes[idx][1]},{boxes[idx][2]})")
-        if unmatched_chars:
-            log(f"  Unmatched chars: {unmatched_chars}")
-
-        # Assign remaining boxes to unmatched chars
-        remaining_indices = [i for i in box_indices if i not in used_indices]
-        for ch, idx in zip(unmatched_chars, remaining_indices):
-            assigned_boxes[ch] = idx
-            log(f"  '{ch}' assigned to box[{idx}] (remaining)")
-
-        # If still unmatched (shouldn't happen with 3 boxes and 3 chars)
-        if len(assigned_boxes) < 3:
-            log("WARNING: Not all chars matched, falling back to position-based")
-            for i, (ch, (_, x1, y1, x2, y2)) in enumerate(
-                zip(expected_chars, boxes[:3])
-            ):
-                assigned_boxes[ch] = i
-
-        # Build result in expected order
-        result_boxes = []
-        for ch in expected_chars:
-            idx = assigned_boxes.get(ch, 0)
-            result_boxes.append(boxes[idx][1:5])
-
-        log(f"\nFinal click order:")
+    # If still missing, fall back to position
+    if len(assigned) < 3:
+        log("WARNING: Not all assigned, using left-to-right fallback")
         for i, ch in enumerate(expected_chars):
-            x1, y1, x2, y2 = result_boxes[i]
-            log(f"  Click {i+1}: '{ch}' at ({x1},{y1})-({x2},{y2})")
+            assigned[ch] = i
 
-        return result_boxes
+    # Build final result
+    result = []
+    log(f"\nFinal click order:")
+    for ch in expected_chars:
+        idx = assigned[ch]
+        box = boxes[idx]
+        result.append(box)
+        log(f"  '{ch}' at ({box[0]},{box[1]})-({box[2]},{box[3]})")
+
+    return result
 
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: ocr_helper.py <image_path> <char1 char2 char3>", file=sys.stderr)
+        log("Usage: ocr_helper.py <image_path> <char1 char2 char3>")
         sys.exit(1)
 
     image_path = sys.argv[1]
@@ -203,8 +221,7 @@ def main():
         sys.exit(1)
 
     try:
-        img = Image.open(image_path)
-        iw, ih = img.size
+        iw, ih = Image.open(image_path).size
     except Exception:
         iw, ih = 300, 150
 
@@ -216,6 +233,7 @@ def main():
         print(f"{cx:.4f},{cy:.4f}")
 
     log("--- OCR Done ---")
+
 
 if __name__ == "__main__":
     main()
