@@ -188,8 +188,17 @@ impl BrowserClient {
 
         for attempt in 1..=max_retries {
             if attempt > 1 {
+                // Refresh captcha button click to get a new image
+                self.log_msg("刷新验证码...");
+                let _ = page.evaluate_expression(
+                    r#"(function() {
+                        const btn = document.getElementById('refreshCaptcha');
+                        if (btn) { btn.click(); return 'ok'; }
+                        return 'no_btn';
+                    })()"#
+                ).await;
                 // Wait for new captcha to load
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
@@ -271,6 +280,10 @@ impl BrowserClient {
                 Ok(r) => r,
                 Err(e) => {
                     self.log_msg(&format!("OCR失败: {}, 准备重试", e));
+                    // Save failed captcha for debugging
+                    let debug_path = format!("/tmp/gaokao_captcha_fail_{}.png", attempt);
+                    let _ = std::fs::copy(temp_path, &debug_path);
+                    self.log_msg(&format!("已保存失败验证码到: {}", debug_path));
                     continue;
                 }
             };

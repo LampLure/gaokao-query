@@ -20,55 +20,86 @@ os.environ["TESSDATA_PREFIX"] = "/tmp"
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
-def solve(image_path, expected_chars):
-    import tesserocr
-
-    log("--- OCR Debug ---")
-    log(f"Expected click order: {' → '.join(expected_chars)}")
-
-    # Preprocess: ensure image has good contrast for OCR
+def preprocess_image(image_path):
+    """Enhance image contrast and binarize for better OCR."""
     try:
         img = Image.open(image_path)
         if img.mode == 'RGBA':
             img = img.convert('RGB')
         gray = img.convert('L')
-        # Auto-level contrast
-        from PIL import ImageOps
-        gray = ImageOps.autocontrast(gray, cutoff=5)
+        from PIL import ImageOps, ImageFilter, ImageEnhance
+        # Auto contrast
+        gray = ImageOps.autocontrast(gray, cutoff=3)
+        # Sharpen
+        gray = gray.filter(ImageFilter.SHARPEN)
+        # Binarize: apply threshold
+        gray = gray.point(lambda x: 0 if x < 180 else 255)
         gray.save(image_path)
+        return True
     except Exception as e:
-        log(f"Preprocess warning: {e}")
+        log(f"Preprocess error: {e}")
+        return False
 
-    api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
-    try:
-        api.SetImageFile(image_path)
-        api.Recognize()
 
-        # Get symbol-level recognition results
-        boxes = []
-        ri = api.GetIterator()
-        if ri:
-            level = tesserocr.RIL.SYMBOL
-            while True:
-                try:
-                    text = ri.GetUTF8Text(level).strip()
-                except RuntimeError:
-                    text = ""
-                bbox = ri.BoundingBox(level)
-                if bbox and text and text.isprintable():
-                    x1, y1, x2, y2 = bbox
-                    w, h = x2 - x1, y2 - y1
-                    if w >= 5 and h >= 5:
-                        boxes.append((text, x1, y1, x2, y2))
-                if not ri.Next(level):
-                    break
+def try_ocr(image_path):
+    """Try OCR with multiple PSM modes, return first successful result."""
+    import tesserocr
 
-        log(f"Tesseract recognized {len(boxes)} symbols:")
-        for text, x1, y1, x2, y2 in boxes:
-            log(f"  '{text}' at ({x1},{y1})-({x2},{y2})  size={x2-x1}x{y2-y1}")
+    psm_modes = [6, 3, 11, 12, 13, 4]
+    for psm in psm_modes:
+        try:
+            api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
+            try:
+                api.SetImageFile(image_path)
+                api.SetVariable("tessedit_pageseg_mode", str(psm))
+                api.Recognize()
 
-        if len(boxes) < 3:
-            log(f"WARNING: Only {len(boxes)} symbols, trying CC fallback")
+                boxes = []
+                ri = api.GetIterator()
+                if ri:
+                    level = tesserocr.RIL.SYMBOL
+                    while True:
+                        try:
+                            text = ri.GetUTF8Text(level).strip()
+                        except RuntimeError:
+                            text = ""
+                        bbox = ri.BoundingBox(level)
+                        if bbox and text and text.isprintable():
+                            x1, y1, x2, y2 = bbox
+                            w, h = x2 - x1, y2 - y1
+                            if w >= 5 and h >= 5:
+                                boxes.append((text, x1, y1, x2, y2))
+                        if not ri.Next(level):
+                            break
+                if len(boxes) >= 3:
+                    return boxes, psm
+            finally:
+                api.End()
+        except Exception as e:
+            log(f"PSM {psm} error: {e}")
+    return [], None
+
+
+def solve(image_path, expected_chars):
+    import tesserocr
+
+    log("--- OCR Debug ---")
+    log(f"Expected click order: {' → '.join(expected_chars)}")
+    log(f"Image size: {Image.open(image_path).size}")
+
+    preprocess_image(image_path)
+
+    boxes, psm = try_ocr(image_path)
+    log(f"PSM mode: {psm}")
+    log(f"Tesseract recognized {len(boxes)} symbols:")
+    for text, x1, y1, x2, y2 in boxes:
+        log(f"  '{text}' at ({x1},{y1})-({x2},{y2})  size={x2-x1}x{y2-y1}")
+
+    if len(boxes) < 3:
+        log(f"WARNING: Only {len(boxes)} symbols from OCR, trying CC fallback")
+        api = tesserocr.PyTessBaseAPI(path="/tmp", lang="chi_sim")
+        try:
+            api.SetImageFile(image_path)
             comps = api.GetComponentImages(tesserocr.RIL.SYMBOL, True)
             boxes = []
             for _, b, _, _ in comps:
@@ -80,6 +111,8 @@ def solve(image_path, expected_chars):
             log(f"CC boxes: {len(boxes)}")
             for _, x1, y1, x2, y2 in boxes:
                 log(f"  (?,?) at ({x1},{y1})-({x2},{y2})")
+        finally:
+            api.End()
 
         if len(boxes) < 3:
             log("ERROR: Could not find 3 character positions")
@@ -150,8 +183,6 @@ def solve(image_path, expected_chars):
 
         return result_boxes
 
-    finally:
-        api.End()
 
 def main():
     if len(sys.argv) < 3:
