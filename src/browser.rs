@@ -29,6 +29,21 @@ pub struct BrowserClient {
 }
 
 impl BrowserClient {
+    /// Poll until JS expression returns true, or timeout.
+    /// turbo mode: 50ms interval, normal: 200ms.
+    async fn poll_true(&self, page: &Page, js: &str, max_ms: u64) -> bool {
+        let interval = if self.turbo { 50u64 } else { 200u64 };
+        let attempts = (max_ms / interval).max(5);
+        for _ in 0..attempts {
+            let ok: bool = page.evaluate_expression(js).await
+                .map(|r| r.into_value().unwrap_or(false))
+                .unwrap_or(false);
+            if ok { return true; }
+            self.sleep_critical(interval).await;
+        }
+        false
+    }
+
     pub fn set_perf(&mut self, perf: Option<Arc<Mutex<Vec<crate::data::PerfEvent>>>>) {
         self.perf = perf;
         self.start = std::time::Instant::now();
@@ -143,7 +158,19 @@ impl BrowserClient {
             .await
             .map_err(|e| format!("打开页面失败: {}", e))?;
 
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // Poll for form element (15s timeout) instead of blind 3s sleep
+        let interval = if turbo { 50u64 } else { 200u64 };
+        let attempts = 15000 / interval;
+        for _ in 0..attempts {
+            let ready: bool = page.evaluate_expression(
+                r#"(function() {
+                    const el = document.getElementById('zkzh');
+                    return el !== null;
+                })()"#
+            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+            if ready { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+        }
 
         let now = std::time::Instant::now();
         Ok(Self {
@@ -166,7 +193,14 @@ impl BrowserClient {
         page.goto(&self.target_url)
             .await
             .map_err(|e| format!("导航回首页失败: {}", e))?;
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Poll for form element to confirm page loaded (10s timeout)
+        self.poll_true(&page,
+            r#"(function() {
+                const el = document.getElementById('zkzh');
+                return el !== null;
+            })()"#, 10000).await;
+
         self.perf_event("导航回首页");
         Ok(())
     }
@@ -205,33 +239,13 @@ impl BrowserClient {
             })()"#
         ).await;
 
-        // Poll for captcha modal or error (200ms interval, max 5s)
+        // Poll for captcha modal or result (15s timeout)
         self.perf_event("等待验证码");
-        let mut captcha_visible = false;
-        for _ in 0..25 {
-            let cv: bool = page.evaluate_expression(
-                r#"(function() {
-                    const m = document.getElementById('captchaModal');
-                    const a = document.getElementById('alertModal');
-                    if (a && !a.classList.contains('hidden')) return false;
-                    return m ? !m.classList.contains('hidden') : false;
-                })()"#
-            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
-            if cv {
-                captcha_visible = true;
-                break;
-            }
-            let has_err: bool = page.evaluate_expression(
-                r#"(function() {
-                    const a = document.getElementById('alertModal');
-                    return a ? !a.classList.contains('hidden') : false;
-                })()"#
-            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
-            if has_err {
-                break;
-            }
-            self.sleep_critical(200).await;
-        }
+        let captcha_visible = self.poll_true(&page,
+            r#"(function() {
+                const m = document.getElementById('captchaModal');
+                return m ? !m.classList.contains('hidden') : false;
+            })()"#, 15000).await;
         if captcha_visible {
             self.perf_event("验证码弹窗出现");
             if let Err(e) = self.solve_captcha_modal(&page).await {
@@ -342,14 +356,12 @@ impl BrowserClient {
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
-            // Poll for captcha image immediately (no blind wait)
-            // captcha_wait_ms becomes the max poll time
-            let max_poll = if self.captcha_wait_ms > 200 { self.captcha_wait_ms } else { 2000 };
-            let poll_step = 200u64;
-            let max_attempts = (max_poll / poll_step).max(5);
+            // Poll for captcha image (15s timeout), fetch via JS immediately when ready
             let img_src: String = {
-                let mut last_src = String::new();
-                for _ in 0..max_attempts {
+                let interval = if self.turbo { 50u64 } else { 200u64 };
+                let attempts = (15000 / interval).max(10);
+                let mut last = String::new();
+                for _ in 0..attempts {
                     let src: String = page.evaluate_expression(
                         r#"(function() {
                             const img = document.getElementById('captchaImage');
@@ -374,33 +386,23 @@ impl BrowserClient {
                                     c.height = img.naturalHeight;
                                     const ctx = c.getContext('2d');
                                     ctx.drawImage(img, 0, 0);
-                                    const data = c.toDataURL('image/png');
-                                    if (data && data.length > 200) return data;
+                                    return c.toDataURL('image/png');
                                 } catch(e) {}
                             }
-                            try {
-                                const parent = img.parentElement;
-                                if (parent) {
-                                    const bg = getComputedStyle(parent).backgroundImage;
-                                    if (bg && bg.startsWith('url("data:image')) {
-                                        return bg.slice(5, -2);
-                                    }
-                                }
-                            } catch(e) {}
                             return '';
                         })()"#
                     ).await.map_err(|e| format!("获取验证码失败: {}", e))?
                         .into_value().unwrap_or_default();
-                    if !src.is_empty() {
-                        last_src = src;
+                    if !src.is_empty() && src.len() > 100 {
+                        last = src;
                         break;
                     }
-                    self.sleep_critical(poll_step).await;
+                    self.sleep_critical(interval).await;
                 }
-                if last_src.is_empty() {
+                if last.is_empty() {
                     return Err("验证码图片加载超时".to_string());
                 }
-                last_src
+                last
             };
             self.perf_event("验证码图片加载完成");
 
@@ -498,22 +500,18 @@ impl BrowserClient {
                 self.sleep_step(0.3).await;
             }
 
-            // Poll for verification result (200ms, max 2s)
+            // Poll for captcha modal to close or result to appear (15s timeout)
             self.perf_event("验证码点击完成");
-            for _ in 0..10 {
-                let still_visible: bool = page.evaluate_expression(
-                    r#"(function() {
-                        const m = document.getElementById('captchaModal');
-                        return m ? !m.classList.contains('hidden') : false;
-                    })()"#
-                ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
-                if !still_visible {
-                    break;
-                }
-                self.sleep_critical(200).await;
-            }
+            self.poll_true(page,
+                r#"(function() {
+                    const m = document.getElementById('captchaModal');
+                    const r = document.querySelector('[data-value="xm"]');
+                    const a = document.getElementById('alertModal');
+                    if (m && !m.classList.contains('hidden')) return false;
+                    return (r && r.textContent.trim()) || (a && !a.classList.contains('hidden'));
+                })()"#, 15000).await;
 
-            // Check if captcha modal is still visible (verification failed)
+            // After poll, check current state
             let still_visible: bool = page.evaluate_expression(
                 r#"(function() {
                     const m = document.getElementById('captchaModal');
