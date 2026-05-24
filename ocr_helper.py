@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
 import sys
 import os
+import threading
 import ddddocr
 from PIL import Image, ImageEnhance
+
+KILL_TIMER = None
+
+def start_kill_timer(seconds=25):
+    global KILL_TIMER
+    def kill():
+        os._exit(1)
+    KILL_TIMER = threading.Timer(seconds, kill)
+    KILL_TIMER.daemon = True
+    KILL_TIMER.start()
+
+def stop_kill_timer():
+    global KILL_TIMER
+    if KILL_TIMER:
+        KILL_TIMER.cancel()
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -82,6 +98,8 @@ def main():
         log(f"ERROR: Image not found: {image_path}")
         sys.exit(1)
 
+    start_kill_timer(25)
+
     try:
         log(f"--- OCR Processing: {image_path} ({n} chars: {expected_chars}) ---")
 
@@ -133,6 +151,8 @@ def main():
                 print(f"{cx:.4f},{cy:.4f}")
 
         log("--- OCR Completed ---")
+
+        stop_kill_timer()
 
     except Exception as e:
         log(f"FATAL ERROR: {str(e)}")

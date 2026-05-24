@@ -376,7 +376,7 @@ impl BrowserClient {
             let ch = dims["h"].as_f64().unwrap_or(150.0);
 
             // Solve captcha via OCR
-            let ocr_result = match ocr::solve_captcha(temp_path, &expected_chars, cw, ch) {
+            let ocr_result = match ocr::solve_captcha(temp_path, &expected_chars, cw, ch).await {
                 Ok(r) => r,
                 Err(e) => {
                     self.log_msg(&format!("OCR失败: {}, 准备重试", e));
