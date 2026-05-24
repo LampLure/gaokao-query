@@ -925,6 +925,10 @@ impl GaokaoApp {
                 handles.push(tokio::spawn(async move {
                     if *cancel.lock().await { return; }
 
+                    let mut l = logs.lock().await;
+                    l.push(format!("[QUERY] 开始处理: {} {}", record.name, record.baominghao));
+                    drop(l);
+
                     {
                         let mut p = progress.lock().await;
                         p.current_name = record.name.clone();
@@ -942,7 +946,17 @@ impl GaokaoApp {
                     for (ci, sfz) in candidates.iter().enumerate() {
                         if *cancel.lock().await { break; }
 
+                        {
+                            let mut l = logs.lock().await;
+                            l.push(format!("[QUERY] {} 获取浏览器中...", record.name));
+                        }
+
                         let (permit, client) = pool.acquire().await;
+
+                        {
+                            let mut l = logs.lock().await;
+                            l.push(format!("[QUERY] {} 浏览器已获取，开始查询", record.name));
+                        }
 
                         if ci > 0 {
                             let _ = client.go_home().await;
