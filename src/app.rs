@@ -278,33 +278,37 @@ impl eframe::App for GaokaoApp {
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {
-                    if self.query_state == QueryState::Idle {
-                        if ui.button(egui::RichText::new("▶ 开始查询").heading().color(egui::Color32::WHITE)).clicked() {
-                            self.start_query(ctx);
+                    ui.push_id("query_controls", |ui| {
+                        if self.query_state == QueryState::Idle {
+                            if ui.button(egui::RichText::new("▶ 开始查询").heading().color(egui::Color32::WHITE)).clicked() {
+                                self.start_query(ctx);
+                            }
                         }
-                    }
-                    if self.query_state == QueryState::Paused {
-                        if ui.button("▶ 继续").clicked() {
-                            *self.cancel_flag.try_lock().unwrap() = false;
-                            self.query_state = QueryState::Running;
-                            self.log("查询继续");
-                            self.start_query(ctx);
+                        if self.query_state == QueryState::Paused {
+                            if ui.button("▶ 继续").clicked() {
+                                *self.cancel_flag.try_lock().unwrap() = false;
+                                self.query_state = QueryState::Running;
+                                self.log("查询继续");
+                                self.start_query(ctx);
+                            }
+                            if ui.button("⏹ 重新开始").clicked() {
+                                *self.cancel_flag.try_lock().unwrap() = true;
+                                self.query_state = QueryState::Idle;
+                                self.log("查询已终止，准备重新开始");
+                            }
                         }
-                        if ui.button("⏹ 重新开始").clicked() {
-                            *self.cancel_flag.try_lock().unwrap() = true;
-                            self.query_state = QueryState::Idle;
-                            self.log("查询已终止，准备重新开始");
-                        }
-                    }
+                    });
                 });
             }
 
             if self.query_state == QueryState::Running {
-                if ui.button(egui::RichText::new("⏸ 暂停").heading()).clicked() {
-                    *self.cancel_flag.try_lock().unwrap() = true;
-                    self.query_state = QueryState::Paused;
-                    self.log("查询暂停");
-                }
+                ui.push_id("pause_btn", |ui| {
+                    if ui.button(egui::RichText::new("⏸ 暂停").heading()).clicked() {
+                        *self.cancel_flag.try_lock().unwrap() = true;
+                        self.query_state = QueryState::Paused;
+                        self.log("查询暂停");
+                    }
+                });
             }
 
             // progress

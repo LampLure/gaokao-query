@@ -63,34 +63,24 @@ impl BrowserClient {
     ) -> Result<QueryResult, String> {
         let page = self.page.lock().await;
 
-        let js_fill = |id: &str, val: &str| -> String {
+        fn js_fill(id: &str, val: &str) -> String {
             format!(
-                r#"(function() {{
-                    const el = document.getElementById('{}');
-                    if (!el) return 'no_' + '{}';
-                    const setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value'
-                    ).set;
-                    setter.call(el, '{}');
-                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return 'ok';
-                }})()"#,
+                "(function(){{const el=document.getElementById('{}');if(!el)return'no_{}';const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;setter.call(el,'{}');el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return'ok';}})()",
                 id, id, val
             )
-        };
+        }
 
-        let _: Result<String, _> = page.evaluate_function(js_fill("zkzh", baominghao))
+        let _: String = page.evaluate_expression(js_fill("zkzh", baominghao))
             .await.map_err(|e| format!("填报名号失败: {}", e))?
-            .into_value();
+            .into_value().map_err(|_| "填报名号返回值解析失败".to_string())?;
 
-        let _: Result<String, _> = page.evaluate_function(js_fill("sfzh", shenfenzheng))
+        let _: String = page.evaluate_expression(js_fill("sfzh", shenfenzheng))
             .await.map_err(|e| format!("填身份证号失败: {}", e))?
-            .into_value();
+            .into_value().map_err(|_| "填身份证返回值解析失败".to_string())?;
 
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let _ = page.evaluate_function(
+        let _ = page.evaluate_expression(
             r#"(function() {
                 const btn = document.querySelector('button[type="submit"]');
                 if (btn) { btn.click(); return 'clicked'; }
@@ -100,7 +90,7 @@ impl BrowserClient {
 
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        let captcha_visible: bool = page.evaluate_function(
+        let captcha_visible: bool = page.evaluate_expression(
             r#"(function() {
                 const m = document.getElementById('captchaModal');
                 return m ? !m.classList.contains('hidden') : false;
@@ -114,7 +104,7 @@ impl BrowserClient {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         }
 
-        let has_error: bool = page.evaluate_function(
+        let has_error: bool = page.evaluate_expression(
             r#"(function() {
                 const m = document.getElementById('alertModal');
                 return m ? !m.classList.contains('hidden') : false;
@@ -122,14 +112,14 @@ impl BrowserClient {
         ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
         if has_error {
-            let err_msg: String = page.evaluate_function(
+            let err_msg: String = page.evaluate_expression(
                 r#"(function() {
                     const el = document.getElementById('alertMessage');
                     return el ? el.textContent || '' : '';
                 })()"#
             ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-            let _ = page.evaluate_function(
+            let _ = page.evaluate_expression(
                 r#"(function() {
                     const btn = document.getElementById('alertOkButton');
                     if (btn) btn.click();
@@ -139,7 +129,7 @@ impl BrowserClient {
             return Err(err_msg);
         }
 
-        let name: String = page.evaluate_function(
+        let name: String = page.evaluate_expression(
             r#"(function() {
                 const el = document.querySelector('[data-value="xm"]');
                 return el ? el.textContent.trim() : '';
@@ -151,21 +141,21 @@ impl BrowserClient {
             return Err("未找到查询结果".to_string());
         }
 
-        let bmh: String = page.evaluate_function(
+        let bmh: String = page.evaluate_expression(
             r#"(function() {
                 const el = document.querySelector('[data-value="ksh"]');
                 return el ? el.textContent.trim() : '';
             })()"#
         ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-        let kemu: String = page.evaluate_function(
+        let kemu: String = page.evaluate_expression(
             r#"(function() {
                 const el = document.querySelector('[data-value="kmmc"]');
                 return el ? el.textContent.trim() : '';
             })()"#
         ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-        let kd: String = page.evaluate_function(
+        let kd: String = page.evaluate_expression(
             r#"(function() {
                 const el = document.querySelector('[data-value="kdmc"]');
                 return el ? el.textContent.trim() : '';
@@ -184,7 +174,7 @@ impl BrowserClient {
     }
 
     async fn solve_captcha_modal(&self, page: &Page) -> Result<(), String> {
-        let img_src: String = page.evaluate_function(
+        let img_src: String = page.evaluate_expression(
             r#"(function() {
                 const img = document.getElementById('captchaImage');
                 return img ? img.getAttribute('src') || '' : '';
@@ -196,7 +186,7 @@ impl BrowserClient {
             return Err("验证码图片为空".to_string());
         }
 
-        let chars_text: String = page.evaluate_function(
+        let chars_text: String = page.evaluate_expression(
             r#"(function() {
                 const spans = document.querySelectorAll('#captchaChars span');
                 return Array.from(spans).map(s => s.textContent.trim()).join(' ');
@@ -223,7 +213,7 @@ impl BrowserClient {
         std::fs::write(temp_path, &img_bytes)
             .map_err(|e| format!("保存验证码图片失败: {}", e))?;
 
-        let dims_json: String = page.evaluate_function(
+        let dims_json: String = page.evaluate_expression(
             r#"(function() {
                 const el = document.getElementById('captchaContainer');
                 if (!el) return JSON.stringify({w:300, h:150});
@@ -255,7 +245,7 @@ impl BrowserClient {
                 }})()"#,
                 point.x * cw, point.y * ch
             );
-            let _ = page.evaluate_function(&click_js).await;
+            let _ = page.evaluate_expression(&click_js).await;
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
 
