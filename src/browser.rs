@@ -228,6 +228,9 @@ impl BrowserClient {
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
+            // Wait for captcha image to render before polling
+            Self::sleep_critical(2000).await;
+
             // Get captcha image (wait for it to actually load)
             let img_src: String = {
                 let mut last_src = String::new();
