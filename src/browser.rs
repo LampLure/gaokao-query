@@ -13,6 +13,7 @@ use crate::ocr;
 const TARGET_URL: &str = "https://cx.hbea.edu.cn/gkkd/2026/eb3f6190-590c-4f79-9b88-81a1d0aa0a2b";
 
 pub struct BrowserClient {
+    _browser: Arc<Browser>,
     page: Arc<Mutex<Page>>,
 }
 
@@ -37,16 +38,22 @@ impl BrowserClient {
             .await
             .map_err(|e| format!("浏览器启动失败: {}", e))?;
 
+        let browser = Arc::new(browser);
+
+        let browser_clone = browser.clone();
         tokio::spawn(async move { loop { let _ = handler.next().await; } });
 
-        let page = browser
+        let page = browser_clone
             .new_page(TARGET_URL)
             .await
             .map_err(|e| format!("打开页面失败: {}", e))?;
 
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-        Ok(Self { page: Arc::new(Mutex::new(page)) })
+        Ok(Self {
+            _browser: browser,
+            page: Arc::new(Mutex::new(page)),
+        })
     }
 
     pub async fn query_single(
