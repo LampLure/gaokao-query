@@ -502,10 +502,20 @@ impl GaokaoApp {
 
                     let mut ok = false;
                     let mut last_err = String::new();
-                    for sfz in &candidates {
-                        if *cancel_inner.lock().await { return; }
-                        match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay).await {
-                            Ok(client) => {
+
+                    // Open ONE browser per record, try all candidates
+                    match crate::browser::BrowserClient::new_with_log(debug_mode, Some(logs.clone()), step_delay).await {
+                        Ok(client) => {
+                            for (ci, sfz) in candidates.iter().enumerate() {
+                                if *cancel_inner.lock().await { return; }
+
+                                if ci > 0 {
+                                    // Re-navigate to main page before next attempt
+                                    let _ = client.go_home().await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(step_delay)).await;
+                                }
+
+                                let _ = logs.lock().await;
                                 match client.query_single(&record.baominghao, sfz).await {
                                     Ok(mut r) => {
                                         r.shenfenzheng = sfz.clone();
@@ -515,16 +525,14 @@ impl GaokaoApp {
                                         break;
                                     }
                                     Err(e) => {
-                                        last_err = e;
+                                        last_err = format!("候选{}失败: {}", ci + 1, e);
                                         continue;
                                     }
                                 }
                             }
-                            Err(e) => {
-                                last_err = e;
-                                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                                continue;
-                            }
+                        }
+                        Err(e) => {
+                            last_err = format!("浏览器启动失败: {}", e);
                         }
                     }
 

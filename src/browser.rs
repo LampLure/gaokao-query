@@ -73,6 +73,15 @@ impl BrowserClient {
         })
     }
 
+    pub async fn go_home(&self) -> Result<(), String> {
+        let page = self.page.lock().await;
+        page.goto(TARGET_URL)
+            .await
+            .map_err(|e| format!("导航回首页失败: {}", e))?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        Ok(())
+    }
+
     pub async fn query_single(
         &self,
         baominghao: &str,
