@@ -104,10 +104,12 @@ impl GaokaoApp {
 
 impl eframe::App for GaokaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // sync async results to ui
+        // sync async results to ui (sorted by baominghao)
         if let Ok(r) = self.results.try_lock() {
             if r.len() != self.displayed_results.len() {
-                self.displayed_results = r.clone();
+                let mut sorted = r.clone();
+                sorted.sort_by(|a, b| a.baominghao.cmp(&b.baominghao));
+                self.displayed_results = sorted;
             }
         }
         if let Ok(l) = self.debug_logs.try_lock() {
@@ -455,7 +457,11 @@ impl GaokaoApp {
         *self.results.try_lock().unwrap() = Vec::new();
         *self.cancel_flag.try_lock().unwrap() = false;
 
-        let matched = self.matched_records.clone();
+        let mut seen = std::collections::HashSet::new();
+        let matched: Vec<_> = self.matched_records.iter()
+            .filter(|r| seen.insert((r.name.clone(), r.baominghao.clone())))
+            .cloned()
+            .collect();
         let concurrency = self.concurrency as usize;
         let delay = self.delay_ms as u64;
         let step_delay = self.step_delay_ms as u64;

@@ -222,7 +222,7 @@ impl BrowserClient {
                         return 'no_btn';
                     })()"#
                 ).await;
-                self.sleep_step(2.0).await;
+                Self::sleep_critical(3000).await;
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
@@ -416,7 +416,7 @@ impl BrowserClient {
                 })()"#
             ).await;
 
-            self.sleep_step(0.5).await;
+            Self::sleep_critical(1000).await;
         }
 
         Err(format!("验证码连续失败 {} 次，已放弃", max_retries))
