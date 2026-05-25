@@ -158,9 +158,10 @@ impl BrowserClient {
             .await
             .map_err(|e| format!("打开页面失败: {}", e))?;
 
-        // Poll for form element (15s timeout) instead of blind 3s sleep
+        // 修复 Bug 7: 页面加载失败时报错
         let interval = if turbo { 50u64 } else { 200u64 };
         let attempts = 15000 / interval;
+        let mut page_ready = false;
         for _ in 0..attempts {
             let ready: bool = page.evaluate_expression(
                 r#"(function() {
@@ -168,8 +169,12 @@ impl BrowserClient {
                     return el !== null;
                 })()"#
             ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
-            if ready { break; }
+            if ready { page_ready = true; break; }
             tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+        }
+
+        if !page_ready {
+            return Err("页面加载超时：未找到表单元素 (zkzh)，请检查目标网址是否正确".to_string());
         }
 
         let now = std::time::Instant::now();
@@ -194,13 +199,16 @@ impl BrowserClient {
             .await
             .map_err(|e| format!("导航回首页失败: {}", e))?;
 
-        // Poll for form element to confirm page loaded (10s timeout)
-        self.poll_true(&page,
+        // 修复 Bug 2: 检查 poll_true 返回值，确保页面加载成功
+        let loaded = self.poll_true(&page,
             r#"(function() {
                 const el = document.getElementById('zkzh');
                 return el !== null;
             })()"#, 10000).await;
 
+        if !loaded {
+            return Err("导航回首页超时：表单元素未加载".to_string());
+        }
         self.perf_event("导航回首页");
         Ok(())
     }
@@ -220,24 +228,28 @@ impl BrowserClient {
             )
         }
 
-        let _: String = page.evaluate_expression(js_fill("zkzh", baominghao))
+        let fill_result: String = page.evaluate_expression(js_fill("zkzh", baominghao))
             .await.map_err(|e| format!("填报名号失败: {}", e))?
             .into_value().map_err(|_| "填报名号返回值解析失败".to_string())?;
 
-        let _: String = page.evaluate_expression(js_fill("sfzh", shenfenzheng))
+        let fill_result: String = page.evaluate_expression(js_fill("sfzh", shenfenzheng))
             .await.map_err(|e| format!("填身份证号失败: {}", e))?
             .into_value().map_err(|_| "填身份证返回值解析失败".to_string())?;
 
         self.sleep_step(0.5).await;
         self.perf_event("填写信息完成");
 
-        let _ = page.evaluate_expression(
+        let click_result: String = page.evaluate_expression(
             r#"(function() {
                 const btn = document.querySelector('button[type="submit"]');
                 if (btn) { btn.click(); return 'clicked'; }
                 return 'no_button';
             })()"#
-        ).await;
+        ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
+
+        if click_result != "clicked" {
+            return Err("提交按钮未找到，页面可能未正确加载".to_string());
+        }
 
         // Poll for captcha modal or result (15s timeout)
         self.perf_event("等待验证码");
@@ -618,7 +630,17 @@ impl BrowserPool {
     pub fn release(self: &Arc<Self>, permit: OwnedSemaphorePermit, client: BrowserClient) {
         let this = self.clone();
         tokio::spawn(async move {
-            let _ = client.go_home().await;
+            // 修复 Bug 4: go_home 失败时进行补救
+            if let Err(e) = client.go_home().await {
+                // go_home 失败，用 JS 强制刷新页面作为补救
+                let page = client.page.lock().await;
+                let _ = page.evaluate_expression(
+                    r#"window.location.reload()"#
+                ).await;
+                drop(page);
+                // 再等待一次页面加载
+                let _ = client.go_home().await;
+            }
             this.clients.lock().await.push_back(client);
             drop(permit);
         });
