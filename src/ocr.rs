@@ -23,6 +23,11 @@ fn ocr_port(instance_id: u64) -> u16 {
     19999 + (instance_id % 10) as u16
 }
 
+/// 就绪信号文件路径
+fn ready_file_path(port: u16) -> PathBuf {
+    std::env::temp_dir().join(format!("ocr_ready_{}", port))
+}
+
 /// 已尝试启动的 OCR 服务端口集合（避免重复启动）
 static STARTED_PORTS: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
@@ -53,8 +58,8 @@ async fn ensure_ocr_server(port: u16) {
         }
     }
 
-    // 先检查服务是否已经在运行
-    if check_ocr_health(port).await {
+    // 先检查服务是否已经在运行（就绪文件 + HTTP 双重检查）
+    if check_ocr_ready(port).await {
         let mut started = STARTED_PORTS.lock().unwrap();
         if !started.contains(&port) {
             started.push(port);
@@ -78,42 +83,85 @@ async fn ensure_ocr_server(port: u16) {
         return;
     }
 
+    // 清理旧的就绪文件
+    let ready_path = ready_file_path(port);
+    let _ = std::fs::remove_file(&ready_path);
+
     let py = python_path();
+
+    // 关键修复：不抑制 stderr！让 Python 的错误信息可见
+    // stdout 可以静默（Python print 输出），但 stderr 必须透传
     let child = Command::new(&py)
         .arg(&script)
         .arg(port.to_string())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())  // 让 Python 错误信息可见
         .spawn();
 
     match child {
-        Ok(_) => {
+        Ok(mut child_handle) => {
             eprintln!("[OCR] 已启动 ocr_server.py (port {})，等待服务就绪...", port);
-            // 等待服务启动完成（最多45秒，4个模型加载需要时间）
-            for _ in 0..90 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if check_ocr_health(port).await {
-                    eprintln!("[OCR] HTTP服务已就绪 (port {})", port);
-                    let mut started = STARTED_PORTS.lock().unwrap();
-                    if !started.contains(&port) {
-                        started.push(port);
+
+            // 策略1：优先等待就绪信号文件（比 HTTP 探测更可靠，不会干扰服务器初始化）
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(60);  // 增加到60秒，4个模型加载可能很慢
+
+            loop {
+                // 检查就绪文件是否存在
+                if ready_path.exists() {
+                    eprintln!("[OCR] 检测到就绪信号文件，服务已就绪 (port {})", port);
+                    // 再做一次 HTTP 健康检查确认
+                    if check_ocr_health(port).await {
+                        eprintln!("[OCR] ✓ HTTP服务已就绪并验证通过 (port {})", port);
+                        let mut started = STARTED_PORTS.lock().unwrap();
+                        if !started.contains(&port) {
+                            started.push(port);
+                        }
+                        let mut cache = HEALTH_CACHE.lock().unwrap();
+                        if !cache.contains(&port) {
+                            cache.push(port);
+                        }
+                        return;
+                    } else {
+                        eprintln!("[OCR] 就绪文件存在但HTTP健康检查失败，继续等待...");
                     }
-                    let mut cache = HEALTH_CACHE.lock().unwrap();
-                    if !cache.contains(&port) {
-                        cache.push(port);
+                }
+
+                // 检查进程是否还活着
+                match child_handle.try_wait() {
+                    Ok(Some(status)) => {
+                        eprintln!("[OCR] ❌ ocr_server.py 进程已退出，状态: {}", status);
+                        let mut failed = FAILED_PORTS.lock().unwrap();
+                        if !failed.contains(&port) {
+                            failed.push(port);
+                        }
+                        return;
+                    }
+                    Ok(None) => {
+                        // 进程仍在运行，继续等待
+                    }
+                    Err(e) => {
+                        eprintln!("[OCR] 无法检查进程状态: {}", e);
+                    }
+                }
+
+                if start.elapsed() > timeout {
+                    eprintln!("[OCR] ❌ HTTP服务启动超时 (port {}，等待{}秒)，将降级到子进程模式", port, timeout.as_secs());
+                    // 尝试杀掉可能还在运行的进程
+                    let _ = child_handle.kill().await;
+                    let mut failed = FAILED_PORTS.lock().unwrap();
+                    if !failed.contains(&port) {
+                        failed.push(port);
                     }
                     return;
                 }
-            }
-            eprintln!("[OCR] HTTP服务启动超时 (port {})，将降级到子进程模式", port);
-            // 标记为失败，本次运行不再重试
-            let mut failed = FAILED_PORTS.lock().unwrap();
-            if !failed.contains(&port) {
-                failed.push(port);
+
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
         Err(e) => {
-            eprintln!("[OCR] 启动 ocr_server.py 失败: {}，将降级到子进程模式", e);
+            eprintln!("[OCR] ❌ 启动 ocr_server.py 失败: {}，将降级到子进程模式", e);
+            eprintln!("[OCR]    请确认 Python3 已安装且 ddddocr 模块可用: pip install ddddocr Pillow");
             let mut failed = FAILED_PORTS.lock().unwrap();
             if !failed.contains(&port) {
                 failed.push(port);
@@ -122,11 +170,23 @@ async fn ensure_ocr_server(port: u16) {
     }
 }
 
-/// 检查 OCR HTTP 服务是否在运行（轻量健康检查）
+/// 检查 OCR 服务是否就绪（就绪文件 + HTTP 双重检查）
+async fn check_ocr_ready(port: u16) -> bool {
+    // 首先检查就绪文件
+    let ready_path = ready_file_path(port);
+    if !ready_path.exists() {
+        return false;
+    }
+
+    // 就绪文件存在，再通过 HTTP 确认
+    check_ocr_health(port).await
+}
+
+/// 检查 OCR HTTP 服务是否在运行（轻量健康检查，使用 GET /health）
 async fn check_ocr_health(port: u16) -> bool {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_millis(1500))
+        .connect_timeout(Duration::from_millis(500))
         .build();
 
     let client = match client {
@@ -134,7 +194,27 @@ async fn check_ocr_health(port: u16) -> bool {
         Err(_) => return false,
     };
 
-    // 发一个极小的请求来检查服务是否存活
+    // 优先使用 GET /health 端点（更轻量）
+    match client.get(format!("http://127.0.0.1:{}/health", port))
+        .timeout(Duration::from_millis(2000))
+        .send().await
+    {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                return true;
+            }
+            // 503 = 模型还在加载中，不算失败
+            if resp.status().as_u16() == 503 {
+                return false;
+            }
+            // 其他状态码，可能是旧版服务没有 /health 端点，用 POST 兜底
+        }
+        Err(_) => {
+            // GET /health 失败，可能是旧版服务，用 POST 方式探测
+        }
+    }
+
+    // 兜底：用 POST 方式探测（兼容旧版 ocr_server.py）
     let body = serde_json::json!({
         "image": "",
         "expected_chars": ["test"],
@@ -142,7 +222,7 @@ async fn check_ocr_health(port: u16) -> bool {
 
     match client.post(format!("http://127.0.0.1:{}/", port))
         .json(&body)
-        .timeout(Duration::from_millis(800))
+        .timeout(Duration::from_millis(2000))
         .send().await
     {
         Ok(resp) => resp.status().is_success(),
@@ -254,7 +334,9 @@ async fn try_http_ocr(
         .map_err(|e| format!("OCR HTTP服务请求失败: {}", e))?;
 
     if !result.status().is_success() {
-        return Err(format!("OCR HTTP服务返回错误状态: {}", result.status()));
+        let status = result.status();
+        let body_text = result.text().await.unwrap_or_default();
+        return Err(format!("OCR HTTP服务返回错误状态: {} ({})", status, body_text));
     }
 
     let resp: serde_json::Value = result.json().await

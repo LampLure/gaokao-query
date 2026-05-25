@@ -35,14 +35,12 @@ pub struct GaokaoApp {
     pred_bkh_path: Option<String>,
     pred_sfz_records: Vec<ShenFenZhengRecord>,
     pred_known_bkh: Vec<BaoKaoHaoRecord>,
-    pred_class_list: Vec<String>,
-    pred_selected_class: usize,
     pred_year_filter: f64,
-    pred_boundary_str: String,
-    pred_boundary: u64,
-    pred_range_start: u64,
-    pred_range_end: u64,
-    pred_search_margin: u32,
+    pred_boundary_str: String,       // 锚点后缀输入框（如 1493）
+    pred_boundary: u64,              // 锚点后缀数值
+    pred_scan_high_str: String,      // 扫描上限输入框（如 2500）
+    pred_scan_high: u64,             // 扫描上限数值
+    pred_search_margin: u32,         // 网格探针数量
     pred_results: Arc<Mutex<Vec<PredictedRecord>>>,
     pred_displayed_results: Vec<PredictedRecord>,
     pred_state: QueryState,
@@ -101,13 +99,11 @@ impl GaokaoApp {
             pred_bkh_path: if cfg.pred_bkh_path.is_empty() { None } else { Some(cfg.pred_bkh_path.clone()) },
             pred_sfz_records: Vec::new(),
             pred_known_bkh: Vec::new(),
-            pred_class_list: Vec::new(),
-            pred_selected_class: 0,
             pred_year_filter: 2023.0,
             pred_boundary_str: cfg.pred_boundary.clone(),
             pred_boundary: cfg.pred_boundary.parse().unwrap_or(0),
-            pred_range_start: 0,
-            pred_range_end: 0,
+            pred_scan_high_str: cfg.pred_scan_high.clone(),
+            pred_scan_high: cfg.pred_scan_high.parse().unwrap_or(0),
             pred_search_margin: 10,
             pred_results: Arc::new(Mutex::new(Vec::new())),
             pred_displayed_results: Vec::new(),
@@ -139,7 +135,6 @@ impl GaokaoApp {
         if let Some(p) = &app.pred_sfz_path {
             if let Ok(records) = parser::parse_shenfenzheng(p) {
                 app.pred_sfz_records = records;
-                app.build_class_list();
             }
         }
         if let Some(p) = &app.pred_bkh_path {
@@ -164,6 +159,7 @@ impl GaokaoApp {
         self.config.pred_sfz_path = self.pred_sfz_path.as_ref().cloned().unwrap_or_default();
         self.config.pred_bkh_path = self.pred_bkh_path.as_ref().cloned().unwrap_or_default();
         self.config.pred_boundary = self.pred_boundary_str.clone();
+        self.config.pred_scan_high = self.pred_scan_high_str.clone();
         self.config.target_url = self.target_url.clone();
         self.config.concurrency = self.concurrency;
         self.config.delay_ms = self.delay_ms;
@@ -177,39 +173,11 @@ impl GaokaoApp {
         self.config_dirty = false;
     }
 
-    // ---- class grouping helper ----
-    fn extract_grade_class(org: &str) -> Option<(String, String, String)> {
-        let parts: Vec<&str> = org.split('-').collect();
-        // 修复 Bug 1: 访问 parts[6] 需要至少 7 个元素 (索引 0-6)
-        if parts.len() >= 7 {
-            let grade = parts[4].to_string();
-            let class_name = parts[6].to_string();
-            let full_grade = parts[3].to_string();
-            Some((grade, class_name, full_grade))
-        } else {
-            None
-        }
-    }
-
-    fn build_class_list(&mut self) {
-        let year = self.pred_year_filter;
-        let mut classes: Vec<(u32, String)> = Vec::new();
-        for r in &self.pred_sfz_records {
-            let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
-            if ruxue != year as u32 { continue; }
-            if let Some((_, cls, _)) = Self::extract_grade_class(&r.organization) {
-                let num: u32 = cls.trim_end_matches("班").parse().unwrap_or(0);
-                let key = format!("{}-{}", ruxue, cls);
-                if !classes.iter().any(|(_, k)| k == &key) {
-                    classes.push((num, key));
-                }
-            }
-        }
-        classes.sort_by_key(|(num, _)| *num);
-        self.pred_class_list = classes.into_iter().map(|(_, k)| k).collect();
-        if !self.pred_class_list.is_empty() {
-            self.pred_selected_class = 0;
-        }
+    // ---- 统计指定年份人数 ----
+    fn count_students_for_year(&self, year: u32) -> usize {
+        self.pred_sfz_records.iter()
+            .filter(|r| r.ruxue_year.unwrap_or(0.0) as u32 == year)
+            .count()
     }
 }
 
@@ -829,11 +797,9 @@ impl GaokaoApp {
                     match parser::parse_shenfenzheng(&s) {
                         Ok(records) => {
                             self.pred_sfz_records = records;
-                            self.build_class_list();
                             self.status_message = format!(
-                                "解析完成: {} 条记录, {} 个班级",
-                                self.pred_sfz_records.len(),
-                                self.pred_class_list.len()
+                                "解析完成: {} 条记录",
+                                self.pred_sfz_records.len()
                             );
                             self.log(&self.status_message);
                         }
@@ -971,9 +937,32 @@ impl GaokaoApp {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
+                ui.label("扫描上限后缀：");
+                let response = ui.add_sized(
+                    [120.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.pred_scan_high_str).hint_text("留空=锚点"),
+                );
+                if response.changed() {
+                    self.pred_scan_high = self.pred_scan_high_str.parse().unwrap_or(0);
+                    self.config_dirty = true;
+                }
+                let effective_high = if self.pred_scan_high > 0 { self.pred_scan_high } else { self.pred_boundary };
+                if self.pred_boundary > 0 && effective_high > 0 {
+                    let year_count = self.count_students_for_year(self.pred_year_filter as u32);
+                    ui.label(egui::RichText::new(format!(
+                        "扫描范围：2642112615{} ~ 2642112615{} (约{}人)",
+                        0, effective_high, year_count
+                    )).color(egui::Color32::LIGHT_BLUE));
+                } else {
+                    ui.label(egui::RichText::new("超过锚点的后缀范围").color(egui::Color32::GRAY));
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
                 ui.label("网格探针数：");
                 ui.add(egui::Slider::new(&mut self.pred_search_margin, 3..=30).text("个"));
-                ui.label("（均匀分布在锚点范围内）");
+                ui.label("（均匀分布在扫描范围内）");
             });
 
             ui.add_space(8.0);
@@ -1403,6 +1392,7 @@ impl GaokaoApp {
         let all_sfz_records = self.pred_sfz_records.clone();
         let target_year = self.pred_year_filter as u32;
         let anchor = self.pred_boundary;
+        let scan_high = if self.pred_scan_high > 0 { self.pred_scan_high } else { anchor };
         let probe_count = self.pred_search_margin.max(3);
 
         tokio::spawn(async move {
@@ -1455,7 +1445,7 @@ impl GaokaoApp {
 
             let mut l = logs.lock().await;
             l.push(format!("=================================================="));
-            l.push(format!("[🔥锚点网格] 启动推算！入学年份={} | 全年级总人数：{}人 | 锚点={}", target_year, students.len(), anchor));
+            l.push(format!("[🔥锚点网格] 启动推算！入学年份={} | 全年级总人数：{}人 | 锚点={} | 扫描范围=[0,{}]", target_year, students.len(), anchor, scan_high));
             drop(l);
 
             // 调用新的锚点网格 + 密集扫射算法
@@ -1464,11 +1454,13 @@ impl GaokaoApp {
                 students,
                 &base_bkh,
                 anchor,
+                0,          // scan_low: 从0开始
+                scan_high,  // scan_high: 可超过锚点
                 probe_count,
                 concurrency,
                 cancel,
                 pred_progress,
-                logs,
+                logs.clone(),
                 perf_logs,
                 captcha_stats,
                 browser_statuses,

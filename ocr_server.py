@@ -7,29 +7,63 @@ v3 核心改进（一招鲜策略）：
 3. 双模型投票增强单字识别准确率
 4. 自动刷新验证码检测：通过截图hash判断验证码是否已刷新
 5. 更详细的debug信息
+
+v3.1 改进：
+- 添加 GET /health 端点用于轻量健康检查
+- 添加就绪信号文件机制，避免启动期间反复HTTP探测
+- 模型加载失败时给出明确错误信息
 """
 import io
+import os
 import base64
 import json
 import sys
+import signal
+import tempfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import ddddocr
-from PIL import Image, ImageEnhance, ImageFilter
 
-# ──────────────────────── 全局模型（只加载一次） ────────────────────────
-print("[OCR Server] 正在加载检测模型(beta)...", flush=True)
-det_beta = ddddocr.DdddOcr(det=True, beta=True, show_ad=False)
-print("[OCR Server] 正在加载检测模型(default)...", flush=True)
-det_default = ddddocr.DdddOcr(det=True, beta=False, show_ad=False)
-print("[OCR Server] 正在加载识别模型(beta)...", flush=True)
-ocr_beta = ddddocr.DdddOcr(beta=True, show_ad=False)
-print("[OCR Server] 正在加载识别模型(default)...", flush=True)
-ocr_default = ddddocr.DdddOcr(show_ad=False)
-print("[OCR Server] ✓ 所有模型加载完成", flush=True)
+# ──────────────────────── 模型加载（带错误处理） ────────────────────────
+MODELS_LOADED = False
+
+def load_models():
+    """加载所有OCR模型，返回是否成功"""
+    global det_beta, det_default, ocr_beta, ocr_default, MODELS_LOADED
+    try:
+        import ddddocr
+    except ImportError:
+        print("[OCR Server] ❌ ddddocr 未安装！请运行: pip install ddddocr", flush=True)
+        return False
+
+    try:
+        from PIL import Image, ImageEnhance, ImageFilter
+    except ImportError:
+        print("[OCR Server] ❌ Pillow 未安装！请运行: pip install Pillow", flush=True)
+        return False
+
+    try:
+        print("[OCR Server] 正在加载检测模型(beta)...", flush=True)
+        det_beta = ddddocr.DdddOcr(det=True, beta=True, show_ad=False)
+        print("[OCR Server] 正在加载检测模型(default)...", flush=True)
+        det_default = ddddocr.DdddOcr(det=True, beta=False, show_ad=False)
+        print("[OCR Server] 正在加载识别模型(beta)...", flush=True)
+        ocr_beta = ddddocr.DdddOcr(beta=True, show_ad=False)
+        print("[OCR Server] 正在加载识别模型(default)...", flush=True)
+        ocr_default = ddddocr.DdddOcr(show_ad=False)
+        print("[OCR Server] ✓ 所有模型加载完成", flush=True)
+        MODELS_LOADED = True
+        return True
+    except Exception as e:
+        print(f"[OCR Server] ❌ 模型加载失败: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return False
+
+# 先不加载模型，等 main 里再加载
 
 
 # ──────────────────────── 图像预处理 ────────────────────────
 def preprocess(img):
+    from PIL import ImageEnhance, ImageFilter
     if img.mode == 'RGBA':
         img = img.convert('RGB')
     enh = ImageEnhance.Contrast(img)
@@ -42,6 +76,7 @@ def preprocess(img):
 
 def preprocess_aggressive(img):
     """更激进的预处理：高对比度+二值化，用于单字识别困难时"""
+    from PIL import ImageEnhance, ImageFilter
     if img.mode == 'RGBA':
         img = img.convert('RGB')
     enh = ImageEnhance.Contrast(img)
@@ -248,6 +283,8 @@ def solve_captcha(img_bytes, expected_chars):
     不再使用全图OCR作为主策略，因为全图OCR对验证码几乎无效。
     全图OCR仅在单字识别部分失败时用于排序辅助。
     """
+    from PIL import Image
+
     n = len(expected_chars)
     expected_set = set(expected_chars)
     debug_lines = []
@@ -366,6 +403,21 @@ def solve_captcha(img_bytes, expected_chars):
 
 # ──────────────────────── HTTP 服务 ────────────────────────
 class OCRHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        """GET /health — 轻量健康检查端点"""
+        if self.path == '/health':
+            resp = json.dumps({
+                "status": "ok" if MODELS_LOADED else "loading",
+                "models_loaded": MODELS_LOADED,
+            })
+            self.send_response(200 if MODELS_LOADED else 503)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(resp.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
     def do_POST(self):
         try:
             length = int(self.headers.get('Content-Length', 0))
@@ -383,6 +435,18 @@ class OCRHandler(BaseHTTPRequestHandler):
                     "debug": "OK"
                 })
                 self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(response.encode())
+                return
+
+            if not MODELS_LOADED:
+                response = json.dumps({
+                    "points": [],
+                    "strategy": "error",
+                    "debug": "Models not loaded yet"
+                })
+                self.send_response(503)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(response.encode())
@@ -418,8 +482,58 @@ class OCRHandler(BaseHTTPRequestHandler):
         pass  # 静默日志
 
 
+def write_ready_file(port):
+    """写入就绪信号文件，通知 Rust 端服务已启动"""
+    ready_path = os.path.join(tempfile.gettempdir(), f"ocr_ready_{port}")
+    try:
+        with open(ready_path, 'w') as f:
+            f.write(str(os.getpid()))
+        print(f"[OCR Server] ✓ 就绪信号文件: {ready_path}", flush=True)
+    except Exception as e:
+        print(f"[OCR Server] ⚠️ 写入就绪文件失败: {e}", flush=True)
+
+
+def cleanup_ready_file(port):
+    """清理就绪信号文件"""
+    ready_path = os.path.join(tempfile.gettempdir(), f"ocr_ready_{port}")
+    try:
+        if os.path.exists(ready_path):
+            os.remove(ready_path)
+    except Exception:
+        pass
+
+
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 19999
-    server = HTTPServer(('127.0.0.1', port), OCRHandler)
+
+    # 1. 先加载模型
+    print(f"[OCR Server] 正在初始化 (port={port})...", flush=True)
+    if not load_models():
+        print("[OCR Server] ❌ 模型加载失败，服务无法启动", flush=True)
+        sys.exit(1)
+
+    # 2. 创建 HTTP 服务器
+    try:
+        server = HTTPServer(('127.0.0.1', port), OCRHandler)
+    except OSError as e:
+        print(f"[OCR Server] ❌ 端口 {port} 绑定失败: {e}", flush=True)
+        sys.exit(1)
+
     print(f"[OCR Server] ✓ 监听端口: {port}", flush=True)
-    server.serve_forever()
+
+    # 3. 写入就绪信号文件（通知 Rust 端服务已就绪）
+    write_ready_file(port)
+
+    # 4. 注册退出清理
+    def on_exit(signum, frame):
+        cleanup_ready_file(port)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, on_exit)
+    signal.signal(signal.SIGINT, on_exit)
+
+    # 5. 开始服务
+    try:
+        server.serve_forever()
+    finally:
+        cleanup_ready_file(port)

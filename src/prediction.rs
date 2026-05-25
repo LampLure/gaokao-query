@@ -7,16 +7,20 @@ use crate::data::{PredictedRecord, PredictedStatus, PredictionProgress, PerfEven
 /// 【锚点网格 + 密集扫射】考号推算算法
 ///
 /// 适用于多学校考号交叉排列的场景：
-///   阶段一（网格探测）：在 [0, anchor] 范围内均匀撒 probe_count 个探针点，
+///   阶段一（网格探测）：在 [scan_low, scan_high] 范围内均匀撒 probe_count 个探针点，
 ///       每个探针点用所有未匹配学生的身份证尝试撞击，记录命中。
 ///   阶段二（密集扫射）：在命中点之间及边界外扩区域逐号扫射，
 ///       每个号码逐个尝试剩余未匹配学生，命中即移出。
+///
+/// 支持双向扫描：锚点可以不是最大值，scan_high 允许超过锚点
 /// ====================================================================
 pub async fn run_prediction(
     pool: Arc<BrowserPool>,
     students: Vec<(String, String)>,    // 全年级所有学生 (name, sfz)
     base_bkh: &str,                      // 考号前缀，如 "2642112615"
     anchor: u64,                         // 锚点后缀，如 1493
+    scan_low: u64,                       // 扫描下限，如 0
+    scan_high: u64,                      // 扫描上限，如 2500（可超过锚点）
     probe_count: u32,                    // 网格探针数量（默认 10）
     concurrency: usize,
     cancel_flag: Arc<Mutex<bool>>,
@@ -32,6 +36,11 @@ pub async fn run_prediction(
     }
 
     let probe_count = probe_count.max(2) as usize;
+
+    // 确保 scan_high >= anchor，scan_low <= scan_high
+    let scan_high = scan_high.max(anchor);
+    let scan_low = scan_low.min(scan_high);
+    let scan_range = scan_high - scan_low;
 
     // 共享状态：活跃（未匹配）学生列表
     let active_students: Arc<Mutex<Vec<(String, String)>>> =
@@ -52,24 +61,32 @@ pub async fn run_prediction(
     {
         let mut l = logs.lock().await;
         l.push(format!(
-            "🚀 [锚点网格] 启动！前缀={}, 锚点={}, 探针数={}, 学生数={}",
-            base_bkh, anchor, probe_count, total_students
+            "🚀 [锚点网格] 启动！前缀={}, 锚点={}, 扫描范围=[{}, {}], 探针数={}, 学生数={}",
+            base_bkh, anchor, scan_low, scan_high, probe_count, total_students
         ));
     }
 
     // =================================================================
     // 阶段一：网格探测（Grid Probe）
     // =================================================================
-    // 生成均匀间隔的探针后缀：anchor, anchor-step, anchor-2*step, ..., 0
-    let step = anchor / (probe_count as u64 - 1).max(1);
-    let probe_suffixes: Vec<u64> = (0..probe_count)
-        .map(|i| anchor.saturating_sub(step * i as u64))
-        .chain(std::iter::once(0u64))  // 确保包含 0
-        .filter(|&v| v <= anchor)
-        .collect::<Vec<_>>();
+    // 在 [scan_low, scan_high] 范围内均匀分布 probe_count 个探针点
+    let step = if probe_count > 1 {
+        scan_range / (probe_count as u64 - 1)
+    } else {
+        0
+    };
+
+    // 生成均匀间隔的探针后缀
+    let mut probe_suffixes: Vec<u64> = (0..probe_count)
+        .map(|i| (scan_low + step * i as u64).min(scan_high))
+        .collect();
+
+    // 确保锚点本身在探针中（锚点是最可靠的参考点）
+    if !probe_suffixes.contains(&anchor) {
+        probe_suffixes.push(anchor);
+    }
 
     // 去重并排序（从大到小）
-    let mut probe_suffixes = probe_suffixes;
     probe_suffixes.sort_unstable_by(|a, b| b.cmp(a));
     probe_suffixes.dedup();
 
@@ -78,9 +95,21 @@ pub async fn run_prediction(
     {
         let mut l = logs.lock().await;
         l.push(format!(
-            "📡 [网格探测] 生成 {} 个探针点，步长={}，范围 [0, {}]",
-            total_probes, step, anchor
+            "📡 [网格探测] 生成 {} 个探针点，步长={}，范围 [{}, {}]",
+            total_probes, step, scan_low, scan_high
         ));
+        // 打印探针点列表（前10个和后5个）
+        let display_probes: Vec<String> = if probe_suffixes.len() <= 15 {
+            probe_suffixes.iter().map(|s| format!("{}{}", base_bkh, s)).collect()
+        } else {
+            let first: Vec<String> = probe_suffixes.iter().take(10).map(|s| format!("{}{}", base_bkh, s)).collect();
+            let last: Vec<String> = probe_suffixes.iter().rev().take(5).rev().map(|s| format!("{}{}", base_bkh, s)).collect();
+            let mut v = first;
+            v.push("...".to_string());
+            v.extend(last);
+            v
+        };
+        l.push(format!("📡 [网格探测] 探针点: {}", display_probes.join(", ")));
     }
 
     // 构建探针任务队列：(probe_suffix, student_name, student_sfz)
@@ -100,6 +129,9 @@ pub async fn run_prediction(
     let hit_points: Arc<Mutex<Vec<(u64, String, String)>>> =
         Arc::new(Mutex::new(Vec::new()));
 
+    // 追踪已完成的探针后缀数（用于进度报告）
+    let probe_suffixes_completed: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+
     let mut probe_handles = Vec::new();
 
     for worker_id in 0..concurrency {
@@ -107,6 +139,7 @@ pub async fn run_prediction(
         let probe_queue = probe_queue.clone();
         let active_students = active_students.clone();
         let hit_points = hit_points.clone();
+        let resolved_records = resolved_records.clone();
         let cancel_flag = cancel_flag.clone();
         let progress = progress.clone();
         let logs = logs.clone();
@@ -114,6 +147,8 @@ pub async fn run_prediction(
         let base_bkh = base_bkh.to_string();
         let captcha_stats = captcha_stats.clone();
         let browser_statuses = browser_statuses.clone();
+        let probe_suffixes_completed = probe_suffixes_completed.clone();
+        let total_probes = total_probes as u64;
 
         probe_handles.push(tokio::spawn(async move {
             loop {
@@ -137,10 +172,11 @@ pub async fn run_prediction(
 
                 // 更新进度
                 {
+                    let completed_suffixes = *probe_suffixes_completed.lock().await;
                     let mut p = progress.lock().await;
                     p.current_batch = format!(
-                        "[网格探测] 探针后缀 {} | 学生 {}",
-                        probe_suffix, name
+                        "[网格探测] 探针 {}/{} | 后缀 {} | 学生 {}",
+                        completed_suffixes, total_probes, probe_suffix, name
                     );
                     p.current_name = name.clone();
                     let full = format!("{}{}", base_bkh, probe_suffix);
@@ -257,7 +293,7 @@ pub async fn run_prediction(
 
         for i in 0..hit_suffixes.len() {
             let low = if i == 0 {
-                hit_suffixes[i].saturating_sub(margin)
+                hit_suffixes[i].saturating_sub(margin).max(scan_low)
             } else {
                 // 两个命中点之间取中点
                 let prev = hit_suffixes[i - 1];
@@ -265,7 +301,7 @@ pub async fn run_prediction(
                 prev + gap / 2
             };
             let high = if i == hit_suffixes.len() - 1 {
-                hit_suffixes[i] + margin
+                (hit_suffixes[i] + margin).min(scan_high)
             } else {
                 let next = hit_suffixes[i + 1];
                 let gap = next - hit_suffixes[i];
@@ -288,16 +324,18 @@ pub async fn run_prediction(
         }
         sweep_ranges = merged;
     } else {
-        // 没有命中点：全范围扫射（太大了，用大步长）
-        // 退回到探测范围的缩小版
-        sweep_ranges.push((anchor.saturating_sub(200), anchor));
+        // 没有命中点：在锚点附近做小范围扫射
+        let estimated_range = (total_students as u64 * 2).min(scan_range);
+        let low = anchor.saturating_sub(estimated_range / 2).max(scan_low);
+        let high = (anchor + estimated_range / 2).min(scan_high);
+        sweep_ranges.push((low, high));
     }
 
     // 生成扫射号池：从大到小遍历
     let mut sweep_numbers: Vec<u64> = Vec::new();
     for (low, high) in &sweep_ranges {
-        let lo = (*low).min(anchor); // 不超过锚点
-        let hi = (*high).min(anchor);
+        let lo = (*low).max(scan_low);
+        let hi = (*high).min(scan_high);
         for n in (lo..=hi).rev() {
             sweep_numbers.push(n);
         }
@@ -381,7 +419,7 @@ pub async fn run_prediction(
                     // 再次检查该学生是否已被其他工人匹配
                     {
                         let active = active_students.lock().await;
-                        if !active.iter().any(|(_, s)| s == &sfz) { continue; }
+                        if !active.iter().any(|(_, s)| s == sfz) { continue; }
                     }
 
                     let (permit, mut client) = pool.acquire().await;
