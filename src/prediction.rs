@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use crate::browser::BrowserPool;
-use crate::data::{PredictedRecord, PredictedStatus, PredictionProgress, PerfEvent};
+use crate::data::{PredictedRecord, PredictedStatus, PredictionProgress, PerfEvent, BrowserStatus, BrowserStep, CaptchaStats};
 
 /// ====================================================================
 /// 【核心算法阶段一】分布式雷达盲推（方案 A：自适应大步长考号广播 + 动态熔断）
@@ -14,6 +14,8 @@ pub async fn run_radar_probes(
     concurrency: usize,
     cancel_flag: Arc<Mutex<bool>>,
     logs: Arc<Mutex<Vec<String>>>,
+    captcha_stats: Arc<Mutex<CaptchaStats>>,
+    browser_statuses: Arc<Mutex<Vec<BrowserStatus>>>,
 ) -> Option<(u64, u32)> { // 如果撞中，返回 (中奖号尾数，探针标签)
 
     // 构建雷达探测任务矩阵：3 个探针号 × 全班 N 个身份证
@@ -39,6 +41,8 @@ pub async fn run_radar_probes(
         let inner_cancel = radar_cancel.clone();
         let global_cancel = cancel_flag.clone();
         let logs = logs.clone();
+        let captcha_stats = captcha_stats.clone();
+        let browser_statuses = browser_statuses.clone();
 
         worker_handles.push(tokio::spawn(async move {
             loop {
@@ -56,11 +60,14 @@ pub async fn run_radar_probes(
                 };
 
                 // 获取空闲浏览器实例
-                let (permit, client) = pool.acquire().await;
-                
+                let (permit, mut client) = pool.acquire().await;
+                client.set_captcha_stats(Some(captcha_stats.clone()));
+                client.set_status(Some(browser_statuses.clone()));
+                client.set_turbo(true);
+
                 // 执行撞击提交
                 let result = client.query_single(&full_bkh, &sfz).await;
-                
+
                 // 雷达探测咬合校验
                 let is_hit = match &result {
                     Ok(query_res) => query_res.name == name,
@@ -78,7 +85,7 @@ pub async fn run_radar_probes(
                     }
                     let mut l = logs.lock().await;
                     l.push(format!("🎯 [雷达命中] 工人#{} 捕获目标！学生：{}, 考号尾数：{}", worker_id, name, probe_bkh));
-                    
+
                     let _ = tx.send((probe_bkh, depth)).await;
                     break;
                 }
@@ -92,7 +99,7 @@ pub async fn run_radar_probes(
     // 强制更改内部状态，确保子线程安全回收
     {
         let mut ic = radar_cancel.lock().await;
-        *ic = true; 
+        *ic = true;
     }
     for h in worker_handles { let _ = h.await; }
 
@@ -112,11 +119,10 @@ pub async fn run_matrix_sweep(
     progress: Arc<Mutex<PredictionProgress>>,
     logs: Arc<Mutex<Vec<String>>>,
     perf_logs: Arc<Mutex<Vec<Vec<PerfEvent>>>>,
+    captcha_stats: Arc<Mutex<CaptchaStats>>,
+    browser_statuses: Arc<Mutex<Vec<BrowserStatus>>>,
 ) -> Vec<PredictedRecord> {
 
-    // 显式指定类型注解，彻底修复 E0282 编译报错
-    let mut final_records: Vec<PredictedRecord> = Vec::new();
-    
     let active_students = Arc::new(Mutex::new(students.clone()));
     let resolved_records = Arc::new(Mutex::new(Vec::new()));
     let bkh_queue = Arc::new(Mutex::new(bkh_pool));
@@ -132,6 +138,8 @@ pub async fn run_matrix_sweep(
         let logs = logs.clone();
         let perf_logs = perf_logs.clone();
         let base_bkh = base_bkh.to_string();
+        let captcha_stats = captcha_stats.clone();
+        let browser_statuses = browser_statuses.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -176,6 +184,8 @@ pub async fn run_matrix_sweep(
                     let record_perf = Arc::new(Mutex::new(Vec::new()));
                     client.set_perf(Some(record_perf.clone()));
                     client.set_turbo(true); // 连续矩阵清洗开启极速 Turbo 模式
+                    client.set_captcha_stats(Some(captcha_stats.clone()));
+                    client.set_status(Some(browser_statuses.clone()));
 
                     let result = client.query_single(&full_exam_number, &sfz).await;
 

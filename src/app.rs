@@ -7,7 +7,7 @@ use crate::config;
 use crate::data::*;
 use crate::matcher;
 use crate::parser;
-use crate::prediction;
+// prediction module is used via crate::prediction:: calls in async tasks
 
 #[derive(Clone, PartialEq)]
 enum QueryState {
@@ -297,7 +297,7 @@ impl eframe::App for GaokaoApp {
                 .resizable(true)
                 .vscroll(true)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().id_source("debug_logs")
+                    egui::ScrollArea::vertical().id_salt("debug_logs")
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
@@ -319,7 +319,7 @@ impl eframe::App for GaokaoApp {
                     if stats.is_empty() {
                         ui.label("暂无性能数据，开始查询后自动记录");
                     } else {
-                        egui::ScrollArea::vertical().id_source("perf_table").show(ui, |ui| {
+                        egui::ScrollArea::vertical().id_salt("perf_table").show(ui, |ui| {
                             egui::Grid::new("perf_grid").striped(true).num_columns(5).show(ui, |ui| {
                                 ui.strong("操作"); ui.strong("次数"); ui.strong("平均(ms)"); ui.strong("最大(ms)"); ui.strong("最小(ms)");
                                 ui.end_row();
@@ -451,8 +451,8 @@ impl GaokaoApp {
                 )).strong());
                 ui.add_space(4.0);
 
-                egui::ScrollArea::vertical().id_source("matched_table").max_height(180.0).show(ui, |ui| {
-                    TableBuilder::new(ui).id_source("matched")
+                egui::ScrollArea::vertical().id_salt("matched_table").max_height(180.0).show(ui, |ui| {
+                    TableBuilder::new(ui).id_salt("matched")
                         .striped(true)
                         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                         .column(Column::auto().resizable(true))
@@ -599,62 +599,134 @@ impl GaokaoApp {
             }
         });
 
+        // 验证码统计面板
+        self.ui_captcha_stats(ui);
+
         // 浏览器实时状态面板
-        if !self.displayed_browser_statuses.is_empty() {
-            ui.push_id("browser_status_panel", |ui| {
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("🖥️ 浏览器实时状态").strong());
-                ui.add_space(4.0);
+        self.ui_browser_status(ui);
+    }
 
-                egui::Grid::new("browser_status_grid")
-                    .striped(true)
-                    .num_columns(4)
-                    .show(ui, |ui| {
-                        ui.strong("实例"); ui.strong("当前步骤"); ui.strong("操作目标"); ui.strong("验证码");
-                        ui.end_row();
-                        for bs in &self.displayed_browser_statuses {
-                            // 实例 ID
-                            ui.label(format!("#{}", bs.id));
+    /// 验证码统计面板（独立方法，两个场景共用）
+    fn ui_captcha_stats(&mut self, ui: &mut egui::Ui) {
+        ui.push_id("captcha_stats_panel", |ui| {
+            if let Ok(cs) = self.captcha_stats.try_lock() {
+                if cs.total_attempts > 0 {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
 
-                            // 当前步骤（带颜色）
-                            let (r, g, b) = bs.step.color();
-                            let color = egui::Color32::from_rgb(r, g, b);
-                            let step_text = match &bs.step {
-                                BrowserStep::Error(e) => format!("❌ {}", e),
-                                _ => bs.step.label().to_string(),
-                            };
-                            ui.label(egui::RichText::new(step_text).color(color).strong());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("🔐 验证码统计").strong());
 
-                            // 操作目标
-                            let target_display = if bs.target.len() > 20 {
-                                format!("{}...", &bs.target[..20])
-                            } else {
-                                bs.target.clone()
-                            };
-                            ui.label(target_display);
+                        let pass_rate = cs.pass_rate();
+                        let first_rate = cs.first_try_rate();
+                        let rate_color = if pass_rate >= 80.0 { egui::Color32::GREEN } else if pass_rate >= 50.0 { egui::Color32::YELLOW } else { egui::Color32::RED };
 
-                            // 验证码状态
-                            if bs.captcha_max > 0 && bs.captcha_attempt > 0 {
-                                let captcha_text = format!("{}/{}", bs.captcha_attempt, bs.captcha_max);
-                                let captcha_color = if bs.captcha_attempt == 1 {
-                                    egui::Color32::GREEN
-                                } else if bs.captcha_attempt <= bs.captcha_max / 2 {
-                                    egui::Color32::YELLOW
-                                } else {
-                                    egui::Color32::RED
-                                };
-                                ui.label(egui::RichText::new(captcha_text).color(captcha_color));
-                            } else {
-                                ui.label("-");
-                            }
+                        ui.label(egui::RichText::new(format!(
+                            "通过 {}/{} ({:.0}%)",
+                            cs.total_passes, cs.total_attempts, pass_rate
+                        )).color(rate_color).strong());
 
-                            ui.end_row();
+                        ui.label("|");
+
+                        let fr_color = if first_rate >= 60.0 { egui::Color32::GREEN } else if first_rate >= 30.0 { egui::Color32::YELLOW } else { egui::Color32::RED };
+                        ui.label(egui::RichText::new(format!(
+                            "一次过 {}/{} ({:.0}%)",
+                            cs.first_try_passes, cs.total_attempts, first_rate
+                        )).color(fr_color));
+
+                        if cs.total_queries > 0 {
+                            ui.label("|");
+                            ui.label(format!("查询: {}", cs.total_queries));
                         }
                     });
-            });
+                }
+            }
+        });
+    }
+
+    /// 浏览器实时状态面板（独立方法，两个场景共用）
+    fn ui_browser_status(&mut self, ui: &mut egui::Ui) {
+        if self.displayed_browser_statuses.is_empty() {
+            return;
         }
+
+        ui.push_id("browser_status_panel", |ui| {
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("🖥️ 浏览器实时状态").strong());
+                // 统计活跃/空闲数
+                let active = self.displayed_browser_statuses.iter()
+                    .filter(|bs| bs.step != BrowserStep::Idle).count();
+                let total = self.displayed_browser_statuses.len();
+                ui.label(format!("({}/{} 活跃)", active, total));
+            });
+            ui.add_space(4.0);
+
+            egui::Grid::new("browser_status_grid")
+                .striped(true)
+                .num_columns(5)
+                .show(ui, |ui| {
+                    ui.strong("实例"); ui.strong("当前步骤"); ui.strong("操作目标"); ui.strong("验证码"); ui.strong("耗时");
+                    ui.end_row();
+                    for bs in &self.displayed_browser_statuses {
+                        // 实例 ID
+                        ui.label(format!("#{}", bs.id + 1));
+
+                        // 当前步骤（带颜色）
+                        let (r, g, b) = bs.step.color();
+                        let color = egui::Color32::from_rgb(r, g, b);
+                        let step_text = match &bs.step {
+                            BrowserStep::Error(e) => format!("❌ {}", e),
+                            _ => bs.step.label().to_string(),
+                        };
+                        ui.label(egui::RichText::new(step_text).color(color).strong());
+
+                        // 操作目标
+                        let target_display = if bs.target.len() > 20 {
+                            format!("{}...", &bs.target[..20])
+                        } else {
+                            bs.target.clone()
+                        };
+                        ui.label(target_display);
+
+                        // 验证码状态
+                        if bs.captcha_max > 0 && bs.captcha_attempt > 0 {
+                            let captcha_text = format!("{}/{}", bs.captcha_attempt, bs.captcha_max);
+                            let captcha_color = if bs.captcha_attempt == 1 {
+                                egui::Color32::GREEN
+                            } else if bs.captcha_attempt <= bs.captcha_max / 2 {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::RED
+                            };
+                            ui.label(egui::RichText::new(captcha_text).color(captcha_color));
+                        } else {
+                            ui.label("-");
+                        }
+
+                        // 耗时
+                        let elapsed_sec = bs.elapsed_ms as f64 / 1000.0;
+                        let elapsed_text = if bs.elapsed_ms < 1000 {
+                            format!("{}ms", bs.elapsed_ms)
+                        } else {
+                            format!("{:.1}s", elapsed_sec)
+                        };
+                        let elapsed_color = if bs.elapsed_ms < 5000 {
+                            egui::Color32::GREEN
+                        } else if bs.elapsed_ms < 15000 {
+                            egui::Color32::YELLOW
+                        } else {
+                            egui::Color32::RED
+                        };
+                        ui.label(egui::RichText::new(elapsed_text).color(elapsed_color));
+
+                        ui.end_row();
+                    }
+                });
+        });
     }
 
     fn ui_results_table(&mut self, ui: &mut egui::Ui) {
@@ -665,8 +737,8 @@ impl GaokaoApp {
             ui.label(egui::RichText::new("📊 查询结果").strong());
             ui.add_space(4.0);
 
-            egui::ScrollArea::vertical().id_source("results_table").max_height(200.0).show(ui, |ui| {
-                TableBuilder::new(ui).id_source("results")
+            egui::ScrollArea::vertical().id_salt("results_table").max_height(200.0).show(ui, |ui| {
+                TableBuilder::new(ui).id_salt("results")
                     .striped(true)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::auto().resizable(true))
@@ -848,7 +920,7 @@ impl GaokaoApp {
                 ui.label("选择班级：");
                 if !self.pred_class_list.is_empty() {
                     let mut selected = self.pred_selected_class;
-                    egui::ComboBox::from_id_source("class_selector")
+                    egui::ComboBox::from_id_salt("class_selector")
                         .selected_text(&self.pred_class_list[selected])
                         .show_ui(ui, |ui| {
                             for (i, cls) in self.pred_class_list.iter().enumerate() {
@@ -928,11 +1000,17 @@ impl GaokaoApp {
                             p.matched, p.not_found, p.current_name
                         ));
                         if !p.current_batch.is_empty() {
-                            ui.label(p.current_batch.clone());
+                            ui.label(egui::RichText::new(&p.current_batch).color(egui::Color32::LIGHT_BLUE));
                         }
                     }
                 }
             });
+
+            // 验证码统计（推算场景也需要看到）
+            self.ui_captcha_stats(ui);
+
+            // 浏览器实时状态（推算场景也需要看到）
+            self.ui_browser_status(ui);
 
             // status
             if !self.status_message.is_empty() {
@@ -954,8 +1032,8 @@ impl GaokaoApp {
                     ui.add_space(4.0);
 
                     // Only redraw when data changes (perf optimization)
-                    egui::ScrollArea::vertical().id_source("pred_results_table").max_height(250.0).show(ui, |ui| {
-                        TableBuilder::new(ui).id_source("pred_results")
+                    egui::ScrollArea::vertical().id_salt("pred_results_table").max_height(250.0).show(ui, |ui| {
+                        TableBuilder::new(ui).id_salt("pred_results")
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .column(Column::auto().resizable(true))
@@ -1095,6 +1173,12 @@ impl GaokaoApp {
                 }).collect();
             }
 
+            // 重置验证码统计
+            {
+                let mut cs = captcha_stats.lock().await;
+                *cs = CaptchaStats::default();
+            }
+
             let perf_logs = perf_logs.clone();
             let captcha_stats = captcha_stats.clone();
             let browser_statuses = browser_statuses.clone();
@@ -1171,11 +1255,10 @@ impl GaokaoApp {
 
                         pool.release(permit, client);
 
-                        // Track captcha stats
+                        // Track total queries (captcha attempts already tracked inside solve_captcha_modal)
                         {
                             let mut cs = captcha_stats.lock().await;
-                            cs.0 += 1;
-                            if result.is_ok() { cs.1 += 1; }
+                            cs.total_queries += 1;
                         }
 
                         match result {
@@ -1256,7 +1339,7 @@ impl GaokaoApp {
 // 报考号推算 逻辑
 // ============================================================
 impl GaokaoApp {
-    fn start_prediction(&mut self, ctx: &egui::Context) {
+    fn start_prediction(&mut self, _ctx: &egui::Context) {
         if self.pred_boundary == 0 {
             self.status_message = "未知报考号表格为空，无法自动化定位雷达启动锚点".to_string();
             return;
@@ -1282,6 +1365,8 @@ impl GaokaoApp {
         let pred_progress = self.pred_progress.clone();
         let delay_ms = self.delay_ms as u64;
         let continuous = self.pred_continuous;
+        let captcha_stats = self.captcha_stats.clone();
+        let browser_statuses = self.browser_statuses.clone();
         
         let all_sfz_records = self.pred_sfz_records.clone();
         let class_list = self.pred_class_list.clone();
@@ -1302,6 +1387,25 @@ impl GaokaoApp {
                     return;
                 }
             };
+
+            // 初始化浏览器状态追踪（推算场景）
+            {
+                let mut statuses = browser_statuses.lock().await;
+                *statuses = (0..concurrency).map(|i| BrowserStatus {
+                    id: i as u64,
+                    step: BrowserStep::Idle,
+                    target: String::new(),
+                    captcha_attempt: 0,
+                    captcha_max: 0,
+                    elapsed_ms: 0,
+                }).collect();
+            }
+
+            // 重置验证码统计
+            {
+                let mut cs = captcha_stats.lock().await;
+                *cs = CaptchaStats::default();
+            }
 
             // 自动化多米诺连推级联循环
             loop {
@@ -1372,13 +1476,6 @@ impl GaokaoApp {
                     
                     let next_radar_base = current_radar_base.saturating_sub(radar_step * 3);
 
-                    // 所有探针都为0说明已经到底，无意义继续
-                    if probe_1 == 0 && probe_2 == 0 && probe_3 == 0 {
-                        let mut l = logs.lock().await;
-                        l.push(format!("[中断] 雷达探针全部归零，考号空间已耗尽"));
-                        break;
-                    }
-
                     let probes = vec![(probe_1, 1), (probe_2, 2), (probe_3, 3)];
 
                     {
@@ -1393,7 +1490,9 @@ impl GaokaoApp {
                         probes,
                         concurrency,
                         cancel.clone(),
-                        logs.clone()
+                        logs.clone(),
+                        captcha_stats.clone(),
+                        browser_statuses.clone(),
                     ).await {
                         base_hit_bkh = Some(hit_bkh);
                         let mut l = logs.lock().await;
@@ -1427,14 +1526,16 @@ impl GaokaoApp {
 
                     let class_results = crate::prediction::run_matrix_sweep(
                         pool.clone(),
-                        &mut students, 
+                        &mut students,
                         &base_bkh,
                         bkh_pool,
                         concurrency,
                         cancel.clone(),
                         pred_progress.clone(),
                         logs.clone(),
-                        perf_logs.clone()
+                        perf_logs.clone(),
+                        captcha_stats.clone(),
+                        browser_statuses.clone(),
                     ).await;
 
                     let mut r_lock = pred_results.lock().await;

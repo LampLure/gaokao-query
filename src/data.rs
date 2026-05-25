@@ -217,7 +217,7 @@ impl BrowserStep {
             BrowserStep::CaptchaFailed => "❌ 验证码失败",
             BrowserStep::ReadingResult => "📋 读取结果",
             BrowserStep::GoingHome => "🏠 回首页",
-            BrowserStep::Error(e) => "❌ 出错",
+            BrowserStep::Error(_e) => "❌ 出错",
         }
     }
 

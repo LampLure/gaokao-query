@@ -727,7 +727,7 @@ impl BrowserPool {
         let this = self.clone();
         tokio::spawn(async move {
             // 修复 Bug 4: go_home 失败时进行补救
-            if let Err(e) = client.go_home().await {
+            if let Err(_e) = client.go_home().await {
                 // go_home 失败，用 JS 强制刷新页面作为补救
                 let page = client.page.lock().await;
                 let _ = page.evaluate_expression(
