@@ -36,10 +36,10 @@ pub struct GaokaoApp {
     pred_sfz_records: Vec<ShenFenZhengRecord>,
     pred_known_bkh: Vec<BaoKaoHaoRecord>,
     pred_year_filter: f64,
-    pred_boundary_str: String,       // 锚点考号输入框（完整14位如 26421126151462）
-    pred_boundary: u64,              // 锚点完整考号数值（14位数字）
-    pred_scan_high_str: String,      // 扫描上限考号输入框
-    pred_scan_high: u64,             // 扫描上限完整考号数值
+    pred_start_str: String,          // 开始考号输入框（完整14位如 26421126151462）
+    pred_start_bkh: u64,             // 开始考号完整数值（14位数字）
+    pred_end_str: String,            // 结束考号输入框（完整14位如 26421126151500）
+    pred_end_bkh: u64,               // 结束考号完整数值（14位数字）
     pred_search_margin: u32,         // 网格探针数量
     pred_results: Arc<Mutex<Vec<PredictedRecord>>>,
     pred_displayed_results: Vec<PredictedRecord>,
@@ -100,10 +100,10 @@ impl GaokaoApp {
             pred_sfz_records: Vec::new(),
             pred_known_bkh: Vec::new(),
             pred_year_filter: 2023.0,
-            pred_boundary_str: cfg.pred_boundary.clone(),
-            pred_boundary: cfg.pred_boundary.parse().unwrap_or(0),
-            pred_scan_high_str: cfg.pred_scan_high.clone(),
-            pred_scan_high: cfg.pred_scan_high.parse().unwrap_or(0),
+            pred_start_str: cfg.pred_start_bkh.clone(),
+            pred_start_bkh: cfg.pred_start_bkh.parse().unwrap_or(0),
+            pred_end_str: cfg.pred_end_bkh.clone(),
+            pred_end_bkh: cfg.pred_end_bkh.parse().unwrap_or(0),
             pred_search_margin: 10,
             pred_results: Arc::new(Mutex::new(Vec::new())),
             pred_displayed_results: Vec::new(),
@@ -158,8 +158,8 @@ impl GaokaoApp {
         self.config.sfz_path = self.sfz_path.as_ref().cloned().unwrap_or_default();
         self.config.pred_sfz_path = self.pred_sfz_path.as_ref().cloned().unwrap_or_default();
         self.config.pred_bkh_path = self.pred_bkh_path.as_ref().cloned().unwrap_or_default();
-        self.config.pred_boundary = self.pred_boundary_str.clone();
-        self.config.pred_scan_high = self.pred_scan_high_str.clone();
+        self.config.pred_start_bkh = self.pred_start_str.clone();
+        self.config.pred_end_bkh = self.pred_end_str.clone();
         self.config.target_url = self.target_url.clone();
         self.config.concurrency = self.concurrency;
         self.config.delay_ms = self.delay_ms;
@@ -839,41 +839,28 @@ impl GaokaoApp {
                             let count = records.len();
                             self.pred_known_bkh = records;
                             
-                            // 自动计算锚点：寻找最大串号群的第一个号
+                            // 自动计算扫描范围：从已知考号的最小值-余量 到 最大值+余量
                             if !self.pred_known_bkh.is_empty() {
-                                // 直接用完整14位考号数值进行排序和分组
                                 let mut sorted_bkh: Vec<u64> = self.pred_known_bkh.iter()
                                     .filter_map(|r| r.baominghao.parse::<u64>().ok())
                                     .filter(|&v| v > 0)
                                     .collect();
                                 sorted_bkh.sort();
 
-                                // 寻找最大串号群 (相邻间隔 <= 10)
-                                let mut max_group = Vec::new();
-                                let mut current_group = Vec::new();
-                                
-                                for i in 0..sorted_bkh.len() {
-                                    if i == 0 {
-                                        current_group.push(sorted_bkh[i]);
-                                    } else {
-                                        if sorted_bkh[i] - sorted_bkh[i-1] <= 10 {
-                                            current_group.push(sorted_bkh[i]);
-                                        } else {
-                                            if current_group.len() > max_group.len() {
-                                                max_group = current_group.clone();
-                                            }
-                                            current_group = vec![sorted_bkh[i]];
-                                        }
-                                    }
-                                }
-                                if current_group.len() > max_group.len() {
-                                    max_group = current_group;
-                                }
-
-                                if let Some(&first_bkh) = max_group.first() {
-                                    self.pred_boundary = first_bkh;
-                                    self.pred_boundary_str = first_bkh.to_string();
-                                    self.log(format!("【算法启动】成功识别最大串号群（共{}人），锁定锚点考号 {} 为雷达启动点", max_group.len(), first_bkh));
+                                if let (Some(&min_bkh), Some(&max_bkh)) = (sorted_bkh.first(), sorted_bkh.last()) {
+                                    let count = sorted_bkh.len() as u64;
+                                    // 开始考号 = 最小号 - 人数（往前留余量）
+                                    let auto_start = min_bkh.saturating_sub(count);
+                                    // 结束考号 = 最大号 + 人数/2（往后留少量余量）
+                                    let auto_end = max_bkh + count / 2;
+                                    self.pred_start_bkh = auto_start;
+                                    self.pred_start_str = auto_start.to_string();
+                                    self.pred_end_bkh = auto_end;
+                                    self.pred_end_str = auto_end.to_string();
+                                    self.log(format!(
+                                        "自动设置扫描范围: {} ~ {} (已知{}条, 范围跨{}个号)",
+                                        auto_start, auto_end, count, auto_end - auto_start
+                                    ));
                                 }
                             }
                             
@@ -929,56 +916,49 @@ impl GaokaoApp {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("已知考号：");
+                ui.label("开始考号：");
                 let response = ui.add_sized(
                     [180.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.pred_boundary_str).hint_text("如 26421126151462"),
+                    egui::TextEdit::singleline(&mut self.pred_start_str).hint_text("如 26421126151400"),
                 );
                 if response.changed() {
-                    self.pred_boundary = Self::parse_bkh_number(&self.pred_boundary_str);
+                    self.pred_start_bkh = Self::parse_bkh_number(&self.pred_start_str);
                     self.config_dirty = true;
                 }
-                if self.pred_boundary > 0 {
+                if self.pred_start_bkh > 0 {
                     ui.label(egui::RichText::new(format!(
-                        "已锁定：{}",
-                        self.pred_boundary
+                        "已设置：{}", self.pred_start_bkh
                     )).color(egui::Color32::LIGHT_BLUE));
                 } else {
-                    ui.label(egui::RichText::new("请输入已知的考号").color(egui::Color32::YELLOW));
+                    ui.label(egui::RichText::new("请输入开始考号").color(egui::Color32::YELLOW));
                 }
             });
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("扫描上限考号：");
+                ui.label("结束考号：");
                 let response = ui.add_sized(
                     [180.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.pred_scan_high_str).hint_text("留空=自动"),
+                    egui::TextEdit::singleline(&mut self.pred_end_str).hint_text("如 26421126151500"),
                 );
                 if response.changed() {
-                    self.pred_scan_high = Self::parse_bkh_number(&self.pred_scan_high_str);
+                    self.pred_end_bkh = Self::parse_bkh_number(&self.pred_end_str);
                     self.config_dirty = true;
                 }
-                if self.pred_boundary > 0 {
-                    let year_count = self.count_students_for_year(self.pred_year_filter as u32);
-                    let n = year_count as u64;
-                    if self.pred_scan_high > 0 {
-                        // 用户指定了扫描上限
-                        ui.label(egui::RichText::new(format!(
-                            "自定义范围：{} ~ {}",
-                            self.pred_scan_high.saturating_sub(n * 2), self.pred_scan_high
-                        )).color(egui::Color32::LIGHT_BLUE));
-                    } else {
-                        // 自动计算范围：以锚点为中心
-                        let auto_low = self.pred_boundary.saturating_sub(n * 2);
-                        let auto_high = self.pred_boundary + n;
-                        ui.label(egui::RichText::new(format!(
-                            "自动范围：{} ~ {} (约{}人)",
-                            auto_low, auto_high, year_count
-                        )).color(egui::Color32::LIGHT_BLUE));
-                    }
+                if self.pred_end_bkh > 0 {
+                    ui.label(egui::RichText::new(format!(
+                        "已设置：{}", self.pred_end_bkh
+                    )).color(egui::Color32::LIGHT_BLUE));
                 } else {
-                    ui.label(egui::RichText::new("请先输入已知考号").color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("请输入结束考号").color(egui::Color32::YELLOW));
+                }
+                if self.pred_start_bkh > 0 && self.pred_end_bkh > 0 && self.pred_end_bkh > self.pred_start_bkh {
+                    ui.label(egui::RichText::new(format!(
+                        "扫描范围：{} ~ {} (共{}个号)",
+                        self.pred_start_bkh, self.pred_end_bkh, self.pred_end_bkh - self.pred_start_bkh
+                    )).color(egui::Color32::GREEN));
+                } else if self.pred_start_bkh > 0 && self.pred_end_bkh > 0 && self.pred_end_bkh <= self.pred_start_bkh {
+                    ui.label(egui::RichText::new("结束考号必须大于开始考号").color(egui::Color32::RED));
                 }
             });
 
@@ -1014,13 +994,13 @@ impl GaokaoApp {
             // start / stop buttons
             ui.horizontal(|ui| {
                 if self.pred_state == QueryState::Idle {
-                    let can_start = self.pred_boundary > 0;
+                    let can_start = self.pred_start_bkh > 0 && self.pred_end_bkh > 0 && self.pred_end_bkh > self.pred_start_bkh;
                     if can_start {
                         if ui.button(egui::RichText::new("▶ 开始推算").heading().color(egui::Color32::WHITE)).clicked() {
                             self.start_prediction(ctx);
                         }
                     } else {
-                        let _ = ui.button(egui::RichText::new("▶ 请先输入锚点").heading().color(egui::Color32::GRAY));
+                        let _ = ui.button(egui::RichText::new("▶ 请设定开始/结束考号").heading().color(egui::Color32::GRAY));
                     }
                 }
                 if self.pred_state == QueryState::Running {
@@ -1386,8 +1366,8 @@ impl GaokaoApp {
 // ============================================================
 impl GaokaoApp {
     fn start_prediction(&mut self, _ctx: &egui::Context) {
-        if self.pred_boundary == 0 {
-            self.status_message = "未知报考号表格为空，无法自动化定位雷达启动锚点".to_string();
+        if self.pred_start_bkh == 0 || self.pred_end_bkh == 0 || self.pred_end_bkh <= self.pred_start_bkh {
+            self.status_message = "请设定有效的开始考号和结束考号（结束 > 开始）".to_string();
             return;
         }
 
@@ -1414,9 +1394,8 @@ impl GaokaoApp {
         // 全年级所有学生
         let all_sfz_records = self.pred_sfz_records.clone();
         let target_year = self.pred_year_filter as u32;
-        let anchor = self.pred_boundary;     // 完整14位考号数字
-        let student_count = self.count_students_for_year(target_year) as u64;
-        let user_scan_high = self.pred_scan_high;
+        let scan_low = self.pred_start_bkh;   // 开始考号（完整14位数字）
+        let scan_high = self.pred_end_bkh;     // 结束考号（完整14位数字）
         let probe_count = self.pred_search_margin.max(3);
 
         tokio::spawn(async move {
@@ -1467,35 +1446,15 @@ impl GaokaoApp {
                 return;
             }
 
-            // 计算扫描范围：以锚点为中心，往前为主
-            // 锚点是完整14位考号数字（如 26421126151462）
-            // 扫描范围 = [锚点 - N*2, 锚点 + N]
-            // 往前多扫（其他学校可能插在前面），往后少扫
-            let n = student_count.max(students.len() as u64);
-            let scan_low = if user_scan_high > 0 {
-                // 用户指定了扫描上限，从锚点往前扫到用户上限-N*2
-                user_scan_high.saturating_sub(n * 2)
-            } else {
-                // 自动模式：从锚点往前推
-                anchor.saturating_sub(n * 2)
-            };
-            let scan_high = if user_scan_high > 0 {
-                user_scan_high
-            } else {
-                // 自动模式：锚点 + N
-                anchor + n
-            };
-
             let mut l = logs.lock().await;
             l.push(format!("=================================================="));
-            l.push(format!("[🔥锚点网格] 启动推算！入学年份={} | 全年级总人数：{}人 | 锚点={} | 扫描范围=[{},{}]", target_year, students.len(), anchor, scan_low, scan_high));
+            l.push(format!("[考号推算] 启动！入学年份={} | 学生数={} | 扫描范围=[{},{}] (共{}个号)", target_year, students.len(), scan_low, scan_high, scan_high - scan_low));
             drop(l);
 
-            // 调用锚点网格 + 密集扫射算法（使用完整数字）
+            // 调用推算算法（使用完整数字范围）
             let results = crate::prediction::run_prediction(
                 pool,
                 students,
-                anchor,
                 scan_low,
                 scan_high,
                 probe_count,
