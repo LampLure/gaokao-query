@@ -36,10 +36,10 @@ pub struct GaokaoApp {
     pred_sfz_records: Vec<ShenFenZhengRecord>,
     pred_known_bkh: Vec<BaoKaoHaoRecord>,
     pred_year_filter: f64,
-    pred_boundary_str: String,       // 锚点后缀输入框（如 1493）
-    pred_boundary: u64,              // 锚点后缀数值
-    pred_scan_high_str: String,      // 扫描上限输入框（如 2500）
-    pred_scan_high: u64,             // 扫描上限数值
+    pred_boundary_str: String,       // 锚点考号输入框（完整14位如 26421126151462）
+    pred_boundary: u64,              // 锚点完整考号数值（14位数字）
+    pred_scan_high_str: String,      // 扫描上限考号输入框
+    pred_scan_high: u64,             // 扫描上限完整考号数值
     pred_search_margin: u32,         // 网格探针数量
     pred_results: Arc<Mutex<Vec<PredictedRecord>>>,
     pred_displayed_results: Vec<PredictedRecord>,
@@ -180,32 +180,15 @@ impl GaokaoApp {
             .count()
     }
 
-    /// 考号前缀（10位），完整考号为14位：前缀(10) + 后缀(4)
-    const BKH_PREFIX: &'static str = "2642112615";
-
-    /// 从用户输入或报考号中提取后缀数字
-    /// 支持两种输入格式：
-    ///   - 完整14位考号如 "26421126151488" → 提取后缀 1488
-    ///   - 仅后缀如 "1488" → 直接解析为 1488
-    fn extract_bkh_suffix(input: &str) -> u64 {
+    /// 从用户输入中解析考号数值
+    /// 直接解析为 u64 数字，用于后续 ±偏移运算
+    /// 例如："26421126151462" → 26421126151462
+    fn parse_bkh_number(input: &str) -> u64 {
         let trimmed = input.trim();
         if trimmed.is_empty() {
             return 0;
         }
-        // 如果以已知前缀开头，提取前缀之后的部分作为后缀
-        if trimmed.starts_with(Self::BKH_PREFIX) {
-            let suffix_str = &trimmed[Self::BKH_PREFIX.len()..];
-            return suffix_str.parse::<u64>().unwrap_or(0);
-        }
-        // 否则直接当作后缀解析
         trimmed.parse::<u64>().unwrap_or(0)
-    }
-
-    /// 用后缀数字生成完整考号
-    /// 考号是连续编号，后缀直接拼接（不补零）
-    /// 例如：suffix=1488 → "26421126151488"，suffix=0 → "26421126150"
-    fn make_full_bkh(suffix: u64) -> String {
-        format!("{}{}", Self::BKH_PREFIX, suffix)
     }
 }
 
@@ -858,8 +841,10 @@ impl GaokaoApp {
                             
                             // 自动计算锚点：寻找最大串号群的第一个号
                             if !self.pred_known_bkh.is_empty() {
+                                // 直接用完整14位考号数值进行排序和分组
                                 let mut sorted_bkh: Vec<u64> = self.pred_known_bkh.iter()
-                                    .filter_map(|r| Some(Self::extract_bkh_suffix(&r.baominghao)).filter(|&v| v > 0))
+                                    .filter_map(|r| r.baominghao.parse::<u64>().ok())
+                                    .filter(|&v| v > 0)
                                     .collect();
                                 sorted_bkh.sort();
 
@@ -887,8 +872,8 @@ impl GaokaoApp {
 
                                 if let Some(&first_bkh) = max_group.first() {
                                     self.pred_boundary = first_bkh;
-                                    self.pred_boundary_str = Self::make_full_bkh(first_bkh);
-                                    self.log(format!("【算法启动】成功识别最大串号群（共{}人），锁定锚点考号 {} 为雷达启动点", max_group.len(), Self::make_full_bkh(first_bkh)));
+                                    self.pred_boundary_str = first_bkh.to_string();
+                                    self.log(format!("【算法启动】成功识别最大串号群（共{}人），锁定锚点考号 {} 为雷达启动点", max_group.len(), first_bkh));
                                 }
                             }
                             
@@ -947,16 +932,16 @@ impl GaokaoApp {
                 ui.label("已知考号：");
                 let response = ui.add_sized(
                     [180.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.pred_boundary_str).hint_text("如 26421126151488 或 1488"),
+                    egui::TextEdit::singleline(&mut self.pred_boundary_str).hint_text("如 26421126151462"),
                 );
                 if response.changed() {
-                    self.pred_boundary = Self::extract_bkh_suffix(&self.pred_boundary_str);
+                    self.pred_boundary = Self::parse_bkh_number(&self.pred_boundary_str);
                     self.config_dirty = true;
                 }
                 if self.pred_boundary > 0 {
                     ui.label(egui::RichText::new(format!(
-                        "完整考号：{}",
-                        Self::make_full_bkh(self.pred_boundary)
+                        "已锁定：{}",
+                        self.pred_boundary
                     )).color(egui::Color32::LIGHT_BLUE));
                 } else {
                     ui.label(egui::RichText::new("请输入已知的考号").color(egui::Color32::YELLOW));
@@ -971,7 +956,7 @@ impl GaokaoApp {
                     egui::TextEdit::singleline(&mut self.pred_scan_high_str).hint_text("留空=自动"),
                 );
                 if response.changed() {
-                    self.pred_scan_high = Self::extract_bkh_suffix(&self.pred_scan_high_str);
+                    self.pred_scan_high = Self::parse_bkh_number(&self.pred_scan_high_str);
                     self.config_dirty = true;
                 }
                 if self.pred_boundary > 0 {
@@ -981,15 +966,15 @@ impl GaokaoApp {
                         // 用户指定了扫描上限
                         ui.label(egui::RichText::new(format!(
                             "自定义范围：{} ~ {}",
-                            Self::make_full_bkh(0), Self::make_full_bkh(self.pred_scan_high)
+                            self.pred_scan_high.saturating_sub(n * 2), self.pred_scan_high
                         )).color(egui::Color32::LIGHT_BLUE));
                     } else {
-                        // 自动计算范围
+                        // 自动计算范围：以锚点为中心
                         let auto_low = self.pred_boundary.saturating_sub(n * 2);
-                        let auto_high = self.pred_boundary + (n / 2);
+                        let auto_high = self.pred_boundary + n;
                         ui.label(egui::RichText::new(format!(
                             "自动范围：{} ~ {} (约{}人)",
-                            Self::make_full_bkh(auto_low), Self::make_full_bkh(auto_high), year_count
+                            auto_low, auto_high, year_count
                         )).color(egui::Color32::LIGHT_BLUE));
                     }
                 } else {
@@ -1411,7 +1396,6 @@ impl GaokaoApp {
         self.pred_displayed_results.clear();
         *self.cancel_flag.try_lock().unwrap() = false;
 
-        let base_bkh = Self::BKH_PREFIX.to_string();
         let concurrency = self.concurrency as usize;
         let hide_browser = self.hide_browser;
         let step_delay = self.step_delay_ms as u64;
@@ -1427,10 +1411,10 @@ impl GaokaoApp {
         let captcha_stats = self.captcha_stats.clone();
         let browser_statuses = self.browser_statuses.clone();
 
-        // 新算法：取全年级所有学生（而非单班级）
+        // 全年级所有学生
         let all_sfz_records = self.pred_sfz_records.clone();
         let target_year = self.pred_year_filter as u32;
-        let anchor = self.pred_boundary;
+        let anchor = self.pred_boundary;     // 完整14位考号数字
         let student_count = self.count_students_for_year(target_year) as u64;
         let user_scan_high = self.pred_scan_high;
         let probe_count = self.pred_search_margin.max(3);
@@ -1484,13 +1468,13 @@ impl GaokaoApp {
             }
 
             // 计算扫描范围：以锚点为中心，往前为主
-            // 锚点是已知考号后缀（如1488），学校约N人
-            // 扫描范围 = [锚点 - N*2, 锚点 + N/2]
+            // 锚点是完整14位考号数字（如 26421126151462）
+            // 扫描范围 = [锚点 - N*2, 锚点 + N]
             // 往前多扫（其他学校可能插在前面），往后少扫
             let n = student_count.max(students.len() as u64);
             let scan_low = if user_scan_high > 0 {
-                // 用户指定了扫描上限，scan_low 仍设为0（用户自定义行为）
-                0
+                // 用户指定了扫描上限，从锚点往前扫到用户上限-N*2
+                user_scan_high.saturating_sub(n * 2)
             } else {
                 // 自动模式：从锚点往前推
                 anchor.saturating_sub(n * 2)
@@ -1498,8 +1482,8 @@ impl GaokaoApp {
             let scan_high = if user_scan_high > 0 {
                 user_scan_high
             } else {
-                // 自动模式：锚点 + N/2
-                anchor + (n / 2)
+                // 自动模式：锚点 + N
+                anchor + n
             };
 
             let mut l = logs.lock().await;
@@ -1507,11 +1491,10 @@ impl GaokaoApp {
             l.push(format!("[🔥锚点网格] 启动推算！入学年份={} | 全年级总人数：{}人 | 锚点={} | 扫描范围=[{},{}]", target_year, students.len(), anchor, scan_low, scan_high));
             drop(l);
 
-            // 调用新的锚点网格 + 密集扫射算法
+            // 调用锚点网格 + 密集扫射算法（使用完整数字）
             let results = crate::prediction::run_prediction(
                 pool,
                 students,
-                &base_bkh,
                 anchor,
                 scan_low,
                 scan_high,
