@@ -147,6 +147,16 @@ impl BrowserClient {
         }
     }
 
+    fn update_name(&self, name: String) {
+        if let Some(st) = &self.status {
+            if let Ok(mut statuses) = st.try_lock() {
+                if let Some(s) = statuses.iter_mut().find(|s| s.id == self.instance_id) {
+                    s.name = name;
+                }
+            }
+        }
+    }
+
     fn update_captcha_attempt(&self, attempt: u32, max: u32) {
         if let Some(st) = &self.status {
             if let Ok(mut statuses) = st.try_lock() {
@@ -368,10 +378,12 @@ impl BrowserClient {
         &self,
         baominghao: &str,
         shenfenzheng: &str,
+        name: &str,
     ) -> Result<QueryResult, String> {
         self.perf_event("开始查询");
         self.update_step(BrowserStep::CheckingPage);
-        self.update_target(format!("{}", baominghao));
+        self.update_name(name.to_string());
+        self.update_target(baominghao.to_string());
         let page = self.page.lock().await;
 
         // 检查页面是否处于表单状态（只有form状态才能填写和提交）
@@ -404,6 +416,7 @@ impl BrowserClient {
             )
         }
 
+        self.update_step(BrowserStep::FillingForm);
         let fill_result: String = page.evaluate_expression(js_fill("zkzh", baominghao))
             .await.map_err(|e| format!("填报名号失败: {}", e))?
             .into_value().map_err(|_| "填报名号返回值解析失败".to_string())?;
@@ -977,6 +990,7 @@ impl BrowserPool {
                     if let Some(s) = statuses.iter_mut().find(|s| s.id == client.instance_id) {
                         s.step = BrowserStep::Idle;
                         s.target = String::new();
+                        s.name = String::new();
                         s.captcha_attempt = 0;
                         s.captcha_max = 0;
                         s.elapsed_ms = 0;

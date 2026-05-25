@@ -120,7 +120,7 @@ async fn check_ocr_health(port: u16) -> bool {
         .timeout(Duration::from_millis(800))
         .send().await
     {
-        Ok(_) => true,
+        Ok(resp) => resp.status().is_success(),
         Err(_) => false,
     }
 }

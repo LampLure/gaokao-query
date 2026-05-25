@@ -234,7 +234,7 @@ impl eframe::App for GaokaoApp {
             }
         }
         if let Ok(bs) = self.browser_statuses.try_lock() {
-            if bs.len() != self.displayed_browser_statuses.len() || bs.iter().zip(self.displayed_browser_statuses.iter()).any(|(a, b)| a.step != b.step || a.target != b.target || a.captcha_attempt != b.captcha_attempt) {
+            if bs.len() != self.displayed_browser_statuses.len() || bs.iter().zip(self.displayed_browser_statuses.iter()).any(|(a, b)| a.step != b.step || a.target != b.target || a.name != b.name || a.captcha_attempt != b.captcha_attempt) {
                 self.displayed_browser_statuses = bs.clone();
             }
         }
@@ -667,13 +667,31 @@ impl GaokaoApp {
 
             egui::Grid::new("browser_status_grid")
                 .striped(true)
-                .num_columns(5)
+                .num_columns(6)
                 .show(ui, |ui| {
-                    ui.strong("实例"); ui.strong("当前步骤"); ui.strong("操作目标"); ui.strong("验证码"); ui.strong("耗时");
+                    ui.strong("实例"); ui.strong("姓名"); ui.strong("报名号"); ui.strong("当前步骤"); ui.strong("验证码"); ui.strong("耗时");
                     ui.end_row();
                     for bs in &self.displayed_browser_statuses {
                         // 实例 ID
                         ui.label(format!("#{}", bs.id + 1));
+
+                        // 姓名
+                        let name_color = if bs.name.is_empty() {
+                            egui::Color32::GRAY
+                        } else {
+                            egui::Color32::WHITE
+                        };
+                        ui.label(egui::RichText::new(if bs.name.is_empty() { "-" } else { &bs.name }).color(name_color).strong());
+
+                        // 报名号
+                        let target_display = if bs.target.len() > 16 {
+                            format!("{}...", &bs.target[..16])
+                        } else if bs.target.is_empty() {
+                            "-".to_string()
+                        } else {
+                            bs.target.clone()
+                        };
+                        ui.label(target_display);
 
                         // 当前步骤（带颜色）
                         let (r, g, b) = bs.step.color();
@@ -683,14 +701,6 @@ impl GaokaoApp {
                             _ => bs.step.label().to_string(),
                         };
                         ui.label(egui::RichText::new(step_text).color(color).strong());
-
-                        // 操作目标
-                        let target_display = if bs.target.len() > 20 {
-                            format!("{}...", &bs.target[..20])
-                        } else {
-                            bs.target.clone()
-                        };
-                        ui.label(target_display);
 
                         // 验证码状态
                         if bs.captcha_max > 0 && bs.captcha_attempt > 0 {
@@ -1167,6 +1177,7 @@ impl GaokaoApp {
                     id: i as u64,
                     step: BrowserStep::Idle,
                     target: String::new(),
+                    name: String::new(),
                     captcha_attempt: 0,
                     captcha_max: 0,
                     elapsed_ms: 0,
@@ -1243,7 +1254,7 @@ impl GaokaoApp {
                             let _ = client.go_home().await;
                         }
 
-                        let result = client.query_single(&record.baominghao, sfz).await;
+                        let result = client.query_single(&record.baominghao, sfz, &record.name).await;
 
                         // Collect perf data
                         if let Ok(perf_data) = record_perf.try_lock() {
@@ -1395,6 +1406,7 @@ impl GaokaoApp {
                     id: i as u64,
                     step: BrowserStep::Idle,
                     target: String::new(),
+                    name: String::new(),
                     captcha_attempt: 0,
                     captcha_max: 0,
                     elapsed_ms: 0,

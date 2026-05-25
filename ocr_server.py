@@ -283,7 +283,7 @@ def solve_captcha(img_bytes, expected_chars):
         fallback = [(round((i + 0.5) / n, 4), 0.5) for i in range(n)]
         debug_lines.append(f"框不足{n}个，均分兜底")
         debug_lines.append("--- OCR Completed (fallback) ---")
-        return fallback, "fallback_split"
+        return fallback, "fallback_split", "\n".join(debug_lines)
 
     # ── 步骤 2：单字识别（一招鲜！直接主策略） ──
     char_to_pos = {}        # 映射成功的字 → 坐标
@@ -311,7 +311,7 @@ def solve_captcha(img_bytes, expected_chars):
         for i, ch in enumerate(expected_chars):
             debug_lines.append(f"  → 第{i+1}次点击 [{ch}] ({char_to_pos[ch][0]:.4f}, {char_to_pos[ch][1]:.4f})")
         debug_lines.append("--- OCR Completed ---")
-        return result, "single_char"
+        return result, "single_char", "\n".join(debug_lines)
 
     # ── 步骤 4：处理未识别的字（修复坐标重复bug！） ──
     # 关键修复：对未识别的字，使用未被占用的框坐标，而不是顺序递增的fb_idx
@@ -374,6 +374,19 @@ class OCRHandler(BaseHTTPRequestHandler):
 
             img_b64 = data.get('image', '')
             expected_chars = data.get('expected_chars', [])
+
+            # 健康检查：空图片直接返回200
+            if not img_b64:
+                response = json.dumps({
+                    "points": [],
+                    "strategy": "health_check",
+                    "debug": "OK"
+                })
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(response.encode())
+                return
 
             img_bytes = base64.b64decode(img_b64)
             points, strategy, debug_text = solve_captcha(img_bytes, expected_chars)

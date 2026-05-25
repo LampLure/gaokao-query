@@ -177,7 +177,8 @@ impl CaptchaStats {
 pub struct BrowserStatus {
     pub id: u64,                    // 浏览器实例 ID
     pub step: BrowserStep,          // 当前步骤
-    pub target: String,             // 当前操作目标（如"张三 26421126154321"）
+    pub target: String,             // 当前操作目标（报名号）
+    pub name: String,               // 当前查询人姓名
     pub captcha_attempt: u32,       // 当前验证码第几次尝试
     pub captcha_max: u32,           // 验证码最大尝试次数
     pub elapsed_ms: u64,            // 当前步骤已耗时(ms)

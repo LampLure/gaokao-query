@@ -66,7 +66,7 @@ pub async fn run_radar_probes(
                 client.set_turbo(true);
 
                 // 执行撞击提交
-                let result = client.query_single(&full_bkh, &sfz).await;
+                let result = client.query_single(&full_bkh, &sfz, &name).await;
 
                 // 雷达探测咬合校验
                 let is_hit = match &result {
@@ -187,7 +187,7 @@ pub async fn run_matrix_sweep(
                     client.set_captcha_stats(Some(captcha_stats.clone()));
                     client.set_status(Some(browser_statuses.clone()));
 
-                    let result = client.query_single(&full_exam_number, &sfz).await;
+                    let result = client.query_single(&full_exam_number, &sfz, &name).await;
 
                     if let Ok(perf_data) = record_perf.try_lock() {
                         if !perf_data.is_empty() {
