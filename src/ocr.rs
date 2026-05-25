@@ -31,8 +31,20 @@ static STARTED_PORTS: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
 static HEALTH_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// HTTP 服务已确认失败的端口（本次运行不再重试，避免反复打印错误日志）
+static FAILED_PORTS: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
 /// 自动启动 OCR HTTP 服务（如果未运行）
 async fn ensure_ocr_server(port: u16) {
+    // 检查是否已确认失败（本次运行不再重试）
+    {
+        let failed = FAILED_PORTS.lock().unwrap();
+        if failed.contains(&port) {
+            return;
+        }
+    }
+
     // 检查是否已启动过
     {
         let started = STARTED_PORTS.lock().unwrap();
@@ -59,6 +71,10 @@ async fn ensure_ocr_server(port: u16) {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ocr_server.py");
     if !script.exists() {
         eprintln!("[OCR] ocr_server.py 不存在，跳过自动启动");
+        let mut failed = FAILED_PORTS.lock().unwrap();
+        if !failed.contains(&port) {
+            failed.push(port);
+        }
         return;
     }
 
@@ -73,8 +89,8 @@ async fn ensure_ocr_server(port: u16) {
     match child {
         Ok(_) => {
             eprintln!("[OCR] 已启动 ocr_server.py (port {})，等待服务就绪...", port);
-            // 等待服务启动完成（最多30秒，模型加载需要时间）
-            for _ in 0..60 {
+            // 等待服务启动完成（最多45秒，4个模型加载需要时间）
+            for _ in 0..90 {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 if check_ocr_health(port).await {
                     eprintln!("[OCR] HTTP服务已就绪 (port {})", port);
@@ -90,9 +106,18 @@ async fn ensure_ocr_server(port: u16) {
                 }
             }
             eprintln!("[OCR] HTTP服务启动超时 (port {})，将降级到子进程模式", port);
+            // 标记为失败，本次运行不再重试
+            let mut failed = FAILED_PORTS.lock().unwrap();
+            if !failed.contains(&port) {
+                failed.push(port);
+            }
         }
         Err(e) => {
             eprintln!("[OCR] 启动 ocr_server.py 失败: {}，将降级到子进程模式", e);
+            let mut failed = FAILED_PORTS.lock().unwrap();
+            if !failed.contains(&port) {
+                failed.push(port);
+            }
         }
     }
 }
@@ -138,40 +163,62 @@ pub async fn solve_captcha(
 ) -> Result<OcrResult, String> {
     let port = ocr_port(instance_id);
 
-    // 检查健康缓存，如果已知服务可用则直接用
-    let use_http = {
-        let cache = HEALTH_CACHE.lock().unwrap();
-        cache.contains(&port)
+    // 检查是否已确认失败（本次运行不再尝试HTTP）
+    let skip_http = {
+        let failed = FAILED_PORTS.lock().unwrap();
+        failed.contains(&port)
     };
 
-    if !use_http {
-        // 尝试启动或确认服务可用
-        ensure_ocr_server(port).await;
-    }
+    if !skip_http {
+        // 检查健康缓存，如果已知服务可用则直接用
+        let use_http = {
+            let cache = HEALTH_CACHE.lock().unwrap();
+            cache.contains(&port)
+        };
 
-    // 读取图片并 base64 编码
-    let img_bytes = std::fs::read(image_path)
-        .map_err(|e| format!("读取验证码图片失败: {}", e))?;
-    use base64::Engine;
-    let img_b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
-
-    // 尝试 HTTP 常驻服务
-    match try_http_ocr(&img_b64, expected_chars, port).await {
-        Ok(result) => {
-            // 成功，确保端口在健康缓存中
-            let mut cache = HEALTH_CACHE.lock().unwrap();
-            if !cache.contains(&port) {
-                cache.push(port);
-            }
-            return Ok(result);
+        if !use_http {
+            // 尝试启动或确认服务可用
+            ensure_ocr_server(port).await;
         }
-        Err(e) => {
-            // HTTP 服务不可用，从健康缓存中移除
-            {
-                let mut cache = HEALTH_CACHE.lock().unwrap();
-                cache.retain(|&p| p != port);
+
+        // 再次检查（启动后可能已就绪）
+        let use_http = {
+            let cache = HEALTH_CACHE.lock().unwrap();
+            cache.contains(&port)
+        };
+
+        if use_http {
+            // 读取图片并 base64 编码
+            let img_bytes = std::fs::read(image_path)
+                .map_err(|e| format!("读取验证码图片失败: {}", e))?;
+            use base64::Engine;
+            let img_b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+
+            // 尝试 HTTP 常驻服务
+            match try_http_ocr(&img_b64, expected_chars, port).await {
+                Ok(result) => {
+                    // 成功，确保端口在健康缓存中
+                    let mut cache = HEALTH_CACHE.lock().unwrap();
+                    if !cache.contains(&port) {
+                        cache.push(port);
+                    }
+                    return Ok(result);
+                }
+                Err(e) => {
+                    // HTTP 服务不可用，从健康缓存中移除，加入失败列表
+                    {
+                        let mut cache = HEALTH_CACHE.lock().unwrap();
+                        cache.retain(|&p| p != port);
+                    }
+                    {
+                        let mut failed = FAILED_PORTS.lock().unwrap();
+                        if !failed.contains(&port) {
+                            failed.push(port);
+                        }
+                    }
+                    eprintln!("[OCR] HTTP服务不可用(port {}): {}，降级到子进程模式", port, e);
+                }
             }
-            eprintln!("[OCR] HTTP服务不可用(port {}): {}，降级到子进程模式", port, e);
         }
     }
 
