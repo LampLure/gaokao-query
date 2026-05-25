@@ -201,11 +201,11 @@ impl GaokaoApp {
         trimmed.parse::<u64>().unwrap_or(0)
     }
 
-    /// 用后缀数字生成完整14位考号
-    /// 后缀补零到4位：前缀(10位) + 后缀(4位) = 完整考号(14位)
-    /// 例如：suffix=1488 → "26421126151488"，suffix=0 → "26421126150000"
+    /// 用后缀数字生成完整考号
+    /// 考号是连续编号，后缀直接拼接（不补零）
+    /// 例如：suffix=1488 → "26421126151488"，suffix=0 → "26421126150"
     fn make_full_bkh(suffix: u64) -> String {
-        format!("{}{:04}", Self::BKH_PREFIX, suffix)
+        format!("{}{}", Self::BKH_PREFIX, suffix)
     }
 }
 
@@ -968,25 +968,32 @@ impl GaokaoApp {
                 ui.label("扫描上限考号：");
                 let response = ui.add_sized(
                     [180.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.pred_scan_high_str).hint_text("留空=锚点"),
+                    egui::TextEdit::singleline(&mut self.pred_scan_high_str).hint_text("留空=自动"),
                 );
                 if response.changed() {
                     self.pred_scan_high = Self::extract_bkh_suffix(&self.pred_scan_high_str);
                     self.config_dirty = true;
                 }
-                let effective_high = if self.pred_scan_high > 0 { self.pred_scan_high } else { self.pred_boundary };
-                if self.pred_boundary > 0 && effective_high > 0 {
+                if self.pred_boundary > 0 {
                     let year_count = self.count_students_for_year(self.pred_year_filter as u32);
-                    ui.label(egui::RichText::new(format!(
-                        "扫描范围：{} ~ {} (约{}人)",
-                        Self::make_full_bkh(0), Self::make_full_bkh(effective_high), year_count
-                    )).color(egui::Color32::LIGHT_BLUE));
-                    ui.label(egui::RichText::new(format!(
-                        "(后缀 0 ~ {})",
-                        effective_high
-                    )).color(egui::Color32::GRAY));
+                    let n = year_count as u64;
+                    if self.pred_scan_high > 0 {
+                        // 用户指定了扫描上限
+                        ui.label(egui::RichText::new(format!(
+                            "自定义范围：{} ~ {}",
+                            Self::make_full_bkh(0), Self::make_full_bkh(self.pred_scan_high)
+                        )).color(egui::Color32::LIGHT_BLUE));
+                    } else {
+                        // 自动计算范围
+                        let auto_low = self.pred_boundary.saturating_sub(n * 2);
+                        let auto_high = self.pred_boundary + (n / 2);
+                        ui.label(egui::RichText::new(format!(
+                            "自动范围：{} ~ {} (约{}人)",
+                            Self::make_full_bkh(auto_low), Self::make_full_bkh(auto_high), year_count
+                        )).color(egui::Color32::LIGHT_BLUE));
+                    }
                 } else {
-                    ui.label(egui::RichText::new("超过锚点的考号范围").color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("请先输入已知考号").color(egui::Color32::GRAY));
                 }
             });
 
@@ -1424,7 +1431,8 @@ impl GaokaoApp {
         let all_sfz_records = self.pred_sfz_records.clone();
         let target_year = self.pred_year_filter as u32;
         let anchor = self.pred_boundary;
-        let scan_high = if self.pred_scan_high > 0 { self.pred_scan_high } else { anchor };
+        let student_count = self.count_students_for_year(target_year) as u64;
+        let user_scan_high = self.pred_scan_high;
         let probe_count = self.pred_search_margin.max(3);
 
         tokio::spawn(async move {
@@ -1475,9 +1483,28 @@ impl GaokaoApp {
                 return;
             }
 
+            // 计算扫描范围：以锚点为中心，往前为主
+            // 锚点是已知考号后缀（如1488），学校约N人
+            // 扫描范围 = [锚点 - N*2, 锚点 + N/2]
+            // 往前多扫（其他学校可能插在前面），往后少扫
+            let n = student_count.max(students.len() as u64);
+            let scan_low = if user_scan_high > 0 {
+                // 用户指定了扫描上限，scan_low 仍设为0（用户自定义行为）
+                0
+            } else {
+                // 自动模式：从锚点往前推
+                anchor.saturating_sub(n * 2)
+            };
+            let scan_high = if user_scan_high > 0 {
+                user_scan_high
+            } else {
+                // 自动模式：锚点 + N/2
+                anchor + (n / 2)
+            };
+
             let mut l = logs.lock().await;
             l.push(format!("=================================================="));
-            l.push(format!("[🔥锚点网格] 启动推算！入学年份={} | 全年级总人数：{}人 | 锚点={} | 扫描范围=[0,{}]", target_year, students.len(), anchor, scan_high));
+            l.push(format!("[🔥锚点网格] 启动推算！入学年份={} | 全年级总人数：{}人 | 锚点={} | 扫描范围=[{},{}]", target_year, students.len(), anchor, scan_low, scan_high));
             drop(l);
 
             // 调用新的锚点网格 + 密集扫射算法
@@ -1486,8 +1513,8 @@ impl GaokaoApp {
                 students,
                 &base_bkh,
                 anchor,
-                0,          // scan_low: 从0开始
-                scan_high,  // scan_high: 可超过锚点
+                scan_low,
+                scan_high,
                 probe_count,
                 concurrency,
                 cancel,
