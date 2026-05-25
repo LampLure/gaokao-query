@@ -11,6 +11,16 @@ use futures_util::StreamExt;
 use crate::data::{QueryResult, QueryStatus, BrowserStatus, BrowserStep, CaptchaStats};
 use crate::ocr;
 
+/// 提交表单后的页面响应状态
+enum SubmitResult {
+    /// 验证码弹窗出现，需要先解决验证码
+    CaptchaNeeded,
+    /// 直接进入结果页面（无需验证码或验证码已通过后的结果）
+    ResultReady,
+    /// 等待超时
+    Timeout,
+}
+
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct BrowserClient {
@@ -29,6 +39,38 @@ pub struct BrowserClient {
     captcha_stats: Option<Arc<Mutex<CaptchaStats>>>,
 }
 
+/// 检测页面当前状态的综合JS表达式
+/// 返回值:
+///   "form"       - 表单可用（初始状态）
+///   "captcha"    - 验证码弹窗可见
+///   "result_ok"  - 查询成功结果（resultContainer可见且有姓名数据）
+///   "result_err" - 查询无数据结果（resultContainer可见但无姓名，如"未查询到数据"）
+///   "alert"      - 错误弹窗可见
+///   "unknown"    - 无法识别
+const JS_PAGE_STATE: &str = r#"(function() {
+    // 1. 检查错误弹窗（最高优先级）
+    const alertModal = document.getElementById('alertModal');
+    if (alertModal && !alertModal.classList.contains('hidden')) return 'alert';
+    // 2. 检查验证码弹窗
+    const captchaModal = document.getElementById('captchaModal');
+    if (captchaModal && !captchaModal.classList.contains('hidden')) return 'captcha';
+    // 3. 检查结果容器是否可见（resultContainer没有hidden类 = 结果正在展示）
+    const resultContainer = document.getElementById('resultContainer');
+    if (resultContainer && !resultContainer.classList.contains('hidden')) {
+        // 结果容器可见，检查是否有成功数据
+        const nameEl = document.querySelector('[data-value="xm"]');
+        if (nameEl && nameEl.textContent.trim().length > 0) return 'result_ok';
+        return 'result_err';
+    }
+    // 4. 检查表单是否可用
+    const form = document.getElementById('zkzh');
+    if (form && !form.disabled) return 'form';
+    // 5. 表单存在但被禁用（结果页面中表单被禁用），resultContainer可能被JS隐藏了
+    //    这种情况也视为结果页面
+    if (form && form.disabled) return 'result_err';
+    return 'unknown';
+})()"#;
+
 impl BrowserClient {
     /// Poll until JS expression returns true, or timeout.
     /// turbo mode: 30ms interval, normal: 150ms.
@@ -43,6 +85,23 @@ impl BrowserClient {
             self.sleep_critical(interval).await;
         }
         false
+    }
+
+    /// Poll until page reaches a result state (captcha, result_ok, result_err, alert) or timeout
+    async fn poll_submit_result(&self, page: &Page, max_ms: u64) -> SubmitResult {
+        let interval = if self.turbo { 30u64 } else { 150u64 };
+        let attempts = (max_ms / interval).max(5);
+        for _ in 0..attempts {
+            let state: String = page.evaluate_expression(JS_PAGE_STATE)
+                .await.map(|r| r.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
+            match state.as_str() {
+                "captcha" => return SubmitResult::CaptchaNeeded,
+                "result_ok" | "result_err" | "alert" => return SubmitResult::ResultReady,
+                _ => {} // "form" or "unknown" - still waiting
+            }
+            self.sleep_critical(interval).await;
+        }
+        SubmitResult::Timeout
     }
 
     pub fn set_perf(&mut self, perf: Option<Arc<Mutex<Vec<crate::data::PerfEvent>>>>) {
@@ -245,60 +304,48 @@ impl BrowserClient {
         self.update_step(BrowserStep::GoingHome);
         let page = self.page.lock().await;
 
-        // 优先用 JS 重置表单（0.1-0.3秒），比完整页面导航快 10-50 倍
-        let reset_ok: bool = page.evaluate_expression(
-            r#"(function() {
-                const form = document.getElementById('zkzh');
-                if (!form) return false;
+        // 检测当前页面状态
+        let page_state: String = page.evaluate_expression(JS_PAGE_STATE)
+            .await.map(|r| r.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
 
-                // 检查是否处于结果展示页面：如果结果区域可见，JS重置无法恢复表单视图
-                const resultEl = document.querySelector('[data-value="xm"]');
-                if (resultEl && resultEl.textContent.trim().length > 0) {
-                    const rect = resultEl.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) {
-                        // 结果区域可见，JS重置不可靠，需要完整导航
-                        return false;
-                    }
-                }
-
-                // 第一步：关闭所有弹窗（alert、captcha）
-                const alertBtn = document.getElementById('alertOkButton');
-                if (alertBtn) alertBtn.click();
-                ['captchaModal', 'alertModal'].forEach(id => {
-                    const m = document.getElementById(id);
-                    if (m) m.classList.add('hidden');
-                });
-                // 第二步：清除验证码弹窗中的残留选中状态
-                const captchaModal = document.getElementById('captchaModal');
-                if (captchaModal) {
-                    captchaModal.querySelectorAll('.selected, .clicked, .active').forEach(el => {
-                        el.classList.remove('selected', 'clicked', 'active');
+        // 只有在 "form" 状态下才能用 JS 重置表单（0.1-0.3秒）
+        // 其他状态（result_ok, result_err, captcha）都需要完整导航
+        if page_state == "form" {
+            let reset_ok: bool = page.evaluate_expression(
+                r#"(function() {
+                    // 关闭所有弹窗
+                    const alertBtn = document.getElementById('alertOkButton');
+                    if (alertBtn) alertBtn.click();
+                    ['captchaModal', 'alertModal'].forEach(id => {
+                        const m = document.getElementById(id);
+                        if (m) m.classList.add('hidden');
                     });
-                }
-                // 第三步：重置所有输入框
-                document.querySelectorAll('input[type="text"]').forEach(el => {
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(el, '');
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                });
+                    // 清除验证码弹窗中的残留选中状态
+                    const captchaModal = document.getElementById('captchaModal');
+                    if (captchaModal) {
+                        captchaModal.querySelectorAll('.selected, .clicked, .active').forEach(el => {
+                            el.classList.remove('selected', 'clicked', 'active');
+                        });
+                    }
+                    // 重置所有输入框
+                    document.querySelectorAll('input[type="text"]').forEach(el => {
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(el, '');
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    });
+                    return true;
+                })()"#
+            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
-                // 第四步：验证表单确实可见可用（不仅仅存在于DOM中）
-                const formRect = form.getBoundingClientRect();
-                if (formRect.width === 0 && formRect.height === 0) {
-                    return false;
-                }
-                return true;
-            })()"#
-        ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
-
-        if reset_ok {
-            self.perf_event("JS重置表单");
-            return Ok(());
+            if reset_ok {
+                self.perf_event("JS重置表单");
+                return Ok(());
+            }
         }
 
-        // JS 重置失败（结果页面或表单不可见），走完整导航
-        self.log_msg("JS重置不可用，执行完整页面导航");
+        // 非 form 状态（结果页面、验证码页面等），走完整导航
+        self.log_msg(&format!("页面状态为[{}]，执行完整页面导航", page_state));
         page.goto(&self.target_url)
             .await
             .map_err(|e| format!("导航回首页失败: {}", e))?;
@@ -307,7 +354,7 @@ impl BrowserClient {
             r#"(function() {
                 const el = document.getElementById('zkzh');
                 return el !== null;
-            })()"#, 8000).await;  // 原10s减到8s
+            })()"#, 8000).await;
 
         if !loaded {
             return Err("导航回首页超时：表单元素未加载".to_string());
@@ -327,25 +374,13 @@ impl BrowserClient {
         self.update_target(format!("{}", baominghao));
         let page = self.page.lock().await;
 
-        // 检查页面是否就绪（表单元素是否存在且可见，而非仅存在于DOM中）
-        let form_ready: bool = page.evaluate_expression(
-            r#"(function() {
-                const zkzh = document.getElementById('zkzh');
-                const sfzh = document.getElementById('sfzh');
-                if (!zkzh || !sfzh) return false;
-                // 额外检查：如果结果区域可见，说明页面处于结果视图，表单不可用
-                const resultEl = document.querySelector('[data-value="xm"]');
-                if (resultEl && resultEl.textContent.trim().length > 0) {
-                    const rect = resultEl.getBoundingClientRect();
-                    if (rect.width > 0 && rect.height > 0) return false;
-                }
-                return true;
-            })()"#
-        ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+        // 检查页面是否处于表单状态（只有form状态才能填写和提交）
+        let page_state: String = page.evaluate_expression(JS_PAGE_STATE)
+            .await.map(|r| r.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
 
-        if !form_ready {
-            // 表单不可用（可能处于结果页面），尝试完整导航回首页
-            self.log_msg("表单不可用，导航回首页...");
+        if page_state != "form" {
+            // 非表单状态（结果页面、验证码页面等），导航回首页
+            self.log_msg(&format!("页面状态为[{}]，导航回首页...", page_state));
             page.goto(&self.target_url)
                 .await
                 .map_err(|e| format!("导航回首页失败: {}", e))?;
@@ -383,7 +418,7 @@ impl BrowserClient {
             return Err("身份证输入框未找到(sfzh)，页面可能未正确加载".to_string());
         }
 
-        self.sleep_step(0.3).await;  // 原0.5步减到0.3步
+        self.sleep_step(0.3).await;
         self.perf_event("填写信息完成");
         self.update_step(BrowserStep::Submitting);
 
@@ -399,64 +434,106 @@ impl BrowserClient {
             return Err("提交按钮未找到，页面可能未正确加载".to_string());
         }
 
-        // Poll for captcha modal or result (8s timeout, 原来15s太长)
-        self.perf_event("等待验证码");
+        // 提交后轮询：等待验证码弹窗 或 查询结果页面
+        self.perf_event("等待验证码或结果");
         self.update_step(BrowserStep::WaitingCaptcha);
-        let captcha_visible = self.poll_true(&page,
-            r#"(function() {
-                const m = document.getElementById('captchaModal');
-                return m ? !m.classList.contains('hidden') : false;
-            })()"#, 8000).await;
-        if captcha_visible {
-            self.perf_event("验证码弹窗出现");
-            if let Err(e) = self.solve_captcha_modal(&page).await {
+        let submit_result = self.poll_submit_result(&page, 15000).await;
+
+        match submit_result {
+            SubmitResult::CaptchaNeeded => {
+                // 验证码弹窗出现，进入验证码流程
+                self.perf_event("验证码弹窗出现");
+                if let Err(e) = self.solve_captcha_modal(&page).await {
+                    self.perf_event("总耗时");
+                    self.update_step(BrowserStep::Error(e.clone()));
+                    return Err(format!("验证码处理失败: {}", e));
+                }
+                // 验证码通过后，等待查询结果加载
+                self.update_step(BrowserStep::ReadingResult);
+                self.perf_event("等待查询结果");
+                // 轮询直到页面离开captcha状态
+                let result_ready = self.poll_submit_result(&page, 8000).await;
+                match result_ready {
+                    SubmitResult::ResultReady => {
+                        self.perf_event("查询结果已加载");
+                    }
+                    SubmitResult::CaptchaNeeded => {
+                        // 验证码又弹出来了（可能验证码验证失败后又弹出新验证码）
+                        self.log_msg("验证码通过后又出现验证码，尝试再次处理");
+                        if let Err(e) = self.solve_captcha_modal(&page).await {
+                            self.perf_event("总耗时");
+                            self.update_step(BrowserStep::Error(e.clone()));
+                            return Err(format!("二次验证码处理失败: {}", e));
+                        }
+                        // 再等结果
+                        let retry_result = self.poll_submit_result(&page, 8000).await;
+                        if let SubmitResult::Timeout = retry_result {
+                            self.perf_event("总耗时");
+                            return Err("二次验证码后等待结果超时".to_string());
+                        }
+                    }
+                    SubmitResult::Timeout => {
+                        self.perf_event("总耗时");
+                        return Err("验证码通过后等待结果超时".to_string());
+                    }
+                }
+            }
+            SubmitResult::ResultReady => {
+                // 直接跳到结果页面（无验证码或无需验证码）
+                self.update_step(BrowserStep::ReadingResult);
+                self.perf_event("直接进入结果页面");
+            }
+            SubmitResult::Timeout => {
                 self.perf_event("总耗时");
-                self.update_step(BrowserStep::Error(e.clone()));
-                return Err(format!("验证码处理失败: {}", e));
+                return Err("提交后等待响应超时".to_string());
             }
         }
 
-        // 等待查询结果加载（验证码通过后结果需要时间渲染）
-        self.update_step(BrowserStep::ReadingResult);
-        self.perf_event("等待查询结果");
-        let result_ready = self.poll_true(&page,
-            r#"(function() {
-                const el = document.querySelector('[data-value="xm"]');
-                if (el && el.textContent.trim().length > 0) return true;
-                const m = document.getElementById('alertModal');
-                if (m && !m.classList.contains('hidden')) return true;
-                return false;
-            })()"#, 5000).await;
+        // 读取结果：统一处理所有结果状态
+        let final_state: String = page.evaluate_expression(JS_PAGE_STATE)
+            .await.map(|r| r.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
 
-        if !result_ready {
-            self.perf_event("总耗时");
-            return Err("查询结果加载超时".to_string());
-        }
+        match final_state.as_str() {
+            "alert" => {
+                let err_msg: String = page.evaluate_expression(
+                    r#"(function() {
+                        const el = document.getElementById('alertMessage');
+                        return el ? el.textContent || '' : '';
+                    })()"#
+                ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-        let has_error: bool = page.evaluate_expression(
-            r#"(function() {
-                const m = document.getElementById('alertModal');
-                return m ? !m.classList.contains('hidden') : false;
-            })()"#
-        ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+                let _ = page.evaluate_expression(
+                    r#"(function() {
+                        const btn = document.getElementById('alertOkButton');
+                        if (btn) btn.click();
+                    })()"#
+                ).await;
 
-        if has_error {
-            let err_msg: String = page.evaluate_expression(
-                r#"(function() {
-                    const el = document.getElementById('alertMessage');
-                    return el ? el.textContent || '' : '';
-                })()"#
-            ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
+                self.perf_event("总耗时");
+                return Err(err_msg);
+            }
+            "result_err" => {
+                // "未查询到数据"结果页面，提取页面提示信息
+                let no_data_msg: String = page.evaluate_expression(
+                    r#"(function() {
+                        // resultContainer可见但没有姓名数据，说明是"未查询到数据"
+                        const allText = document.body.innerText || '';
+                        if (allText.includes('未查询到数据')) return '未查询到数据，请检查输入信息是否正确';
+                        if (allText.includes('未找到')) return '未找到查询结果';
+                        return '未查询到数据';
+                    })()"#
+                ).await.map(|r| r.into_value().unwrap_or_default()).unwrap_or_default();
 
-            let _ = page.evaluate_expression(
-                r#"(function() {
-                    const btn = document.getElementById('alertOkButton');
-                    if (btn) btn.click();
-                })()"#
-            ).await;
-
-            self.perf_event("总耗时");
-            return Err(err_msg);
+                self.perf_event("总耗时");
+                return Err(no_data_msg);
+            }
+            "result_ok" => {
+                // 成功结果，继续读取数据
+            }
+            _ => {
+                self.perf_event("总耗时");
+                return Err(format!("无法识别页面状态: {}", final_state));
+            }
         }
 
         let name: String = page.evaluate_expression(
@@ -469,7 +546,7 @@ impl BrowserClient {
 
         if name.is_empty() {
             self.perf_event("总耗时");
-            return Err("未找到查询结果".to_string());
+            return Err("未找到查询结果（姓名为空）".to_string());
         }
         self.perf_event("获取查询结果");
 
@@ -695,32 +772,32 @@ impl BrowserClient {
             let _ = page.evaluate_expression(&clicks_js).await;
             self.sleep_critical(300).await;
 
-            // ── 修复问题1：快速检测验证码结果（同时检测alert弹窗和captchaModal消失） ──
+            // ── 快速检测验证码结果（同时检测alert弹窗、captchaModal消失、以及页面进入结果状态） ──
             self.perf_event("验证码点击完成");
             self.update_step(BrowserStep::WaitingCaptchaResult);
-            let max_polls = 15; // 最多约1.5秒（大幅缩短）
+            let max_polls = 15; // 最多约1.5秒
             let mut captcha_passed = false;
             let mut alert_found = false;
             for i in 0..max_polls {
-                // 同时检查：captchaModal是否消失（通过）或 alertModal是否出现（失败）
-                let check_result: String = page.evaluate_expression(
-                    r#"(function() {
-                        const m = document.getElementById('captchaModal');
-                        const a = document.getElementById('alertModal');
-                        const modal_visible = m ? !m.classList.contains('hidden') : false;
-                        const alert_visible = a ? !a.classList.contains('hidden') : false;
-                        if (!modal_visible) return 'passed';
-                        if (alert_visible) return 'alert';
-                        return 'waiting';
-                    })()"#
-                ).await.map(|v| v.into_value().unwrap_or("waiting".to_string())).unwrap_or("waiting".to_string());
-
-                if check_result == "passed" {
-                    captcha_passed = true;
-                    break;
-                } else if check_result == "alert" {
-                    alert_found = true;
-                    break;
+                let state: String = page.evaluate_expression(JS_PAGE_STATE)
+                    .await.map(|v| v.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
+                match state.as_str() {
+                    "captcha" => {
+                        // 验证码弹窗还在，继续等待
+                    }
+                    "alert" => {
+                        // 错误弹窗出现
+                        alert_found = true;
+                        break;
+                    }
+                    "result_ok" | "result_err" | "form" => {
+                        // 验证码弹窗已消失，页面进入了结果或表单状态
+                        captcha_passed = true;
+                        break;
+                    }
+                    _ => {
+                        // unknown状态，可能验证码刚消失，继续等
+                    }
                 }
                 // 前几轮快速轮询，后面稍慢
                 self.sleep_critical(if i < 3 { 50 } else { 120 }).await;
@@ -741,11 +818,11 @@ impl BrowserClient {
                 return Ok(());
             }
 
-            // ── 修复问题1+3：快速关闭alert弹窗，彻底清理页面状态 ──
+            // ── 快速关闭alert弹窗，彻底清理页面状态 ──
             self.log_msg("验证码验证失败，快速关闭弹窗");
             self.update_step(BrowserStep::DismissingAlert);
 
-            // 立即关闭alert弹窗（不再犹豫！）
+            // 立即关闭alert弹窗
             let dismiss_result: String = page.evaluate_expression(
                 r#"(function() {
                     // 第一步：立即关闭 alert 弹窗
@@ -754,7 +831,6 @@ impl BrowserClient {
                     // 第二步：彻底清理页面状态，重置 captchaModal 中的已选状态
                     const captchaModal = document.getElementById('captchaModal');
                     if (captchaModal) {
-                        // 清除所有已点击的样式（如果有 selected 类）
                         captchaModal.querySelectorAll('.selected, .clicked, .active').forEach(el => {
                             el.classList.remove('selected', 'clicked', 'active');
                         });
@@ -771,13 +847,11 @@ impl BrowserClient {
             // 短暂等待让网站完成自动刷新验证码
             self.sleep_critical(400).await;
 
-            // 检查网站是否自动刷新了验证码（alert关闭后网站通常会自动刷新）
+            // 检查网站是否自动刷新了验证码
             let auto_refreshed: bool = page.evaluate_expression(
                 r#"(function() {
-                    // 检查验证码图片是否已经更新（有src且可用）
                     const img = document.getElementById('captchaImage');
                     if (img && img.complete && img.naturalWidth > 0) return true;
-                    // 检查刷新按钮是否存在且可用
                     const btn = document.getElementById('refreshCaptcha');
                     return btn !== null;
                 })()"#
@@ -785,7 +859,7 @@ impl BrowserClient {
 
             captcha_auto_refreshed = auto_refreshed;
 
-            // ── 修复问题3：确保captchaModal仍然可见且可用 ──
+            // 确保captchaModal仍然可见且可用
             let modal_ok: bool = page.evaluate_expression(
                 r#"(function() {
                     const m = document.getElementById('captchaModal');
@@ -795,7 +869,25 @@ impl BrowserClient {
             ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
             if !modal_ok {
-                // captchaModal 消失了或不可用，需要等待它重新出现
+                // captchaModal 消失了或不可用，检查页面状态
+                let state: String = page.evaluate_expression(JS_PAGE_STATE)
+                    .await.map(|r| r.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
+                if state != "captcha" {
+                    // 页面已经不在验证码状态了，可能已经进入了结果页面
+                    self.log_msg(&format!("验证码弹窗已消失，页面状态: {}", state));
+                    // 如果已经是结果状态，说明验证码实际上通过了
+                    if state == "result_ok" || state == "result_err" {
+                        self.log_msg("验证码实际已通过，页面已进入结果状态");
+                        if let Some(cs) = &self.captcha_stats {
+                            if let Ok(mut stats) = cs.try_lock() {
+                                stats.total_passes += 1;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    return Err("验证码弹窗状态异常，无法恢复".to_string());
+                }
+                // 仍然是captcha状态但modal不可用，等待恢复
                 self.log_msg("验证码弹窗状态异常，等待恢复...");
                 let recovered = self.poll_true(&page,
                     r#"(function() {
@@ -870,32 +962,14 @@ impl BrowserPool {
     pub fn release(self: &Arc<Self>, permit: OwnedSemaphorePermit, client: BrowserClient) {
         let this = self.clone();
         tokio::spawn(async move {
-            // go_home 已优化：优先用 JS 重置表单（~100ms），失败才完整导航
-            // 只有 JS 重置也失败时才做完整重载补救
             if let Err(_e) = client.go_home().await {
-                // go_home 失败，用 JS 强制刷新页面作为补救
+                // go_home 失败，完整刷新页面作为补救
                 let page = client.page.lock().await;
                 let _ = page.evaluate_expression(
                     r#"window.location.reload()"#
                 ).await;
                 drop(page);
-                // 只短暂等待页面加载，不再二次 go_home（避免阻塞浏览器池太久）
                 tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                let page = client.page.lock().await;
-                let _ = page.evaluate_expression(
-                    r#"(function() {
-                        // 再次尝试 JS 重置
-                        document.querySelectorAll('input[type="text"]').forEach(el => {
-                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                            setter.call(el, '');
-                            el.dispatchEvent(new Event('input', {bubbles: true}));
-                        });
-                        ['captchaModal', 'alertModal'].forEach(id => {
-                            const m = document.getElementById(id);
-                            if (m) m.classList.add('hidden');
-                        });
-                    })()"#
-                ).await;
             }
             // 重置状态为空闲
             if let Some(st) = &client.status {
