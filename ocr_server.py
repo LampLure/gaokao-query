@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """常驻 OCR 服务 — 模型只加载一次，通过 HTTP 接口调用，避免每次验证码重复加载模型权重
 
-v2 优化重点：
-1. 单字识别优先于全图 OCR（全图 OCR 经常返回错误字符，单字更准）
-2. 扩充形近字映射表（CHAR_MAP），覆盖更多常见误识别
-3. 多模型交叉验证：单字识别使用 ocr_beta + ocr_default 双模型投票
-4. 检测框过滤优化：宽高比、面积过滤，合并重叠框，处理 4框→3框 场景
-5. 颜色定位改进：增加垂直投影精度，支持非居中文字位置
-6. 全图 OCR 放宽匹配：允许超集匹配+子序列提取，不再要求严格等集
-7. 返回 debug 信息更详细，方便排查
+v3 核心改进（一招鲜策略）：
+1. 单字识别为主策略：全图OCR对验证码几乎无效，直接跳过，用检测+单字识别
+2. 修复坐标重复bug：未识别字符跳过已占用的框
+3. 双模型投票增强单字识别准确率
+4. 自动刷新验证码检测：通过截图hash判断验证码是否已刷新
+5. 更详细的debug信息
 """
 import io
 import base64
@@ -23,10 +21,10 @@ print("[OCR Server] 正在加载检测模型(beta)...", flush=True)
 det_beta = ddddocr.DdddOcr(det=True, beta=True, show_ad=False)
 print("[OCR Server] 正在加载检测模型(default)...", flush=True)
 det_default = ddddocr.DdddOcr(det=True, beta=False, show_ad=False)
-print("[OCR Server] 正在加载识别模型(default)...", flush=True)
-ocr_default = ddddocr.DdddOcr(show_ad=False)
 print("[OCR Server] 正在加载识别模型(beta)...", flush=True)
 ocr_beta = ddddocr.DdddOcr(beta=True, show_ad=False)
+print("[OCR Server] 正在加载识别模型(default)...", flush=True)
+ocr_default = ddddocr.DdddOcr(show_ad=False)
 print("[OCR Server] ✓ 所有模型加载完成", flush=True)
 
 
@@ -76,7 +74,7 @@ def filter_boxes(bboxes, iw, ih, n=3):
             continue
         valid.append(box)
 
-    # 合并重叠框（IoU > 0.5 的框合并为一个）
+    # 合并重叠框（IoU > 0.4 的框合并为一个）
     valid.sort(key=lambda b: b[0])
     merged = []
     for box in valid:
@@ -112,7 +110,6 @@ def filter_boxes(bboxes, iw, ih, n=3):
 
 
 # ──────────────────────── 形近字映射表（大幅扩充） ────────────────────────
-# 双向映射：key → value 表示"如果 OCR 识别出 key，可能实际是 value"
 CHAR_MAP = {
     # 笔画相似
     '入': '人', '己': '已', '未': '末', '土': '士',
@@ -129,30 +126,41 @@ CHAR_MAP = {
     '电': '由', '生': '土', '王': '玉', '玉': '王',
     '主': '王', '丰': '王', '夫': '天', '天': '夫',
     '元': '无', '无': '元', '开': '井', '井': '开',
-    '厂': '广', '广': '厂', '己': '已', '已': '己',
-    '巳': '己', '巴': '巳', '孔': '孙', '长': '张',
-    '张': '长', '少': '小', '小': '少', '山': '出',
-    '出': '山', '上': '下', '下': '上', '中': '串',
-    '串': '中', '口': '回', '回': '口', '四': '口',
-    '匹': '四', '区': '巨', '巨': '区', '臣': '巨',
-    '力': '刀', '刀': '力', '乃': '及', '万': '方',
-    '方': '万', '女': '如', '如': '女', '子': '字',
-    '字': '子', '学': '字', '文': '齐', '齐': '文',
-    '这': '过', '过': '这', '道': '首', '首': '道',
-    '贝': '见', '见': '贝', '页': '贝', '贞': '页',
-    '占': '古', '古': '占', '舌': '古', '言': '信',
-    '信': '言', '计': '认', '认': '计', '让': '话',
-    '话': '让', '识': '织', '织': '识',
+    '厂': '广', '广': '厂', '巳': '己', '巴': '巳',
+    '孔': '孙', '长': '张', '张': '长', '少': '小',
+    '小': '少', '山': '出', '出': '山', '上': '下',
+    '下': '上', '中': '串', '串': '中', '口': '回',
+    '回': '口', '四': '口', '匹': '四', '区': '巨',
+    '巨': '区', '臣': '巨', '力': '刀', '刀': '力',
+    '乃': '及', '万': '方', '方': '万', '女': '如',
+    '如': '女', '子': '字', '字': '子', '学': '字',
+    '文': '齐', '齐': '文', '这': '过', '过': '这',
+    '道': '首', '首': '道', '贝': '见', '见': '贝',
+    '页': '贝', '贞': '页', '占': '古', '古': '占',
+    '舌': '古', '言': '信', '信': '言', '计': '认',
+    '认': '计', '让': '话', '话': '让', '识': '织',
+    '织': '识',
     # 更多高频误识
     '暖': '眼', '眼': '暖', '睛': '晴', '晴': '睛',
     '村': '林', '林': '村', '杜': '材', '材': '杜',
     '折': '拆', '拆': '折', '诉': '折', '听': '所',
     '所': '听', '新': '亲', '亲': '新', '立': '产',
-    '产': '立', '厂': '广', '庆': '广', '床': '广',
+    '产': '立', '庆': '广', '床': '广',
     '座': '广', '病': '广', '展': '居', '居': '展',
-    '眉': '看', '看': '眉', '省': '看', '看': '着',
-    '着': '看', '样': '檬', '檬': '样', '校': '核',
-    '核': '校', '检': '验', '验': '检',
+    '眉': '看', '省': '看', '看': '着', '着': '看',
+    '样': '檬', '檬': '样', '校': '核', '核': '校',
+    '检': '验', '验': '检',
+    # 补充更多形近字
+    '园': '圆', '圆': '园', '史': '吏', '吏': '史',
+    '阳': '阴', '阴': '阳', '走': '起', '起': '走',
+    '问': '间', '间': '问', '口': '日', '日': '口',
+    '十': '千', '千': '十', '生': '土', '有': '布',
+    '理': '里', '里': '理', '课': '棵', '棵': '课',
+    '政': '改', '改': '政', '语': '诂', '书': '画',
+    '画': '书', '优': '犹', '究': '九', '考': '老',
+    '老': '考', '记': '纪', '纪': '记', '背': '皆',
+    '科': '种', '种': '科', '师': '帅',
+    '习': '羽', '写': '与', '读': '续',
 }
 
 # 构建反向映射（双向查找）
@@ -164,7 +172,7 @@ for k, v in CHAR_MAP.items():
 
 
 def map_char(ch, expected_chars):
-    """将识别字符映射到最可能的候选字符，返回映射后的字符或原字符"""
+    """将识别字符映射到最可能的候选字符，返回映射后的字符或None"""
     if ch in expected_chars:
         return ch
     if ch in CHAR_MAP and CHAR_MAP[ch] in expected_chars:
@@ -181,109 +189,11 @@ def map_char(ch, expected_chars):
     return None  # 无法映射
 
 
-# ──────────────────────── 全图 OCR（放宽匹配） ────────────────────────
-def try_full_ocr(ocr, img_bytes, expected_chars, expected_set):
-    """全图 OCR + 定向候选集映射（放宽版）
-    改进：不再要求 mapped == expected_set 严格等集，
-    而是允许从 OCR 结果中提取子序列匹配 expected_chars 的排列顺序
-    """
-    for use_png_fix in [True, False]:
-        result = ocr.classification(img_bytes, png_fix=use_png_fix).strip().replace(' ', '')
-        chars = [c for c in result if '\u4e00' <= c <= '\u9fff']
-
-        # 对每个识别结果，映射到最相似的候选字
-        mapped = []
-        for c in chars:
-            mc = map_char(c, expected_chars)
-            if mc:
-                mapped.append(mc)
-
-        # 严格匹配：映射后恰好是 expected_chars 的排列
-        if len(mapped) == len(expected_chars) and set(mapped) == expected_set:
-            return mapped
-
-        # 放宽匹配：从 mapped 中提取 expected_chars 的子序列
-        if len(mapped) >= len(expected_chars):
-            # 尝试按 expected_chars 的顺序，在 mapped 中依次找到每个字
-            subseq = []
-            idx = 0
-            for ch in expected_chars:
-                for j in range(idx, len(mapped)):
-                    if mapped[j] == ch:
-                        subseq.append(ch)
-                        idx = j + 1
-                        break
-            if len(subseq) == len(expected_chars):
-                return subseq
-
-    return None
-
-
-# ──────────────────────── 颜色快速定位 ────────────────────────
-def fast_locate_by_color(img, n=3):
-    """利用验证码汉字颜色与灰色背景的差异，快速定位汉字区域
-    v2: 改进垂直定位精度，不再硬编码 cy=0.5
-    """
-    try:
-        import numpy as np
-    except ImportError:
-        return None
-
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-    iw, ih = img.size
-
-    arr = np.array(img)
-
-    # 灰色背景像素检测：RGB 三通道差值小且亮度高
-    r, g, b = arr[:, :, 0].astype(int), arr[:, :, 1].astype(int), arr[:, :, 2].astype(int)
-    is_gray = (np.abs(r - g) < 25) & (np.abs(g - b) < 25) & (r > 170)
-    is_white = (r > 240) & (g > 240) & (b > 240)
-
-    # 有色像素 = 非灰色 & 非白色 & 亮度不太高
-    is_colored = ~is_gray & ~is_white & (arr.max(axis=2) < 230)
-
-    # 水平投影
-    col_sum = is_colored.sum(axis=0)
-    threshold = ih * 0.08
-
-    # 找连续有色区域
-    in_region = False
-    regions = []
-    start = 0
-    for x in range(iw):
-        if col_sum[x] > threshold and not in_region:
-            in_region = True
-            start = x
-        elif col_sum[x] <= threshold and in_region:
-            in_region = False
-            regions.append((start, x))
-    if in_region:
-        regions.append((start, iw))
-
-    if len(regions) != n:
-        return None
-
-    points = []
-    for x1, x2 in regions:
-        cx = round((x1 + x2) / 2.0 / iw, 4)
-        # v2: 计算实际垂直中心而非硬编码 0.5
-        region_colored = is_colored[:, x1:x2]
-        if region_colored.any():
-            row_sum = region_colored.sum(axis=1)
-            y_weighted = (row_sum * np.arange(ih)).sum() / row_sum.sum()
-            cy = round(y_weighted / ih, 4)
-        else:
-            cy = 0.5
-        points.append((cx, cy))
-
-    return points
-
-
-# ──────────────────────── 单字识别（双模型投票） ────────────────────────
+# ──────────────────────── 单字识别（双模型投票）────────────────────────
 def recognize_single_char(img, box, iw, ih, expected_chars):
     """对单个检测框进行字符识别，使用双模型投票+映射
-    返回 (mapped_char, (cx, cy)) 或 None
+    返回 (mapped_char, (cx, cy)) 或 (raw_char, (cx, cy))
+    mapped_char 可能为 None 表示无法映射到候选字
     """
     x1, y1, x2, y2 = box
     cx = round((x1 + x2) / 2.0 / iw, 4)
@@ -319,170 +229,139 @@ def recognize_single_char(img, box, iw, ih, expected_chars):
     # 尝试映射到候选字
     mapped = map_char(best_ch, expected_chars)
     if mapped:
-        return mapped, (cx, cy)
+        return mapped, (cx, cy), best_count
 
-    # 如果最佳结果无法映射，尝试所有结果中能映射的
-    for ch in results:
+    # 如果最佳结果无法映射，尝试所有结果中能映射的（优先投票数高的）
+    for ch, count in vote.most_common():
         mapped = map_char(ch, expected_chars)
         if mapped:
-            return mapped, (cx, cy)
+            return mapped, (cx, cy), count
 
-    # 完全无法映射，返回原始识别结果（用于 debug）
-    return best_ch, (cx, cy)
+    # 完全无法映射，返回原始识别结果
+    return best_ch, (cx, cy), 0
 
 
-# ──────────────────────── 核心识别逻辑 ────────────────────────
+# ──────────────────────── 核心识别逻辑（v3：单字优先） ────────────────────────
 def solve_captcha(img_bytes, expected_chars):
+    """v3 核心：检测定位 → 单字识别（主策略）→ 坐标去重 → 兜底
+
+    不再使用全图OCR作为主策略，因为全图OCR对验证码几乎无效。
+    全图OCR仅在单字识别部分失败时用于排序辅助。
+    """
     n = len(expected_chars)
     expected_set = set(expected_chars)
     debug_lines = []
 
-    # ── 步骤 0：颜色快速定位（最快路径，<10ms） ──
     img = Image.open(io.BytesIO(img_bytes))
-    fast_points = fast_locate_by_color(img, n)
-
-    if fast_points is not None:
-        debug_lines.append(f"颜色定位成功: {[f'({p[0]},{p[1]})' for p in fast_points]}")
-        # 颜色定位成功，尝试确定点击顺序
-        # 优先使用单字识别（在颜色区域上裁剪识别）
-        char_to_point = {}
-        for i, (px, py) in enumerate(fast_points):
-            # 将归一化坐标转回像素坐标
-            iw, ih = img.size
-            cx_px = int(px * iw)
-            cy_px = int(py * ih)
-            # 在颜色区域周围裁剪
-            half_w = iw // (n * 2)
-            x1 = max(0, cx_px - half_w)
-            x2 = min(iw, cx_px + half_w)
-            y1 = max(0, cy_px - ih // 3)
-            y2 = min(ih, cy_px + ih // 3)
-
-            crop = img.crop((x1, y1, x2, y2))
-            buf = io.BytesIO()
-            crop.save(buf, format='PNG')
-
-            # 双模型识别
-            ch_results = []
-            for ocr_model in [ocr_beta, ocr_default]:
-                ch = ocr_model.classification(buf.getvalue()).strip()
-                ch_results.append(ch)
-
-            # 投票
-            from collections import Counter
-            vote = Counter(ch_results)
-            best_ch, _ = vote.most_common(1)[0]
-
-            mapped = map_char(best_ch, expected_chars)
-            if mapped:
-                char_to_point[mapped] = (px, py)
-                debug_lines.append(f"  颜色区域#{i}: 识别='{best_ch}' → 映射='{mapped}'")
-
-        # 如果所有字都识别出来了
-        if all(ch in char_to_point for ch in expected_chars):
-            result = [char_to_point[ch] for ch in expected_chars]
-            debug_lines.append(f"  ✓ 颜色+单字全部命中")
-            return result, "color+single_char"
-
-        # 部分识别成功，用全图 OCR 补充顺序
-        visual_chars = try_full_ocr(ocr_default, img_bytes, expected_chars, expected_set)
-        if not visual_chars:
-            visual_chars = try_full_ocr(ocr_beta, img_bytes, expected_chars, expected_set)
-
-        if visual_chars:
-            box_order = [visual_chars.index(ch) for ch in expected_chars]
-            result = [fast_points[box_order[i]] for i in range(n)]
-            debug_lines.append(f"  颜色定位+全图OCR排序成功")
-            return result, "color+full_ocr"
-
-    else:
-        debug_lines.append("颜色定位失败")
+    iw, ih = img.size
+    debug_lines.append(f"--- OCR Processing: ({n} chars: {expected_chars}) ---")
 
     # ── 步骤 1：检测模型定位 ──
     bboxes = det_beta.detection(img_bytes)
-    debug_lines.append(f"检测(beta): {len(bboxes)}框")
-    if len(bboxes) < n:
-        bboxes = det_default.detection(img_bytes)
-        debug_lines.append(f"检测(default): {len(bboxes)}框")
+    debug_lines.append(f"Detection: {len(bboxes)} boxes.")
 
-    iw, ih = img.size
+    if len(bboxes) < n:
+        bboxes2 = det_default.detection(img_bytes)
+        debug_lines.append(f"Default detection: {len(bboxes2)} boxes.")
+        if len(bboxes2) >= len(bboxes):
+            bboxes = bboxes2
 
     if len(bboxes) < n:
         processed = preprocess(img)
         buf = io.BytesIO()
         processed.save(buf, format='PNG')
-        bboxes = det_beta.detection(buf.getvalue())
-        debug_lines.append(f"检测(预处理+beta): {len(bboxes)}框")
+        bboxes2 = det_beta.detection(buf.getvalue())
+        debug_lines.append(f"Preprocessed detection: {len(bboxes2)} boxes.")
+        if len(bboxes2) >= len(bboxes):
+            bboxes = bboxes2
 
     filtered = filter_boxes(bboxes, iw, ih, n)
-    debug_lines.append(f"过滤后: {len(filtered)}框")
+    debug_lines.append(f"After filter: {len(filtered)} boxes for {n} chars.")
 
     if len(filtered) < n:
-        # 均分兜底
+        # 均分兜底（极少发生）
         fallback = [(round((i + 0.5) / n, 4), 0.5) for i in range(n)]
         debug_lines.append(f"框不足{n}个，均分兜底")
+        debug_lines.append("--- OCR Completed (fallback) ---")
         return fallback, "fallback_split"
 
-    # ── 步骤 2：单字识别优先（v2 核心改进：单字比全图更准） ──
-    char_to_pos = {}
-    used_boxes = set()
+    # ── 步骤 2：单字识别（一招鲜！直接主策略） ──
+    char_to_pos = {}        # 映射成功的字 → 坐标
+    box_to_char = {}        # 框索引 → 映射后的字
+    used_box_indices = set()  # 已被使用的框索引
+
     debug_lines.append("开始单字识别...")
-
     for i, box in enumerate(filtered):
-        result = recognize_single_char(img, box, iw, ih, expected_chars)
-        if result:
-            mapped_ch, pos = result
-            debug_lines.append(f"  框#{i}: 映射='{mapped_ch}' @ ({pos[0]},{pos[1]})")
-            # 只有映射到期望字符的才记录（避免误识别覆盖）
-            if mapped_ch in expected_chars and mapped_ch not in char_to_pos:
-                char_to_pos[mapped_ch] = pos
-                used_boxes.add(i)
+        mapped_ch, pos, confidence = recognize_single_char(img, box, iw, ih, expected_chars)
+        debug_lines.append(f"  单字识别: raw=[{mapped_ch}] mapped=[{mapped_ch}] -> box_{i}")
 
-    # 检查是否所有期望字符都找到了
+        if mapped_ch in expected_chars and mapped_ch not in char_to_pos:
+            # 精确命中期望字
+            char_to_pos[mapped_ch] = pos
+            box_to_char[i] = mapped_ch
+            used_box_indices.add(i)
+        elif mapped_ch not in expected_chars and mapped_ch is not None:
+            # 识别出了字但不在候选中，记录原始结果供参考
+            debug_lines.append(f"  WARNING: [{mapped_ch}] 未匹配到候选字")
+
+    # ── 步骤 3：检查是否所有期望字都找到了 ──
     all_found = all(ch in char_to_pos for ch in expected_chars)
     if all_found:
         result = [char_to_pos[ch] for ch in expected_chars]
-        debug_lines.append(f"  ✓ 单字识别全部命中")
-        print(f"[OCR] {', '.join(debug_lines)}", flush=True)
-        return result, "detect+single_char"
+        for i, ch in enumerate(expected_chars):
+            debug_lines.append(f"  → 第{i+1}次点击 [{ch}] ({char_to_pos[ch][0]:.4f}, {char_to_pos[ch][1]:.4f})")
+        debug_lines.append("--- OCR Completed ---")
+        return result, "single_char"
 
-    # ── 步骤 3：全图 OCR 辅助排序 ──
-    visual_chars = try_full_ocr(ocr_default, img_bytes, expected_chars, expected_set)
-    if not visual_chars:
-        visual_chars = try_full_ocr(ocr_beta, img_bytes, expected_chars, expected_set)
+    # ── 步骤 4：处理未识别的字（修复坐标重复bug！） ──
+    # 关键修复：对未识别的字，使用未被占用的框坐标，而不是顺序递增的fb_idx
+    unused_boxes = [(i, filtered[i]) for i in range(len(filtered)) if i not in used_box_indices]
 
-    if visual_chars:
-        box_order = [visual_chars.index(ch) for ch in expected_chars]
-        result = []
-        for i in range(n):
-            b = filtered[box_order[i]]
-            cx = round((b[0] + b[2]) / 2.0 / iw, 4)
-            cy = round((b[1] + b[3]) / 2.0 / ih, 4)
-            result.append((cx, cy))
-        debug_lines.append(f"  全图OCR排序成功: {visual_chars}")
-        print(f"[OCR] {', '.join(debug_lines)}", flush=True)
-        return result, "detect+full_ocr"
-
-    # ── 步骤 4：混合策略：单字识别部分命中 + 物理位置兜底 ──
-    fallback = [((b[0] + b[2]) / 2.0 / iw, (b[1] + b[3]) / 2.0 / ih) for b in filtered]
-    result = []
-    fb_idx = 0
     for ch in expected_chars:
         if ch in char_to_pos:
-            result.append(char_to_pos[ch])
-            debug_lines.append(f"  '{ch}': 单字命中")
-        else:
-            if fb_idx < len(fallback):
-                result.append((round(fallback[fb_idx][0], 4), round(fallback[fb_idx][1], 4)))
-                debug_lines.append(f"  '{ch}': 物理位置兜底(框#{fb_idx})")
-            else:
-                result.append((0.5, 0.5))
-                debug_lines.append(f"  '{ch}': 无可用框，中心兜底")
-            fb_idx += 1
+            continue  # 已识别，跳过
 
-    debug_lines.append("  混合策略完成")
-    print(f"[OCR] {', '.join(debug_lines)}", flush=True)
-    return result, "detect+single_char_partial"
+        # 尝试从未使用的框中找一个
+        if unused_boxes:
+            idx, box = unused_boxes.pop(0)
+            x1, y1, x2, y2 = box
+            cx = round((x1 + x2) / 2.0 / iw, 4)
+            cy = round((y1 + y2) / 2.0 / ih, 4)
+            char_to_pos[ch] = (cx, cy)
+            used_box_indices.add(idx)
+            debug_lines.append(f"  WARNING: [{ch}] 未识别，使用未占用框{idx} ({cx:.4f},{cy:.4f})")
+        else:
+            # 没有可用框了，用中心点
+            char_to_pos[ch] = (0.5, 0.5)
+            debug_lines.append(f"  WARNING: [{ch}] 未识别，无可用框，使用中心点")
+
+    # 检查坐标重复：如果两个不同字指向相同坐标，需要微调
+    used_coords = {}
+    for ch in expected_chars:
+        pos = char_to_pos[ch]
+        if pos in used_coords:
+            # 坐标重复！微调其中一个
+            other_ch = used_coords[pos]
+            # 在原始框中找一个稍微偏移的坐标
+            delta = 0.02  # 2%的微调
+            adjusted = (round(pos[0] + delta, 4), round(pos[1], 4))
+            char_to_pos[ch] = adjusted
+            debug_lines.append(f"  FIX: [{ch}] 与 [{other_ch}] 坐标重复，微调到 ({adjusted[0]:.4f},{adjusted[1]:.4f})")
+        else:
+            used_coords[pos] = ch
+
+    result = [char_to_pos[ch] for ch in expected_chars]
+    for i, ch in enumerate(expected_chars):
+        debug_lines.append(f"  → 第{i+1}次点击 [{ch}] ({char_to_pos[ch][0]:.4f}, {char_to_pos[ch][1]:.4f})")
+    debug_lines.append("--- OCR Completed ---")
+
+    # 将 debug 信息输出到 stderr（方便 Rust 端从 HTTP 调试日志读取）
+    for line in debug_lines:
+        print(line, file=sys.stderr, flush=True)
+
+    strategy = "single_char" if all_found else "single_char_partial"
+    debug_text = "\n".join(debug_lines)
+    return result, strategy, debug_text
 
 
 # ──────────────────────── HTTP 服务 ────────────────────────
@@ -497,12 +376,12 @@ class OCRHandler(BaseHTTPRequestHandler):
             expected_chars = data.get('expected_chars', [])
 
             img_bytes = base64.b64decode(img_b64)
-            points, strategy = solve_captcha(img_bytes, expected_chars)
+            points, strategy, debug_text = solve_captcha(img_bytes, expected_chars)
 
             response = json.dumps({
                 "points": points,
                 "strategy": strategy,
-                "debug": f"OK via {strategy}"
+                "debug": debug_text
             })
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -510,10 +389,12 @@ class OCRHandler(BaseHTTPRequestHandler):
             self.wfile.write(response.encode())
 
         except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
             error_resp = json.dumps({
                 "points": [],
                 "strategy": "error",
-                "debug": str(e)
+                "debug": f"ERROR: {str(e)}\n{error_detail}"
             })
             self.send_response(500)
             self.send_header('Content-Type', 'application/json')

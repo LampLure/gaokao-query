@@ -196,6 +196,7 @@ pub enum BrowserStep {
     ClickingCaptcha,            // 点击验证码
     WaitingCaptchaResult,       // 等待验证码结果
     CaptchaFailed,              // 验证码失败，准备重试
+    DismissingAlert,            // 关闭错误弹窗
     ReadingResult,              // 读取查询结果
     GoingHome,                  // 导航回首页
     Error(String),              // 出错
@@ -215,6 +216,7 @@ impl BrowserStep {
             BrowserStep::ClickingCaptcha => "👆 点击验证码",
             BrowserStep::WaitingCaptchaResult => "⏳ 验证码验证中",
             BrowserStep::CaptchaFailed => "❌ 验证码失败",
+            BrowserStep::DismissingAlert => "🗑️ 关闭弹窗",
             BrowserStep::ReadingResult => "📋 读取结果",
             BrowserStep::GoingHome => "🏠 回首页",
             BrowserStep::Error(_e) => "❌ 出错",
@@ -234,6 +236,7 @@ impl BrowserStep {
             BrowserStep::ClickingCaptcha => (255, 140, 0),
             BrowserStep::WaitingCaptchaResult => (255, 165, 0),
             BrowserStep::CaptchaFailed => (255, 69, 0),    // 红橙
+            BrowserStep::DismissingAlert => (255, 99, 71),  // 番茄色
             BrowserStep::ReadingResult => (50, 205, 50),   // 绿色
             BrowserStep::GoingHome => (147, 112, 219),     // 紫色
             BrowserStep::Error(_) => (255, 0, 0),          // 红色
