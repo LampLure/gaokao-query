@@ -8,8 +8,7 @@ use chromiumoxide::{
 };
 use futures_util::StreamExt;
 
-use crate::data::QueryResult;
-use crate::data::QueryStatus;
+use crate::data::{QueryResult, QueryStatus, BrowserStatus, BrowserStep, CaptchaStats};
 use crate::ocr;
 
 static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -26,6 +25,8 @@ pub struct BrowserClient {
     instance_id: u64,
     start: std::time::Instant,
     turbo: bool,
+    status: Option<Arc<Mutex<Vec<BrowserStatus>>>>,
+    captcha_stats: Option<Arc<Mutex<CaptchaStats>>>,
 }
 
 impl BrowserClient {
@@ -52,6 +53,50 @@ impl BrowserClient {
 
     pub fn set_turbo(&mut self, turbo: bool) {
         self.turbo = turbo;
+    }
+
+    pub fn set_status(&mut self, status: Option<Arc<Mutex<Vec<BrowserStatus>>>>) {
+        self.status = status;
+    }
+
+    pub fn set_captcha_stats(&mut self, stats: Option<Arc<Mutex<CaptchaStats>>>) {
+        self.captcha_stats = stats;
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    fn update_step(&self, step: BrowserStep) {
+        if let Some(st) = &self.status {
+            if let Ok(mut statuses) = st.try_lock() {
+                if let Some(s) = statuses.iter_mut().find(|s| s.id == self.instance_id) {
+                    s.step = step;
+                    s.elapsed_ms = self.start.elapsed().as_millis() as u64;
+                }
+            }
+        }
+    }
+
+    fn update_target(&self, target: String) {
+        if let Some(st) = &self.status {
+            if let Ok(mut statuses) = st.try_lock() {
+                if let Some(s) = statuses.iter_mut().find(|s| s.id == self.instance_id) {
+                    s.target = target;
+                }
+            }
+        }
+    }
+
+    fn update_captcha_attempt(&self, attempt: u32, max: u32) {
+        if let Some(st) = &self.status {
+            if let Ok(mut statuses) = st.try_lock() {
+                if let Some(s) = statuses.iter_mut().find(|s| s.id == self.instance_id) {
+                    s.captcha_attempt = attempt;
+                    s.captcha_max = max;
+                }
+            }
+        }
     }
 
     fn perf_event(&self, label: &'static str) {
@@ -190,10 +235,13 @@ impl BrowserClient {
             instance_id,
             start: now,
             turbo,
+            status: None,
+            captcha_stats: None,
         })
     }
 
     pub async fn go_home(&self) -> Result<(), String> {
+        self.update_step(BrowserStep::GoingHome);
         let page = self.page.lock().await;
         page.goto(&self.target_url)
             .await
@@ -220,6 +268,8 @@ impl BrowserClient {
         shenfenzheng: &str,
     ) -> Result<QueryResult, String> {
         self.perf_event("开始查询");
+        self.update_step(BrowserStep::CheckingPage);
+        self.update_target(format!("{}", baominghao));
         let page = self.page.lock().await;
 
         // 检查页面是否就绪（表单元素是否存在）
@@ -268,6 +318,7 @@ impl BrowserClient {
 
         self.sleep_step(0.5).await;
         self.perf_event("填写信息完成");
+        self.update_step(BrowserStep::Submitting);
 
         let click_result: String = page.evaluate_expression(
             r#"(function() {
@@ -283,6 +334,7 @@ impl BrowserClient {
 
         // Poll for captcha modal or result (15s timeout)
         self.perf_event("等待验证码");
+        self.update_step(BrowserStep::WaitingCaptcha);
         let captcha_visible = self.poll_true(&page,
             r#"(function() {
                 const m = document.getElementById('captchaModal');
@@ -292,10 +344,13 @@ impl BrowserClient {
             self.perf_event("验证码弹窗出现");
             if let Err(e) = self.solve_captcha_modal(&page).await {
                 self.perf_event("总耗时");
+                self.update_step(BrowserStep::Error(e.clone()));
                 return Err(format!("验证码处理失败: {}", e));
             }
             self.sleep_critical(200).await;
         }
+
+        self.update_step(BrowserStep::ReadingResult);
 
         let has_error: bool = page.evaluate_expression(
             r#"(function() {
@@ -384,6 +439,13 @@ impl BrowserClient {
         let temp_path = self.captcha_path();
 
         for attempt in 1..=max_retries {
+            self.update_captcha_attempt(attempt, max_retries);
+            // 统计验证码尝试次数
+            if let Some(cs) = &self.captcha_stats {
+                if let Ok(mut stats) = cs.try_lock() {
+                    stats.total_attempts += 1;
+                }
+            }
             if attempt > 1 {
                 // Refresh captcha button click to get a new image
                 self.log_msg("刷新验证码...");
@@ -405,6 +467,7 @@ impl BrowserClient {
                 }
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
+            self.update_step(BrowserStep::LoadingCaptchaImage);
 
             // Poll for captcha image (10s timeout), 用 canvas 方式获取（最可靠，不阻塞主线程）
             let img_src: String = {
@@ -492,6 +555,7 @@ impl BrowserClient {
 
             // Solve captcha via OCR
             self.perf_event("OCR开始");
+            self.update_step(BrowserStep::OcrProcessing);
             let ocr_result = match ocr::solve_captcha(&temp_path, &expected_chars, cw, ch, self.instance_id).await {
                 Ok(r) => {
                     self.perf_event("OCR完成");
@@ -516,8 +580,9 @@ impl BrowserClient {
                 }
             }
 
-            // Click points — 合并为1次JS调用，用setTimeout错开点击，减少等待时间
+            // Click points — 合并为1次JS调用
             self.perf_event("验证码点击开始");
+            self.update_step(BrowserStep::ClickingCaptcha);
             let clicks_js = format!(
                 r#"(function() {{
                     const container = document.getElementById('captchaContainer');
@@ -542,8 +607,9 @@ impl BrowserClient {
             let _ = page.evaluate_expression(&clicks_js).await;
             self.sleep_critical(500).await;
 
-            // Poll for verification result — 自适应轮询：前5次100ms快速检测，之后200ms
+            // Poll for verification result
             self.perf_event("验证码点击完成");
+            self.update_step(BrowserStep::WaitingCaptchaResult);
             let max_polls = 30; // 最多3秒
             let mut still_visible = true;
             for i in 0..max_polls {
@@ -564,11 +630,21 @@ impl BrowserClient {
                 // Captcha passed
                 self.log_msg("验证码通过");
                 self.perf_event("验证码验证通过");
+                // 统计验证码通过
+                if let Some(cs) = &self.captcha_stats {
+                    if let Ok(mut stats) = cs.try_lock() {
+                        stats.total_passes += 1;
+                        if attempt == 1 {
+                            stats.first_try_passes += 1;
+                        }
+                    }
+                }
                 return Ok(());
             }
 
-            // Captcha failed - dismiss error alert if present
+            // Captcha failed
             self.log_msg("验证码验证失败，尝试关闭弹窗并重试");
+            self.update_step(BrowserStep::CaptchaFailed);
 
             let _ = page.evaluate_expression(
                 r#"(function() {

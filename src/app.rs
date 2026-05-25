@@ -66,7 +66,9 @@ pub struct GaokaoApp {
     // performance profiling
     perf_logs: Arc<Mutex<Vec<Vec<PerfEvent>>>>,
     perf_stats: Vec<PerfRecord>,
-    captcha_stats: Arc<Mutex<(u64, u64)>>,  // (total, ok)
+    captcha_stats: Arc<Mutex<CaptchaStats>>,
+    browser_statuses: Arc<Mutex<Vec<BrowserStatus>>>,
+    displayed_browser_statuses: Vec<BrowserStatus>,
     // cancellation
     cancel_flag: Arc<Mutex<bool>>,
 }
@@ -126,7 +128,9 @@ impl GaokaoApp {
             displayed_logs: Vec::new(),
             perf_logs: Arc::new(Mutex::new(Vec::new())),
             perf_stats: Vec::new(),
-            captcha_stats: Arc::new(Mutex::new((0, 0))),
+            captcha_stats: Arc::new(Mutex::new(CaptchaStats::default())),
+            browser_statuses: Arc::new(Mutex::new(Vec::new())),
+            displayed_browser_statuses: Vec::new(),
             cancel_flag: Arc::new(Mutex::new(false)),
         };
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
@@ -227,6 +231,11 @@ impl eframe::App for GaokaoApp {
         if let Ok(l) = self.debug_logs.try_lock() {
             if l.len() != self.displayed_logs.len() {
                 self.displayed_logs = l.clone();
+            }
+        }
+        if let Ok(bs) = self.browser_statuses.try_lock() {
+            if bs.len() != self.displayed_browser_statuses.len() || bs.iter().zip(self.displayed_browser_statuses.iter()).any(|(a, b)| a.step != b.step || a.target != b.target || a.captcha_attempt != b.captcha_attempt) {
+                self.displayed_browser_statuses = bs.clone();
             }
         }
 
@@ -347,13 +356,15 @@ impl eframe::App for GaokaoApp {
                     ui.checkbox(&mut self.config.turbo, "🔥 暴力");
                     if tb != self.config.turbo { self.config_dirty = true; }
                     if let Ok(cs) = self.captcha_stats.try_lock() {
-                        let rate = if cs.0 > 0 {
-                            format!("验证码 {}/{} ({:.0}%)", cs.1, cs.0,
-                                cs.1 as f64 / cs.0 as f64 * 100.0)
+                        if cs.total_attempts > 0 {
+                            ui.label(egui::RichText::new(format!(
+                                "验证码 {}/{} ({:.0}%) 一次过:{}/{} ({:.0}%)",
+                                cs.total_passes, cs.total_attempts, cs.pass_rate(),
+                                cs.first_try_passes, cs.total_attempts, cs.first_try_rate()
+                            )).color(if cs.pass_rate() >= 80.0 { egui::Color32::GREEN } else if cs.pass_rate() >= 50.0 { egui::Color32::YELLOW } else { egui::Color32::RED }).strong());
                         } else {
-                            "验证码 --%".to_string()
-                        };
-                        ui.label(rate);
+                            ui.label("验证码 --%");
+                        }
                     }
                 });
             });
@@ -587,6 +598,63 @@ impl GaokaoApp {
                 }
             }
         });
+
+        // 浏览器实时状态面板
+        if !self.displayed_browser_statuses.is_empty() {
+            ui.push_id("browser_status_panel", |ui| {
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("🖥️ 浏览器实时状态").strong());
+                ui.add_space(4.0);
+
+                egui::Grid::new("browser_status_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .show(ui, |ui| {
+                        ui.strong("实例"); ui.strong("当前步骤"); ui.strong("操作目标"); ui.strong("验证码");
+                        ui.end_row();
+                        for bs in &self.displayed_browser_statuses {
+                            // 实例 ID
+                            ui.label(format!("#{}", bs.id));
+
+                            // 当前步骤（带颜色）
+                            let (r, g, b) = bs.step.color();
+                            let color = egui::Color32::from_rgb(r, g, b);
+                            let step_text = match &bs.step {
+                                BrowserStep::Error(e) => format!("❌ {}", e),
+                                _ => bs.step.label().to_string(),
+                            };
+                            ui.label(egui::RichText::new(step_text).color(color).strong());
+
+                            // 操作目标
+                            let target_display = if bs.target.len() > 20 {
+                                format!("{}...", &bs.target[..20])
+                            } else {
+                                bs.target.clone()
+                            };
+                            ui.label(target_display);
+
+                            // 验证码状态
+                            if bs.captcha_max > 0 && bs.captcha_attempt > 0 {
+                                let captcha_text = format!("{}/{}", bs.captcha_attempt, bs.captcha_max);
+                                let captcha_color = if bs.captcha_attempt == 1 {
+                                    egui::Color32::GREEN
+                                } else if bs.captcha_attempt <= bs.captcha_max / 2 {
+                                    egui::Color32::YELLOW
+                                } else {
+                                    egui::Color32::RED
+                                };
+                                ui.label(egui::RichText::new(captcha_text).color(captcha_color));
+                            } else {
+                                ui.label("-");
+                            }
+
+                            ui.end_row();
+                        }
+                    });
+            });
+        }
     }
 
     fn ui_results_table(&mut self, ui: &mut egui::Ui) {
@@ -989,6 +1057,7 @@ impl GaokaoApp {
         let logs = self.debug_logs.clone();
         let perf_logs = self.perf_logs.clone();
         let captcha_stats = self.captcha_stats.clone();
+        let browser_statuses = self.browser_statuses.clone();
         let turbo = self.config.turbo;
 
         {
@@ -1013,8 +1082,22 @@ impl GaokaoApp {
                 }
             };
 
+            // 初始化浏览器状态追踪
+            {
+                let mut statuses = browser_statuses.lock().await;
+                *statuses = (0..concurrency).map(|i| BrowserStatus {
+                    id: i as u64,
+                    step: BrowserStep::Idle,
+                    target: String::new(),
+                    captcha_attempt: 0,
+                    captcha_max: 0,
+                    elapsed_ms: 0,
+                }).collect();
+            }
+
             let perf_logs = perf_logs.clone();
             let captcha_stats = captcha_stats.clone();
+            let browser_statuses = browser_statuses.clone();
             let mut handles = Vec::new();
             for record in &matched {
                 if *cancel.lock().await { break; }
@@ -1026,6 +1109,7 @@ impl GaokaoApp {
                 let logs = logs.clone();
                 let perf_logs = perf_logs.clone();
                 let captcha_stats = captcha_stats.clone();
+                let browser_statuses = browser_statuses.clone();
                 let record = record.clone();
                 let delay = delay;
 
@@ -1063,6 +1147,8 @@ impl GaokaoApp {
                         let record_perf: Arc<Mutex<Vec<PerfEvent>>> = Arc::new(Mutex::new(Vec::new()));
                         client.set_perf(Some(record_perf.clone()));
                         client.set_turbo(turbo);
+                        client.set_captcha_stats(Some(captcha_stats.clone()));
+                        client.set_status(Some(browser_statuses.clone()));
 
                         {
                             let mut l = logs.lock().await;

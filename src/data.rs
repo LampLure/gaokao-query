@@ -154,6 +154,93 @@ pub struct PerfEvent {
     pub elapsed_ms: u64,
 }
 
+/// 验证码统计：精确追踪每次验证码尝试
+#[derive(Debug, Clone, Default)]
+pub struct CaptchaStats {
+    pub total_attempts: u64,   // 总验证码尝试次数
+    pub total_passes: u64,     // 总通过次数
+    pub first_try_passes: u64, // 首次即通过次数
+    pub total_queries: u64,    // 总查询次数（含无需验证码的）
+}
+
+impl CaptchaStats {
+    pub fn pass_rate(&self) -> f64 {
+        if self.total_attempts == 0 { 0.0 } else { self.total_passes as f64 / self.total_attempts as f64 * 100.0 }
+    }
+    pub fn first_try_rate(&self) -> f64 {
+        if self.total_attempts == 0 { 0.0 } else { self.first_try_passes as f64 / self.total_attempts as f64 * 100.0 }
+    }
+}
+
+/// 单个浏览器的实时状态
+#[derive(Debug, Clone)]
+pub struct BrowserStatus {
+    pub id: u64,                    // 浏览器实例 ID
+    pub step: BrowserStep,          // 当前步骤
+    pub target: String,             // 当前操作目标（如"张三 26421126154321"）
+    pub captcha_attempt: u32,       // 当前验证码第几次尝试
+    pub captcha_max: u32,           // 验证码最大尝试次数
+    pub elapsed_ms: u64,            // 当前步骤已耗时(ms)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserStep {
+    Idle,                       // 空闲等待
+    Acquiring,                  // 获取浏览器实例
+    CheckingPage,               // 检查页面就绪
+    FillingForm,                // 填写表单
+    Submitting,                 // 提交查询
+    WaitingCaptcha,             // 等待验证码弹窗
+    LoadingCaptchaImage,        // 加载验证码图片
+    OcrProcessing,              // OCR识别中
+    ClickingCaptcha,            // 点击验证码
+    WaitingCaptchaResult,       // 等待验证码结果
+    CaptchaFailed,              // 验证码失败，准备重试
+    ReadingResult,              // 读取查询结果
+    GoingHome,                  // 导航回首页
+    Error(String),              // 出错
+}
+
+impl BrowserStep {
+    pub fn label(&self) -> &str {
+        match self {
+            BrowserStep::Idle => "⏳ 空闲",
+            BrowserStep::Acquiring => "🔄 获取浏览器",
+            BrowserStep::CheckingPage => "🔍 检查页面",
+            BrowserStep::FillingForm => "✏️ 填写表单",
+            BrowserStep::Submitting => "📤 提交查询",
+            BrowserStep::WaitingCaptcha => "⏳ 等待验证码",
+            BrowserStep::LoadingCaptchaImage => "🖼️ 加载验证码图",
+            BrowserStep::OcrProcessing => "🧠 OCR识别中",
+            BrowserStep::ClickingCaptcha => "👆 点击验证码",
+            BrowserStep::WaitingCaptchaResult => "⏳ 验证码验证中",
+            BrowserStep::CaptchaFailed => "❌ 验证码失败",
+            BrowserStep::ReadingResult => "📋 读取结果",
+            BrowserStep::GoingHome => "🏠 回首页",
+            BrowserStep::Error(e) => "❌ 出错",
+        }
+    }
+
+    pub fn color(&self) -> (u8, u8, u8) {
+        match self {
+            BrowserStep::Idle => (128, 128, 128),         // 灰色
+            BrowserStep::Acquiring => (100, 149, 237),     // 蓝色
+            BrowserStep::CheckingPage => (100, 149, 237),
+            BrowserStep::FillingForm => (65, 105, 225),
+            BrowserStep::Submitting => (65, 105, 225),
+            BrowserStep::WaitingCaptcha => (255, 165, 0),  // 橙色
+            BrowserStep::LoadingCaptchaImage => (255, 165, 0),
+            BrowserStep::OcrProcessing => (255, 140, 0),
+            BrowserStep::ClickingCaptcha => (255, 140, 0),
+            BrowserStep::WaitingCaptchaResult => (255, 165, 0),
+            BrowserStep::CaptchaFailed => (255, 69, 0),    // 红橙
+            BrowserStep::ReadingResult => (50, 205, 50),   // 绿色
+            BrowserStep::GoingHome => (147, 112, 219),     // 紫色
+            BrowserStep::Error(_) => (255, 0, 0),          // 红色
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PerfRecord {
     pub label: &'static str,
