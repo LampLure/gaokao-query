@@ -250,6 +250,17 @@ impl BrowserClient {
             r#"(function() {
                 const form = document.getElementById('zkzh');
                 if (!form) return false;
+
+                // 检查是否处于结果展示页面：如果结果区域可见，JS重置无法恢复表单视图
+                const resultEl = document.querySelector('[data-value="xm"]');
+                if (resultEl && resultEl.textContent.trim().length > 0) {
+                    const rect = resultEl.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        // 结果区域可见，JS重置不可靠，需要完整导航
+                        return false;
+                    }
+                }
+
                 // 第一步：关闭所有弹窗（alert、captcha）
                 const alertBtn = document.getElementById('alertOkButton');
                 if (alertBtn) alertBtn.click();
@@ -271,6 +282,12 @@ impl BrowserClient {
                     el.dispatchEvent(new Event('input', {bubbles: true}));
                     el.dispatchEvent(new Event('change', {bubbles: true}));
                 });
+
+                // 第四步：验证表单确实可见可用（不仅仅存在于DOM中）
+                const formRect = form.getBoundingClientRect();
+                if (formRect.width === 0 && formRect.height === 0) {
+                    return false;
+                }
                 return true;
             })()"#
         ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
@@ -280,7 +297,8 @@ impl BrowserClient {
             return Ok(());
         }
 
-        // JS 重置失败才走完整导航
+        // JS 重置失败（结果页面或表单不可见），走完整导航
+        self.log_msg("JS重置不可用，执行完整页面导航");
         page.goto(&self.target_url)
             .await
             .map_err(|e| format!("导航回首页失败: {}", e))?;
@@ -309,27 +327,39 @@ impl BrowserClient {
         self.update_target(format!("{}", baominghao));
         let page = self.page.lock().await;
 
-        // 检查页面是否就绪（表单元素是否存在）
+        // 检查页面是否就绪（表单元素是否存在且可见，而非仅存在于DOM中）
         let form_ready: bool = page.evaluate_expression(
             r#"(function() {
-                return document.getElementById('zkzh') !== null && document.getElementById('sfzh') !== null;
+                const zkzh = document.getElementById('zkzh');
+                const sfzh = document.getElementById('sfzh');
+                if (!zkzh || !sfzh) return false;
+                // 额外检查：如果结果区域可见，说明页面处于结果视图，表单不可用
+                const resultEl = document.querySelector('[data-value="xm"]');
+                if (resultEl && resultEl.textContent.trim().length > 0) {
+                    const rect = resultEl.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) return false;
+                }
+                return true;
             })()"#
         ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
         if !form_ready {
-            // 表单不存在，尝试刷新页面
-            let _ = page.evaluate_expression(r#"window.location.reload()"#).await;
-            self.sleep_critical(2000).await;
+            // 表单不可用（可能处于结果页面），尝试完整导航回首页
+            self.log_msg("表单不可用，导航回首页...");
+            page.goto(&self.target_url)
+                .await
+                .map_err(|e| format!("导航回首页失败: {}", e))?;
 
-            let retry_ready: bool = page.evaluate_expression(
+            let loaded = self.poll_true(&page,
                 r#"(function() {
-                    return document.getElementById('zkzh') !== null && document.getElementById('sfzh') !== null;
-                })()"#
-            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+                    const el = document.getElementById('zkzh');
+                    return el !== null;
+                })()"#, 8000).await;
 
-            if !retry_ready {
-                return Err("页面未就绪：表单元素不存在，请检查目标网址".to_string());
+            if !loaded {
+                return Err("页面未就绪：导航回首页后表单元素仍未加载，请检查目标网址".to_string());
             }
+            self.sleep_critical(500).await;
         }
 
         fn js_fill(id: &str, val: &str) -> String {
@@ -384,10 +414,24 @@ impl BrowserClient {
                 self.update_step(BrowserStep::Error(e.clone()));
                 return Err(format!("验证码处理失败: {}", e));
             }
-            self.sleep_critical(200).await;
         }
 
+        // 等待查询结果加载（验证码通过后结果需要时间渲染）
         self.update_step(BrowserStep::ReadingResult);
+        self.perf_event("等待查询结果");
+        let result_ready = self.poll_true(&page,
+            r#"(function() {
+                const el = document.querySelector('[data-value="xm"]');
+                if (el && el.textContent.trim().length > 0) return true;
+                const m = document.getElementById('alertModal');
+                if (m && !m.classList.contains('hidden')) return true;
+                return false;
+            })()"#, 5000).await;
+
+        if !result_ready {
+            self.perf_event("总耗时");
+            return Err("查询结果加载超时".to_string());
+        }
 
         let has_error: bool = page.evaluate_expression(
             r#"(function() {
