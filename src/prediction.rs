@@ -100,10 +100,10 @@ pub async fn run_prediction(
         ));
         // 打印探针点列表（前10个和后5个）
         let display_probes: Vec<String> = if probe_suffixes.len() <= 15 {
-            probe_suffixes.iter().map(|s| format!("{}{}", base_bkh, s)).collect()
+            probe_suffixes.iter().map(|s| format!("{}{:04}", base_bkh, s)).collect()
         } else {
-            let first: Vec<String> = probe_suffixes.iter().take(10).map(|s| format!("{}{}", base_bkh, s)).collect();
-            let last: Vec<String> = probe_suffixes.iter().rev().take(5).rev().map(|s| format!("{}{}", base_bkh, s)).collect();
+            let first: Vec<String> = probe_suffixes.iter().take(10).map(|s| format!("{}{:04}", base_bkh, s)).collect();
+            let last: Vec<String> = probe_suffixes.iter().rev().take(5).rev().map(|s| format!("{}{:04}", base_bkh, s)).collect();
             let mut v = first;
             v.push("...".to_string());
             v.extend(last);
@@ -179,11 +179,11 @@ pub async fn run_prediction(
                         completed_suffixes, total_probes, probe_suffix, name
                     );
                     p.current_name = name.clone();
-                    let full = format!("{}{}", base_bkh, probe_suffix);
+                    let full = format!("{}{:04}", base_bkh, probe_suffix);
                     p.current_exam = full;
                 }
 
-                let full_exam_number = format!("{}{}", base_bkh, probe_suffix);
+                let full_exam_number = format!("{}{:04}", base_bkh, probe_suffix);
 
                 let (permit, mut client) = pool.acquire().await;
                 client.set_captcha_stats(Some(captcha_stats.clone()));
@@ -400,7 +400,7 @@ pub async fn run_prediction(
                 if current_batch_students.is_empty() { break; }
 
                 let remaining = current_batch_students.len();
-                let full_exam_number = format!("{}{}", base_bkh, current_suffix);
+                let full_exam_number = format!("{}{:04}", base_bkh, current_suffix);
 
                 // 更新进度
                 {

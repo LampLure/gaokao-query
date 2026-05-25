@@ -202,9 +202,10 @@ impl GaokaoApp {
     }
 
     /// 用后缀数字生成完整14位考号
-    /// 注意：后缀直接拼接到前缀后面，不需要补零（因为考号本身就是连续编号）
+    /// 后缀补零到4位：前缀(10位) + 后缀(4位) = 完整考号(14位)
+    /// 例如：suffix=1488 → "26421126151488"，suffix=0 → "26421126150000"
     fn make_full_bkh(suffix: u64) -> String {
-        format!("{}{}", Self::BKH_PREFIX, suffix)
+        format!("{}{:04}", Self::BKH_PREFIX, suffix)
     }
 }
 

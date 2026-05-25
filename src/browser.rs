@@ -229,10 +229,10 @@ impl BrowserClient {
             .chrome_executable(chrome_path)
             .headless_mode(HeadlessMode::False)
             .user_data_dir(&user_data_dir)
-            .arg("--disable-blink-features=AutomationControlled");
+            .arg("--disable-blink-features=AutomationControlled")
+            .arg("--window-size=400,400");
 
         if hide_browser {
-            builder = builder.arg("--window-size=1280,720");
             builder = builder.arg("--window-position=-32000,-32000");
             builder = builder.arg("--start-minimized");
         }
