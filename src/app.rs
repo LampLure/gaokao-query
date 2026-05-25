@@ -176,7 +176,8 @@ impl GaokaoApp {
     // ---- class grouping helper ----
     fn extract_grade_class(org: &str) -> Option<(String, String, String)> {
         let parts: Vec<&str> = org.split('-').collect();
-        if parts.len() >= 6 {
+        // 修复 Bug 1: 访问 parts[6] 需要至少 7 个元素 (索引 0-6)
+        if parts.len() >= 7 {
             let grade = parts[4].to_string();
             let class_name = parts[6].to_string();
             let full_grade = parts[3].to_string();
@@ -1238,6 +1239,10 @@ impl GaokaoApp {
                     .collect();
 
                 if students.is_empty() {
+                    // 修复 Bug 6: 学生列表为空时给出提示
+                    let mut l = logs.lock().await;
+                    l.push(format!("[警告] 班级 {} 无匹配学生（入学年份或组织格式不匹配），跳过", cls_name));
+                    drop(l);
                     if continuous && current_class_idx > 0 {
                         current_class_idx -= 1;
                         continue;
@@ -1271,6 +1276,14 @@ impl GaokaoApp {
                     let probe_1 = current_radar_base.saturating_sub(1);
                     let probe_2 = current_radar_base.saturating_sub(1 + radar_step);
                     let probe_3 = current_radar_base.saturating_sub(1 + radar_step * 2);
+                    
+                    // 修复 Bug 9: 所有探针都为 0 说明已经到底，无意义继续
+                    if probe_1 == 0 && probe_2 == 0 && probe_3 == 0 {
+                        let mut l = logs.lock().await;
+                        l.push(format!("[中断] 雷达探针全部归零，考号空间已耗尽"));
+                        break;
+                    }
+                    
                     let next_radar_base = current_radar_base.saturating_sub(radar_step * 3);
 
                     let probes = vec![(probe_1, 1), (probe_2, 2), (probe_3, 3)];
