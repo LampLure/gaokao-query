@@ -1432,13 +1432,16 @@ impl GaokaoApp {
             }
 
             // 取全年级（指定入学年份）的所有学生
-            let students: Vec<(String, String)> = all_sfz_records.iter()
+            let mut students: Vec<(String, String)> = all_sfz_records.iter()
                 .filter(|r| {
                     let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
                     ruxue == target_year
                 })
                 .map(|r| (r.name.clone(), r.shenfenzheng.clone()))
                 .collect();
+
+            // 扫描从大号往小号，学生也倒序排列（17班在前，1班在后），命中率更高
+            students.reverse();
 
             if students.is_empty() {
                 let mut l = logs.lock().await;
