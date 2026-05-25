@@ -174,7 +174,7 @@ impl BrowserClient {
         }
 
         if !page_ready {
-            return Err("页面加载超时：未找到表单元素 (zkzh)，请检查目标网址是否正确".to_string());
+            return Err("页面加载超时：未找到表单元素(zkzh)，请检查目标网址是否正确".to_string());
         }
 
         let now = std::time::Instant::now();
@@ -209,6 +209,7 @@ impl BrowserClient {
         if !loaded {
             return Err("导航回首页超时：表单元素未加载".to_string());
         }
+
         self.perf_event("导航回首页");
         Ok(())
     }
@@ -221,6 +222,29 @@ impl BrowserClient {
         self.perf_event("开始查询");
         let page = self.page.lock().await;
 
+        // 检查页面是否就绪（表单元素是否存在）
+        let form_ready: bool = page.evaluate_expression(
+            r#"(function() {
+                return document.getElementById('zkzh') !== null && document.getElementById('sfzh') !== null;
+            })()"#
+        ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+
+        if !form_ready {
+            // 表单不存在，尝试刷新页面
+            let _ = page.evaluate_expression(r#"window.location.reload()"#).await;
+            self.sleep_critical(2000).await;
+
+            let retry_ready: bool = page.evaluate_expression(
+                r#"(function() {
+                    return document.getElementById('zkzh') !== null && document.getElementById('sfzh') !== null;
+                })()"#
+            ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
+
+            if !retry_ready {
+                return Err("页面未就绪：表单元素不存在，请检查目标网址".to_string());
+            }
+        }
+
         fn js_fill(id: &str, val: &str) -> String {
             format!(
                 "(function(){{const el=document.getElementById('{}');if(!el)return'no_{}';const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;setter.call(el,'{}');el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));return'ok';}})()",
@@ -231,10 +255,16 @@ impl BrowserClient {
         let fill_result: String = page.evaluate_expression(js_fill("zkzh", baominghao))
             .await.map_err(|e| format!("填报名号失败: {}", e))?
             .into_value().map_err(|_| "填报名号返回值解析失败".to_string())?;
+        if fill_result != "ok" {
+            return Err("报名号输入框未找到(zkzh)，页面可能未正确加载".to_string());
+        }
 
         let fill_result: String = page.evaluate_expression(js_fill("sfzh", shenfenzheng))
             .await.map_err(|e| format!("填身份证号失败: {}", e))?
             .into_value().map_err(|_| "填身份证返回值解析失败".to_string())?;
+        if fill_result != "ok" {
+            return Err("身份证输入框未找到(sfzh)，页面可能未正确加载".to_string());
+        }
 
         self.sleep_step(0.5).await;
         self.perf_event("填写信息完成");
@@ -376,40 +406,28 @@ impl BrowserClient {
             }
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
 
-            // Poll for captcha image (15s timeout), fetch via JS immediately when ready
+            // Poll for captcha image (10s timeout), 用 canvas 方式获取（最可靠，不阻塞主线程）
             let img_src: String = {
                 let interval = if self.turbo { 50u64 } else { 200u64 };
-                let attempts = (15000 / interval).max(10);
+                let attempts = (10000 / interval).max(10);
                 let mut last = String::new();
                 for _ in 0..attempts {
                     let src: String = page.evaluate_expression(
                         r#"(function() {
                             const img = document.getElementById('captchaImage');
-                            if (!img) return '';
-                            const loaded = img.complete && img.naturalWidth > 0;
+                            if (!img || !img.complete || img.naturalWidth === 0) return '';
+                            // 优先直接 src（base64 内嵌图片）
                             const s = img.getAttribute('src') || '';
                             if (s && !s.includes('svg+xml') && s.length > 100) return s;
-                            if (loaded && s && s.startsWith('http')) {
-                                try {
-                                    const xhr = new XMLHttpRequest();
-                                    xhr.open('GET', s, false);
-                                    xhr.responseType = 'blob';
-                                    xhr.send();
-                                    const reader = new FileReaderSync();
-                                    return reader.readAsDataURL(xhr.response);
-                                } catch(e) {}
-                            }
-                            if (loaded) {
-                                try {
-                                    const c = document.createElement('canvas');
-                                    c.width = img.naturalWidth;
-                                    c.height = img.naturalHeight;
-                                    const ctx = c.getContext('2d');
-                                    ctx.drawImage(img, 0, 0);
-                                    return c.toDataURL('image/png');
-                                } catch(e) {}
-                            }
-                            return '';
+                            // canvas 转换（最可靠，不阻塞主线程）
+                            try {
+                                const c = document.createElement('canvas');
+                                c.width = img.naturalWidth;
+                                c.height = img.naturalHeight;
+                                const ctx = c.getContext('2d');
+                                ctx.drawImage(img, 0, 0);
+                                return c.toDataURL('image/png');
+                            } catch(e) { return ''; }
                         })()"#
                     ).await.map_err(|e| format!("获取验证码失败: {}", e))?
                         .into_value().unwrap_or_default();
@@ -498,35 +516,37 @@ impl BrowserClient {
                 }
             }
 
-            // Click points
+            // Click points — 合并为1次JS调用，用setTimeout错开点击，减少等待时间
             self.perf_event("验证码点击开始");
-            for point in &ocr_result.points {
-                let click_js = format!(
-                    r#"(function() {{
-                        const container = document.getElementById('captchaContainer');
-                        if (!container) return 'no_container';
-                        const rect = container.getBoundingClientRect();
-                        const x = rect.left + {};
-                        const y = rect.top + {};
-                        container.dispatchEvent(new MouseEvent('click', {{
-                            clientX: x, clientY: y, bubbles: true, cancelable: true
-                        }}));
-                        return 'clicked';
-                    }})()"#,
-                    point.x * cw, point.y * ch
-                );
-                let _ = page.evaluate_expression(&click_js).await;
-                self.sleep_step(0.3).await;
-            }
+            let clicks_js = format!(
+                r#"(function() {{
+                    const container = document.getElementById('captchaContainer');
+                    if (!container) return 'no_container';
+                    const rect = container.getBoundingClientRect();
+                    const points = [{}];
+                    points.forEach(([rx, ry], i) => {{
+                        setTimeout(() => {{
+                            const x = rect.left + rx;
+                            const y = rect.top + ry;
+                            container.dispatchEvent(new MouseEvent('click', {{
+                                clientX: x, clientY: y, bubbles: true, cancelable: true
+                            }}));
+                        }}, i * 150);
+                    }});
+                    return 'clicked_all';
+                }})()"#,
+                ocr_result.points.iter()
+                    .map(|p| format!("[{}, {}]", p.x * cw, p.y * ch))
+                    .collect::<Vec<_>>().join(", ")
+            );
+            let _ = page.evaluate_expression(&clicks_js).await;
+            self.sleep_critical(500).await;
 
-            // Poll for verification result (200ms interval, server usually responds in 0.5-2s)
+            // Poll for verification result — 自适应轮询：前5次100ms快速检测，之后200ms
             self.perf_event("验证码点击完成");
-            // Wait at least 2s total (matching original 2s blind sleep)
-            // but with polling so early success is detected faster
-            let interval = if self.turbo { 100u64 } else { 200u64 };
-            let max_polls = (2000 / interval).max(5);
+            let max_polls = 30; // 最多3秒
             let mut still_visible = true;
-            for _ in 0..max_polls {
+            for i in 0..max_polls {
                 let r: bool = page.evaluate_expression(
                     r#"(function() {
                         const m = document.getElementById('captchaModal');
@@ -537,7 +557,7 @@ impl BrowserClient {
                     still_visible = false;
                     break;
                 }
-                self.sleep_critical(interval).await;
+                self.sleep_critical(if i < 5 { 100 } else { 200 }).await;
             }
 
             if !still_visible {

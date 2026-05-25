@@ -17,11 +17,114 @@ fn python_path() -> PathBuf {
     if venv.exists() { venv } else { PathBuf::from("python3") }
 }
 
+/// OCR 服务端口，每个浏览器实例对应一个端口（instance_id + 19999）
+fn ocr_port(instance_id: u64) -> u16 {
+    19999 + (instance_id % 10) as u16
+}
+
+/// ────────────────────────────────────────────────────────
+/// 优先使用常驻 OCR HTTP 服务（模型只加载一次，0.3-0.8s/次）
+/// 如果服务不可用，自动降级为子进程模式（兼容旧流程）
+/// ────────────────────────────────────────────────────────
 pub async fn solve_captcha(
     image_path: &str,
     expected_chars: &[String],
     _container_width: f64,
     _container_height: f64,
+    instance_id: u64,
+) -> Result<OcrResult, String> {
+    // 读取图片并 base64 编码
+    let img_bytes = std::fs::read(image_path)
+        .map_err(|e| format!("读取验证码图片失败: {}", e))?;
+    use base64::Engine;
+    let img_b64 = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+
+    let port = ocr_port(instance_id);
+
+    // 优先尝试 HTTP 常驻服务
+    match try_http_ocr(&img_b64, expected_chars, port).await {
+        Ok(result) => return Ok(result),
+        Err(e) => {
+            // HTTP 服务不可用，降级到子进程模式
+            eprintln!("[OCR] HTTP服务不可用(port {}): {}，降级到子进程模式", port, e);
+        }
+    }
+
+    // 子进程兜底（原有逻辑）
+    solve_captcha_subprocess(image_path, expected_chars, instance_id).await
+}
+
+/// HTTP 常驻 OCR 服务调用
+async fn try_http_ocr(
+    img_b64: &str,
+    expected_chars: &[String],
+    port: u16,
+) -> Result<OcrResult, String> {
+    let body = serde_json::json!({
+        "image": img_b64,
+        "expected_chars": expected_chars,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("HTTP客户端创建失败: {}", e))?;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.post(format!("http://127.0.0.1:{}/", port))
+            .json(&body)
+            .send(),
+    ).await
+        .map_err(|_| "OCR HTTP服务请求超时（15秒）".to_string())?
+        .map_err(|e| format!("OCR HTTP服务请求失败: {}", e))?;
+
+    if !result.status().is_success() {
+        return Err(format!("OCR HTTP服务返回错误状态: {}", result.status()));
+    }
+
+    let resp: serde_json::Value = result.json().await
+        .map_err(|e| format!("OCR HTTP服务响应解析失败: {}", e))?;
+
+    let points_json = resp.get("points")
+        .ok_or_else(|| "OCR服务返回缺少 points 字段".to_string())?
+        .as_array()
+        .ok_or_else(|| "points 不是数组".to_string())?;
+
+    let mut points = Vec::new();
+    for p in points_json {
+        // 支持两种格式：[x, y] 数组 或 {"x":..., "y":...} 对象
+        if let Some(arr) = p.as_array() {
+            let x = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let y = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.5);
+            points.push(ClickPoint { x, y });
+        } else {
+            let x = p.get("x").and_then(|v| v.as_f64()).unwrap_or(0.5);
+            let y = p.get("y").and_then(|v| v.as_f64()).unwrap_or(0.5);
+            points.push(ClickPoint { x, y });
+        }
+    }
+
+    if points.len() != expected_chars.len() {
+        return Err(format!(
+            "OCR 返回点数({})与期望字符数({})不匹配",
+            points.len(), expected_chars.len()
+        ));
+    }
+
+    let strategy = resp.get("strategy").and_then(|v| v.as_str()).unwrap_or("http");
+    let debug = resp.get("debug").and_then(|v| v.as_str()).unwrap_or("OK");
+
+    Ok(OcrResult {
+        points,
+        debug_info: format!("[OCR HTTP] strategy={}, {}", strategy, debug),
+    })
+}
+
+/// 子进程模式（原有逻辑，作为降级方案保留）
+async fn solve_captcha_subprocess(
+    image_path: &str,
+    expected_chars: &[String],
     instance_id: u64,
 ) -> Result<OcrResult, String> {
     let expected = expected_chars.join(" ");
@@ -46,14 +149,13 @@ pub async fn solve_captcha(
         return Err(format!("OCR 失败：{}", stderr));
     }
 
-    // --- 🟢 重新定义支持汉字语义绑定的 OCR 识别块结构 ---
+    // --- 支持汉字语义绑定的 OCR 识别块结构 ---
     struct DetBlock {
         x: f64,
         y: f64,
         text: String,
     }
 
-    // 1. 精准解析 Python 传回的结构（支持行格式：x,y,text）
     let mut det_blocks: Vec<DetBlock> = Vec::new();
     let mut fallback_points: Vec<ClickPoint> = Vec::new();
 
@@ -63,7 +165,6 @@ pub async fn solve_captcha(
             let x: f64 = match parts[0].parse() { Ok(v) => v, Err(_) => continue };
             let y: f64 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
             
-            // 如果 Python 端传回了第三个参数汉字，做精准配对
             let text = if parts.len() >= 3 { parts[2].trim().to_string() } else { String::new() };
             
             det_blocks.push(DetBlock { x, y, text: text.clone() });
@@ -75,7 +176,6 @@ pub async fn solve_captcha(
     let mut debug_info = stderr.clone();
     debug_info.push_str("\n[OCR 语义重排流开始]\n");
 
-    // 2. 根据提示词要求的标准点击顺序（如：["育", "校", "究"]），重新编排坐标映射
     for (step, target_char) in expected_chars.iter().enumerate() {
         let mut found_match = false;
         
@@ -91,7 +191,6 @@ pub async fn solve_captcha(
             }
         }
 
-        // 3. 兜底策略：如果因为噪点完全没认出来这个字，降级为原生的物理顺序，防止流中断
         if !found_match {
             if let Some(fb_point) = fallback_points.get(step) {
                 final_click_points.push(ClickPoint { x: fb_point.x, y: fb_point.y });

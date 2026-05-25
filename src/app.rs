@@ -1286,8 +1286,15 @@ impl GaokaoApp {
                     
                     let next_radar_base = current_radar_base.saturating_sub(radar_step * 3);
 
+                    // 所有探针都为0说明已经到底，无意义继续
+                    if probe_1 == 0 && probe_2 == 0 && probe_3 == 0 {
+                        let mut l = logs.lock().await;
+                        l.push(format!("[中断] 雷达探针全部归零，考号空间已耗尽"));
+                        break;
+                    }
+
                     let probes = vec![(probe_1, 1), (probe_2, 2), (probe_3, 3)];
-                    
+
                     {
                         let mut p = pred_progress.lock().await;
                         p.current_batch = format!("[雷达阶段] 步长：{}, 发射分布式探针号：[{}, {}, {}]", radar_step, probe_1, probe_2, probe_3);
