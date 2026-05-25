@@ -312,6 +312,29 @@ impl BrowserClient {
 
     pub async fn go_home(&self) -> Result<(), String> {
         self.update_step(BrowserStep::GoingHome);
+
+        // go_home 整体加超时保护，防止卡死导致浏览器池耗尽
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            self.go_home_inner()
+        ).await;
+
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                self.log_msg("go_home超时(20s)，强制刷新页面");
+                // 超时后强制刷新页面作为补救
+                let page = self.page.lock().await;
+                let _ = page.evaluate_expression(r#"window.location.reload()"#).await;
+                drop(page);
+                // 给页面一点加载时间
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn go_home_inner(&self) -> Result<(), String> {
         let page = self.page.lock().await;
 
         // 检测当前页面状态
@@ -356,9 +379,18 @@ impl BrowserClient {
 
         // 非 form 状态（结果页面、验证码页面等），走完整导航
         self.log_msg(&format!("页面状态为[{}]，执行完整页面导航", page_state));
-        page.goto(&self.target_url)
-            .await
-            .map_err(|e| format!("导航回首页失败: {}", e))?;
+
+        // goto 加超时保护
+        let goto_result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            page.goto(&self.target_url)
+        ).await;
+
+        match goto_result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(format!("导航回首页失败: {}", e)),
+            Err(_) => return Err("导航回首页超时(15秒)".to_string()),
+        }
 
         let loaded = self.poll_true(&page,
             r#"(function() {
@@ -384,18 +416,51 @@ impl BrowserClient {
         self.update_step(BrowserStep::CheckingPage);
         self.update_name(name.to_string());
         self.update_target(baominghao.to_string());
+
+        // 用 tokio::timeout 包裹整个查询，防止卡死
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            self.query_single_inner(baominghao, shenfenzheng, name)
+        ).await;
+
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                self.update_step(BrowserStep::Error("查询超时(120s)".to_string()));
+                Err("查询超时(120秒)，浏览器可能无响应".to_string())
+            }
+        }
+    }
+
+    async fn query_single_inner(
+        &self,
+        baominghao: &str,
+        shenfenzheng: &str,
+        name: &str,
+    ) -> Result<QueryResult, String> {
         let page = self.page.lock().await;
 
         // 检查页面是否处于表单状态（只有form状态才能填写和提交）
         let page_state: String = page.evaluate_expression(JS_PAGE_STATE)
             .await.map(|r| r.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
 
+        self.log_msg(&format!("[{}] 页面状态=[{}], 开始填表 报考号={} 身份证={}...", name, page_state, baominghao, &shenfenzheng[..shenfenzheng.len().min(6)]));
+
         if page_state != "form" {
             // 非表单状态（结果页面、验证码页面等），导航回首页
             self.log_msg(&format!("页面状态为[{}]，导航回首页...", page_state));
-            page.goto(&self.target_url)
-                .await
-                .map_err(|e| format!("导航回首页失败: {}", e))?;
+
+            // goto 加超时保护
+            let goto_result = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                page.goto(&self.target_url)
+            ).await;
+
+            match goto_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(format!("导航回首页失败: {}", e)),
+                Err(_) => return Err("导航回首页超时(15秒)".to_string()),
+            }
 
             let loaded = self.poll_true(&page,
                 r#"(function() {
@@ -975,14 +1040,15 @@ impl BrowserPool {
     pub fn release(self: &Arc<Self>, permit: OwnedSemaphorePermit, client: BrowserClient) {
         let this = self.clone();
         tokio::spawn(async move {
+            // go_home 加了超时保护，不会无限卡住
             if let Err(_e) = client.go_home().await {
-                // go_home 失败，完整刷新页面作为补救
+                // go_home 失败，强制刷新页面
                 let page = client.page.lock().await;
                 let _ = page.evaluate_expression(
                     r#"window.location.reload()"#
                 ).await;
                 drop(page);
-                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
             }
             // 重置状态为空闲
             if let Some(st) = &client.status {

@@ -69,6 +69,8 @@ pub struct GaokaoApp {
     displayed_browser_statuses: Vec<BrowserStatus>,
     // cancellation
     cancel_flag: Arc<Mutex<bool>>,
+    // prediction completion signal
+    pred_done: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -128,6 +130,7 @@ impl GaokaoApp {
             browser_statuses: Arc::new(Mutex::new(Vec::new())),
             displayed_browser_statuses: Vec::new(),
             cancel_flag: Arc::new(Mutex::new(false)),
+            pred_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
             app.parse_and_match();
@@ -194,6 +197,13 @@ impl GaokaoApp {
 
 impl eframe::App for GaokaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 检查推算任务是否完成
+        if self.pred_state == QueryState::Running && self.pred_done.load(std::sync::atomic::Ordering::Relaxed) {
+            self.pred_state = QueryState::Idle;
+            self.pred_done.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.status_message = "推算任务已完成".to_string();
+        }
+
         // sync results
         if let Ok(r) = self.results.try_lock() {
             if r.len() != self.displayed_results.len() {
@@ -1390,6 +1400,7 @@ impl GaokaoApp {
         let pred_progress = self.pred_progress.clone();
         let captcha_stats = self.captcha_stats.clone();
         let browser_statuses = self.browser_statuses.clone();
+        let pred_done = self.pred_done.clone();
 
         // 全年级所有学生
         let all_sfz_records = self.pred_sfz_records.clone();
@@ -1407,6 +1418,7 @@ impl GaokaoApp {
                 Err(e) => {
                     let mut l = logs.lock().await;
                     l.push(format!("[ERROR] 浏览器池启动失败：{}", e));
+                    pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
             };
@@ -1446,6 +1458,7 @@ impl GaokaoApp {
             if students.is_empty() {
                 let mut l = logs.lock().await;
                 l.push(format!("[警告] 入学年份 {} 无匹配学生，终止", target_year));
+                pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
 
@@ -1477,7 +1490,10 @@ impl GaokaoApp {
             }
 
             let mut l = logs.lock().await;
-            l.push(format!("🏁 所有的自动化可预测盲推流程全部收工。"));
+            l.push(format!("🏁 推算任务已完成。"));
+
+            // 通知主线程任务结束
+            pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }
 

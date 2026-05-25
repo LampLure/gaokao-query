@@ -169,40 +169,50 @@ pub async fn run_prediction(
 
                     pool.release(permit, client);
 
-                    if let Ok(res) = result {
-                        if res.name == *name {
-                            // 命中！从活跃池移除
-                            {
-                                let mut active = active_students.lock().await;
-                                active.retain(|(_, s)| s != sfz);
-                            }
+                    match &result {
+                        Ok(res) => {
+                            if res.name == *name {
+                                // 命中！从活跃池移除
+                                {
+                                    let mut active = active_students.lock().await;
+                                    active.retain(|(_, s)| s != sfz);
+                                }
 
-                            // 写入匹配记录
-                            {
-                                let mut r_lock = resolved_records.lock().await;
-                                r_lock.push(PredictedRecord {
-                                    name: name.clone(),
-                                    shenfenzheng: sfz.clone(),
-                                    exam_number: full_exam_number.clone(),
-                                    status: PredictedStatus::Matched,
-                                });
-                            }
+                                // 写入匹配记录
+                                {
+                                    let mut r_lock = resolved_records.lock().await;
+                                    r_lock.push(PredictedRecord {
+                                        name: name.clone(),
+                                        shenfenzheng: sfz.clone(),
+                                        exam_number: full_exam_number.clone(),
+                                        status: PredictedStatus::Matched,
+                                    });
+                                }
 
-                            // 更新进度
-                            {
-                                let mut p = progress.lock().await;
-                                p.matched += 1;
-                                p.current_name = name.clone();
-                            }
+                                // 更新进度
+                                {
+                                    let mut p = progress.lock().await;
+                                    p.matched += 1;
+                                    p.current_name = name.clone();
+                                }
 
+                                let mut l = logs.lock().await;
+                                l.push(format!(
+                                    "✅ [命中] 工人#{} 考号 {} 命中！学生：{}",
+                                    worker_id, current_number, name
+                                ));
+
+                                // 一个号码最多匹配一个学生，命中后立即换下一个号码
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            // 查询失败，记录日志继续下一个学生
                             let mut l = logs.lock().await;
                             l.push(format!(
-                                "✅ [命中] 工人#{} 考号 {} 命中！学生：{}",
-                                worker_id, current_number, name
+                                "⚠️ [未命中] 工人#{} 考号 {} 学生 {} 失败: {}",
+                                worker_id, current_number, name, e
                             ));
-
-                            // 一个号码最多匹配一个学生，命中后立即换下一个号码
-                            break;
                         }
                     }
                 }
