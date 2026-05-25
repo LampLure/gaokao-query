@@ -179,6 +179,33 @@ impl GaokaoApp {
             .filter(|r| r.ruxue_year.unwrap_or(0.0) as u32 == year)
             .count()
     }
+
+    /// 考号前缀（10位），完整考号为14位：前缀(10) + 后缀(4)
+    const BKH_PREFIX: &'static str = "2642112615";
+
+    /// 从用户输入或报考号中提取后缀数字
+    /// 支持两种输入格式：
+    ///   - 完整14位考号如 "26421126151488" → 提取后缀 1488
+    ///   - 仅后缀如 "1488" → 直接解析为 1488
+    fn extract_bkh_suffix(input: &str) -> u64 {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return 0;
+        }
+        // 如果以已知前缀开头，提取前缀之后的部分作为后缀
+        if trimmed.starts_with(Self::BKH_PREFIX) {
+            let suffix_str = &trimmed[Self::BKH_PREFIX.len()..];
+            return suffix_str.parse::<u64>().unwrap_or(0);
+        }
+        // 否则直接当作后缀解析
+        trimmed.parse::<u64>().unwrap_or(0)
+    }
+
+    /// 用后缀数字生成完整14位考号
+    /// 注意：后缀直接拼接到前缀后面，不需要补零（因为考号本身就是连续编号）
+    fn make_full_bkh(suffix: u64) -> String {
+        format!("{}{}", Self::BKH_PREFIX, suffix)
+    }
 }
 
 impl eframe::App for GaokaoApp {
@@ -831,7 +858,7 @@ impl GaokaoApp {
                             // 自动计算锚点：寻找最大串号群的第一个号
                             if !self.pred_known_bkh.is_empty() {
                                 let mut sorted_bkh: Vec<u64> = self.pred_known_bkh.iter()
-                                    .filter_map(|r| r.baominghao.split("261").last()?.parse::<u64>().ok())
+                                    .filter_map(|r| Some(Self::extract_bkh_suffix(&r.baominghao)).filter(|&v| v > 0))
                                     .collect();
                                 sorted_bkh.sort();
 
@@ -859,8 +886,8 @@ impl GaokaoApp {
 
                                 if let Some(&first_bkh) = max_group.first() {
                                     self.pred_boundary = first_bkh;
-                                    self.pred_boundary_str = first_bkh.to_string();
-                                    self.log(format!("【算法启动】成功识别最大串号群（共{}人），锁定首个账号尾数 {} 为雷达启动锚点", max_group.len(), first_bkh));
+                                    self.pred_boundary_str = Self::make_full_bkh(first_bkh);
+                                    self.log(format!("【算法启动】成功识别最大串号群（共{}人），锁定锚点考号 {} 为雷达启动点", max_group.len(), Self::make_full_bkh(first_bkh)));
                                 }
                             }
                             
@@ -916,45 +943,49 @@ impl GaokaoApp {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("锚点考号后缀：");
+                ui.label("已知考号：");
                 let response = ui.add_sized(
-                    [120.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.pred_boundary_str).hint_text("如 1493"),
+                    [180.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.pred_boundary_str).hint_text("如 26421126151488 或 1488"),
                 );
                 if response.changed() {
-                    self.pred_boundary = self.pred_boundary_str.parse().unwrap_or(0);
+                    self.pred_boundary = Self::extract_bkh_suffix(&self.pred_boundary_str);
                     self.config_dirty = true;
                 }
                 if self.pred_boundary > 0 {
                     ui.label(egui::RichText::new(format!(
-                        "完整考号示例：2642112615{}",
-                        self.pred_boundary
+                        "完整考号：{}",
+                        Self::make_full_bkh(self.pred_boundary)
                     )).color(egui::Color32::LIGHT_BLUE));
                 } else {
-                    ui.label(egui::RichText::new("请输入已知考号的末位数字").color(egui::Color32::YELLOW));
+                    ui.label(egui::RichText::new("请输入已知的考号").color(egui::Color32::YELLOW));
                 }
             });
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("扫描上限后缀：");
+                ui.label("扫描上限考号：");
                 let response = ui.add_sized(
-                    [120.0, 20.0],
+                    [180.0, 20.0],
                     egui::TextEdit::singleline(&mut self.pred_scan_high_str).hint_text("留空=锚点"),
                 );
                 if response.changed() {
-                    self.pred_scan_high = self.pred_scan_high_str.parse().unwrap_or(0);
+                    self.pred_scan_high = Self::extract_bkh_suffix(&self.pred_scan_high_str);
                     self.config_dirty = true;
                 }
                 let effective_high = if self.pred_scan_high > 0 { self.pred_scan_high } else { self.pred_boundary };
                 if self.pred_boundary > 0 && effective_high > 0 {
                     let year_count = self.count_students_for_year(self.pred_year_filter as u32);
                     ui.label(egui::RichText::new(format!(
-                        "扫描范围：2642112615{} ~ 2642112615{} (约{}人)",
-                        0, effective_high, year_count
+                        "扫描范围：{} ~ {} (约{}人)",
+                        Self::make_full_bkh(0), Self::make_full_bkh(effective_high), year_count
                     )).color(egui::Color32::LIGHT_BLUE));
+                    ui.label(egui::RichText::new(format!(
+                        "(后缀 0 ~ {})",
+                        effective_high
+                    )).color(egui::Color32::GRAY));
                 } else {
-                    ui.label(egui::RichText::new("超过锚点的后缀范围").color(egui::Color32::GRAY));
+                    ui.label(egui::RichText::new("超过锚点的考号范围").color(egui::Color32::GRAY));
                 }
             });
 
@@ -996,7 +1027,7 @@ impl GaokaoApp {
                             self.start_prediction(ctx);
                         }
                     } else {
-                        ui.button(egui::RichText::new("▶ 请先输入锚点").heading().color(egui::Color32::GRAY));
+                        let _ = ui.button(egui::RichText::new("▶ 请先输入锚点").heading().color(egui::Color32::GRAY));
                     }
                 }
                 if self.pred_state == QueryState::Running {
@@ -1372,7 +1403,7 @@ impl GaokaoApp {
         self.pred_displayed_results.clear();
         *self.cancel_flag.try_lock().unwrap() = false;
 
-        let base_bkh = "2642112615".to_string();
+        let base_bkh = Self::BKH_PREFIX.to_string();
         let concurrency = self.concurrency as usize;
         let hide_browser = self.hide_browser;
         let step_delay = self.step_delay_ms as u64;
