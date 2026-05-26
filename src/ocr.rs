@@ -94,6 +94,58 @@ fn clear_port_failure(port: u16) {
     failed.retain(|i| i.port != port);
 }
 
+/// 杀死占用指定端口的进程（Linux/WSL 兼容）
+async fn kill_port_occupant(port: u16) {
+    // 使用 ss 命令查找占用端口的进程 PID
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ss -tlnp 'sport = :{}' 2>/dev/null | grep -oP 'pid=\\K[0-9]+' | head -1", port))
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !stdout.is_empty() {
+                if let Ok(pid) = stdout.parse::<u32>() {
+                    eprintln!("[OCR] 端口 {} 被进程 PID={} 占用，正在终止...", port, pid);
+                    // 先尝试 SIGTERM（优雅退出）
+                    let _ = Command::new("kill")
+                        .arg("-15")
+                        .arg(pid.to_string())
+                        .output()
+                        .await;
+                    // 等待进程退出
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // 检查是否还在，如果还在就 SIGKILL
+                    let check = Command::new("kill")
+                        .arg("-0")
+                        .arg(pid.to_string())
+                        .output()
+                        .await;
+                    if check.map(|c| c.status.success()).unwrap_or(false) {
+                        eprintln!("[OCR] 进程 PID={} 未响应 SIGTERM，发送 SIGKILL", pid);
+                        let _ = Command::new("kill")
+                            .arg("-9")
+                            .arg(pid.to_string())
+                            .output()
+                            .await;
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    eprintln!("[OCR] ✓ 旧进程已清理 (port {})", port);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[OCR] 查找端口占用进程失败: {}", e);
+        }
+    }
+
+    // 清理旧的就绪文件
+    let ready_path = ready_file_path(port);
+    let _ = std::fs::remove_file(&ready_path);
+}
+
 /// 自动启动 OCR HTTP 服务（如果未运行）
 async fn ensure_ocr_server(port: u16) {
     // 检查是否可以重试（指数退避）
@@ -122,8 +174,11 @@ async fn ensure_ocr_server(port: u16) {
         return;
     }
 
-    // 服务未运行，尝试启动
-    eprintln!("[OCR] HTTP服务未运行(port {})，正在自动启动...", port);
+    // 服务未运行，先杀死占用端口的旧进程（防止端口冲突）
+    eprintln!("[OCR] HTTP服务未运行(port {})，先清理端口占用...", port);
+    kill_port_occupant(port).await;
+
+    eprintln!("[OCR] 正在启动 OCR HTTP 服务 (port {})...", port);
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ocr_server.py");
     if !script.exists() {
         eprintln!("[OCR] ocr_server.py 不存在，跳过自动启动");
@@ -139,9 +194,11 @@ async fn ensure_ocr_server(port: u16) {
 
     // 关键修复：不抑制 stderr！让 Python 的错误信息可见
     // stdout 可以静默（Python print 输出），但 stderr 必须透传
+    // 同时为 AMD RDNA2 GPU 设置 ROCm 兼容环境变量
     let child = Command::new(&py)
         .arg(&script)
         .arg(port.to_string())
+        .env("HSA_OVERRIDE_GFX_VERSION", "10.3.0")  // AMD RDNA2 GPU ROCm 兼容
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())  // 让 Python 错误信息可见
         .spawn();

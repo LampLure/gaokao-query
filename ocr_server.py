@@ -42,20 +42,54 @@ def load_models():
         print("[OCR Server] ❌ Pillow 未安装！请运行: pip install Pillow", flush=True)
         return False
 
-    # 自动检测GPU可用性
+    # 自动检测GPU可用性（支持 NVIDIA CUDA / AMD ROCm / DirectML）
     use_gpu = False
+    gpu_provider = None
     try:
         import onnxruntime as ort
         providers = ort.get_available_providers()
+        print(f"[OCR Server] 可用 providers: {providers}", flush=True)
+
+        # 优先级：CUDA > ROCm/MIGraphX > DirectML > CPU
         if 'CUDAExecutionProvider' in providers:
+            gpu_provider = 'CUDAExecutionProvider'
             use_gpu = True
-            print(f"[OCR Server] 🚀 检测到CUDA GPU，启用GPU加速 (providers: {providers})", flush=True)
+            print(f"[OCR Server] 🚀 检测到 NVIDIA CUDA GPU，启用GPU加速", flush=True)
+        elif 'MIGraphXExecutionProvider' in providers:
+            gpu_provider = 'MIGraphXExecutionProvider'
+            use_gpu = True
+            print(f"[OCR Server] 🚀 检测到 AMD ROCm (MIGraphX)，启用GPU加速", flush=True)
+        elif 'ROCMExecutionProvider' in providers:
+            gpu_provider = 'ROCMExecutionProvider'
+            use_gpu = True
+            print(f"[OCR Server] 🚀 检测到 AMD ROCm，启用GPU加速", flush=True)
+        elif 'DmlExecutionProvider' in providers:
+            gpu_provider = 'DmlExecutionProvider'
+            use_gpu = True
+            print(f"[OCR Server] 🚀 检测到 DirectML (Windows GPU)，启用GPU加速", flush=True)
         else:
+            # 尝试检测 AMD GPU 并给出安装指引
+            _check_amd_gpu_hint()
             print(f"[OCR Server] GPU不可用，使用CPU模式 (providers: {providers})", flush=True)
     except ImportError:
         print("[OCR Server] onnxruntime未安装，使用CPU模式", flush=True)
 
     try:
+        # 为 AMD GPU 设置 ONNX Runtime session options
+        session_options = None
+        if use_gpu and gpu_provider:
+            try:
+                import onnxruntime as ort
+                so = ort.SessionOptions()
+                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                so.intra_op_num_threads = 4  # 限制CPU线程数，GPU为主
+                so.inter_op_num_threads = 2
+                session_options = so
+                print(f"[OCR Server] ONNX Runtime session 优化已启用 (provider: {gpu_provider})", flush=True)
+            except Exception as e:
+                print(f"[OCR Server] ⚠️ session options 设置失败: {e}", flush=True)
+                session_options = None
+
         print("[OCR Server] 正在加载检测模型(beta)...", flush=True)
         det_beta = ddddocr.DdddOcr(det=True, beta=True, show_ad=False, use_gpu=use_gpu)
         print("[OCR Server] 正在加载检测模型(default)...", flush=True)
@@ -64,7 +98,7 @@ def load_models():
         ocr_beta = ddddocr.DdddOcr(beta=True, show_ad=False, use_gpu=use_gpu)
         print("[OCR Server] 正在加载识别模型(default)...", flush=True)
         ocr_default = ddddocr.DdddOcr(show_ad=False, use_gpu=use_gpu)
-        mode_str = "GPU" if use_gpu else "CPU"
+        mode_str = f"GPU({gpu_provider})" if use_gpu and gpu_provider else ("GPU" if use_gpu else "CPU")
         print(f"[OCR Server] ✓ 所有模型加载完成 (模式: {mode_str})", flush=True)
         MODELS_LOADED = True
         return True
@@ -73,6 +107,50 @@ def load_models():
         import traceback
         traceback.print_exc()
         return False
+
+def _check_amd_gpu_hint():
+    """检测系统是否存在 AMD GPU，如果存在则给出 ROCm 加速安装指引"""
+    import subprocess
+    amd_detected = False
+
+    # 方法1：检查 lspci
+    try:
+        result = subprocess.run(['lspci'], capture_output=True, text=True, timeout=5)
+        if 'AMD' in result.stdout and ('VGA' in result.stdout or 'Display' in result.stdout):
+            amd_detected = True
+    except Exception:
+        pass
+
+    # 方法2：检查 /sys/class/drm
+    try:
+        import os
+        for entry in os.listdir('/sys/class/drm'):
+            device_path = f'/sys/class/drm/{entry}/device/vendor'
+            if os.path.exists(device_path):
+                with open(device_path, 'r') as f:
+                    vendor_id = f.read().strip()
+                    # AMD vendor ID: 0x1002
+                    if vendor_id == '0x1002':
+                        amd_detected = True
+                        break
+    except Exception:
+        pass
+
+    if amd_detected:
+        print("[OCR Server] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
+        print("[OCR Server] ⚡ 检测到 AMD GPU！可以通过 ROCm 启用 GPU 加速", flush=True)
+        print("[OCR Server] ", flush=True)
+        print("[OCR Server] 安装步骤（在虚拟环境中执行）：", flush=True)
+        print("[OCR Server]   1. pip uninstall onnxruntime  # 卸载CPU版本", flush=True)
+        print("[OCR Server]   2. pip install onnxruntime-rocm  # 安装AMD ROCm版本", flush=True)
+        print("[OCR Server]   3. 设置环境变量（RDNA2显卡需要）：", flush=True)
+        print("[OCR Server]      export HSA_OVERRIDE_GFX_VERSION=10.3.0", flush=True)
+        print("[OCR Server]   4. 重新启动 ocr_server.py", flush=True)
+        print("[OCR Server] ", flush=True)
+        print("[OCR Server] 支持的 AMD GPU：RX 6000/7000 系列 (RDNA2/RDNA3)", flush=True)
+        print("[OCR Server] 注意：需要先安装 ROCm 驱动 (https://rocm.docs.amd.com)", flush=True)
+        print("[OCR Server] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
+
 
 # 先不加载模型，等 main 里再加载
 
@@ -521,6 +599,27 @@ def cleanup_ready_file(port):
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 19999
+
+    # AMD RDNA2 显卡（RX 6000系列如 6650XT）需要此环境变量才能使用 ROCm
+    # 如果未设置，自动设置（不影响 NVIDIA GPU）
+    if 'HSA_OVERRIDE_GFX_VERSION' not in os.environ:
+        # 检测是否为 AMD RDNA2 GPU（通过 lspci 或 /sys）
+        is_rdna2 = False
+        try:
+            import subprocess as sp
+            result = sp.run(['lspci'], capture_output=True, text=True, timeout=5)
+            # RX 6000 系列 (navi21/22/23/24) 需要 GFX 10.3.0
+            rdna2_keywords = ['6600', '6650', '6700', '6750', '6800', '6850', '6900', '6950']
+            for kw in rdna2_keywords:
+                if kw in result.stdout and 'AMD' in result.stdout:
+                    is_rdna2 = True
+                    break
+        except Exception:
+            pass
+
+        if is_rdna2:
+            os.environ['HSA_OVERRIDE_GFX_VERSION'] = '10.3.0'
+            print("[OCR Server] ⚡ 自动设置 HSA_OVERRIDE_GFX_VERSION=10.3.0 (RDNA2 GPU)", flush=True)
 
     # 1. 先加载模型
     print(f"[OCR Server] 正在初始化 (port={port})...", flush=True)
