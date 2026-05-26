@@ -855,7 +855,7 @@ impl BrowserClient {
             self.update_step(BrowserStep::WaitingCaptchaResult);
             let max_polls = 15; // 最多约1.5秒
             let mut captcha_passed = false;
-            let mut alert_found = false;
+            let mut _alert_found = false;
             for i in 0..max_polls {
                 let state: String = page.evaluate_expression(JS_PAGE_STATE)
                     .await.map(|v| v.into_value().unwrap_or("unknown".to_string())).unwrap_or("unknown".to_string());
@@ -865,7 +865,7 @@ impl BrowserClient {
                     }
                     "alert" => {
                         // 错误弹窗出现
-                        alert_found = true;
+                        _alert_found = true;
                         break;
                     }
                     "result_ok" | "result_err" | "form" => {

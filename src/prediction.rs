@@ -5,7 +5,7 @@ use crate::browser::BrowserPool;
 use crate::data::{
     PredictionProgress, PerfEvent, BrowserStatus, CaptchaStats,
     QueryTask, TaskBatch, TaskResult, TaskType, PredictionJob,
-    StudentInfo, ScanPhase, MatchedPair, ClassZone, Anchor,
+    StudentInfo, ScanPhase, Anchor,
     PredictedRecord, PredictedStatus,
 };
 
@@ -437,7 +437,7 @@ pub async fn run_prediction(
 ) -> Vec<PredictedRecord> {
     let total_students = job.total_students;
     let _job_id = job.id.clone();
-    let _job_name = job.name.clone();
+    let job_name = job.name.clone();
 
     // 初始化进度
     {
