@@ -20,7 +20,7 @@ import json
 import sys
 import signal
 import tempfile
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ──────────────────────── 模型加载（带错误处理） ────────────────────────
 MODELS_LOADED = False
@@ -514,7 +514,7 @@ if __name__ == '__main__':
 
     # 2. 创建 HTTP 服务器
     try:
-        server = HTTPServer(('127.0.0.1', port), OCRHandler)
+        server = ThreadingHTTPServer(('127.0.0.1', port), OCRHandler)
     except OSError as e:
         print(f"[OCR Server] ❌ 端口 {port} 绑定失败: {e}", flush=True)
         sys.exit(1)

@@ -75,9 +75,9 @@ const JS_PAGE_STATE: &str = r#"(function() {
 
 impl BrowserClient {
     /// Poll until JS expression returns true, or timeout.
-    /// turbo mode: 30ms interval, normal: 150ms.
+    /// turbo mode: 20ms interval, normal: 150ms.
     async fn poll_true(&self, page: &Page, js: &str, max_ms: u64) -> bool {
-        let interval = if self.turbo { 30u64 } else { 150u64 };
+        let interval = if self.turbo { 20u64 } else { 150u64 };
         let attempts = (max_ms / interval).max(5);
         for _ in 0..attempts {
             let ok: bool = page.evaluate_expression(js).await
@@ -91,7 +91,7 @@ impl BrowserClient {
 
     /// Poll until page reaches a result state (captcha, result_ok, result_err, alert) or timeout
     async fn poll_submit_result(&self, page: &Page, max_ms: u64) -> SubmitResult {
-        let interval = if self.turbo { 30u64 } else { 150u64 };
+        let interval = if self.turbo { 20u64 } else { 150u64 };
         let attempts = (max_ms / interval).max(5);
         for _ in 0..attempts {
             let state: String = page.evaluate_expression(JS_PAGE_STATE)
@@ -189,8 +189,8 @@ impl BrowserClient {
     }
 
     async fn sleep_critical(&self, ms: u64) {
-        // turbo 模式下将等待时间压缩到最多800ms
-        let actual = if self.turbo { ms.min(800) } else { ms };
+        // turbo 模式下将等待时间压缩到最多300ms（从800ms降低）
+        let actual = if self.turbo { ms.min(300) } else { ms };
         tokio::time::sleep(std::time::Duration::from_millis(actual)).await;
     }
 
@@ -320,8 +320,10 @@ impl BrowserClient {
         self.update_step(BrowserStep::GoingHome);
 
         // go_home 整体加超时保护，防止卡死导致浏览器池耗尽
+        // turbo模式下缩短超时到10秒
+        let timeout_secs = if self.turbo { 10 } else { 20 };
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(timeout_secs),
             self.go_home_inner()
         ).await;
 
@@ -502,7 +504,7 @@ impl BrowserClient {
             return Err("身份证输入框未找到(sfzh)，页面可能未正确加载".to_string());
         }
 
-        self.sleep_step(0.3).await;
+        self.sleep_step(0.15).await;
         self.perf_event("填写信息完成");
         self.update_step(BrowserStep::Submitting);
 
@@ -854,12 +856,13 @@ impl BrowserClient {
                     .collect::<Vec<_>>().join(", ")
             );
             let _ = page.evaluate_expression(&clicks_js).await;
-            self.sleep_critical(300).await;
+            // 点击后等待验证码结果（缩短等待）
+            self.sleep_critical(150).await;
 
             // ── 快速检测验证码结果（同时检测alert弹窗、captchaModal消失、以及页面进入结果状态） ──
             self.perf_event("验证码点击完成");
             self.update_step(BrowserStep::WaitingCaptchaResult);
-            let max_polls = 15; // 最多约1.5秒
+            let max_polls = 20; // 最多约2秒
             let mut captcha_passed = false;
             let mut _alert_found = false;
             for i in 0..max_polls {
@@ -883,8 +886,8 @@ impl BrowserClient {
                         // unknown状态，可能验证码刚消失，继续等
                     }
                 }
-                // 前几轮快速轮询，后面稍慢
-                self.sleep_critical(if i < 3 { 50 } else { 120 }).await;
+                // turbo模式下超快轮询
+                self.sleep_critical(if self.turbo { 50 } else if i < 3 { 50 } else { 120 }).await;
             }
 
             if captcha_passed {
@@ -929,7 +932,7 @@ impl BrowserClient {
             self.log_msg(&format!("弹窗处理: {}", dismiss_result));
 
             // 短暂等待让网站完成自动刷新验证码
-            self.sleep_critical(400).await;
+            self.sleep_critical(200).await;
 
             // 检查网站是否自动刷新了验证码
             let auto_refreshed: bool = page.evaluate_expression(

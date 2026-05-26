@@ -18,9 +18,10 @@ fn python_path() -> PathBuf {
     if venv.exists() { venv } else { PathBuf::from("python3") }
 }
 
-/// OCR 服务端口，每个浏览器实例对应一个端口（instance_id + 19999）
-fn ocr_port(instance_id: u64) -> u16 {
-    19999 + (instance_id % 10) as u16
+/// OCR 服务端口，所有浏览器实例共享同一个端口（单端口多线程服务）
+/// 之前每10个实例映射同一端口，现在统一用 19999 端口，配合 ThreadingHTTPServer 并发处理
+fn ocr_port(_instance_id: u64) -> u16 {
+    19999
 }
 
 /// 就绪信号文件路径
@@ -318,9 +319,11 @@ async fn try_http_ocr(
     });
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .connect_timeout(Duration::from_secs(1))
-        .pool_max_idle_per_host(1)
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_millis(500))
+        .pool_max_idle_per_host(5)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_nodelay(true)
         .build()
         .map_err(|e| format!("HTTP客户端创建失败: {}", e))?;
 

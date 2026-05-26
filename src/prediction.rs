@@ -54,7 +54,15 @@ impl TaskScheduler {
     }
 
     /// 生成下一批任务，返回 None 表示所有阶段完成
-    fn generate_batch(&mut self) -> Option<TaskBatch> {
+    fn generate_batch(&mut self, cancelled: bool) -> Option<TaskBatch> {
+        // 如果已取消，不再生成新任务，只消耗队列中已有的
+        if cancelled {
+            if self.task_queue.is_empty() {
+                return None;
+            }
+            return self.pop_batch();
+        }
+
         // 如果队列里还有任务，先消耗
         if !self.task_queue.is_empty() {
             return self.pop_batch();
@@ -368,10 +376,9 @@ impl TaskScheduler {
             }
         }
 
-        // 检查阶段切换：种子阶段一旦有锚点就切换到扩展
-        if self.job.phase == ScanPhase::SeedDiscovery && !self.job.anchors.is_empty() {
-            self.job.phase = ScanPhase::ClassExpansion;
-        }
+        // 注意：不再在 process_results 中自动切换阶段！
+        // 阶段切换只在 generate_batch 中进行，当当前阶段的任务队列为空时才推进。
+        // 这样可以避免用户停止推算时，process_results 发现锚点就跳阶段的问题。
 
         // 更新班级区域的总人数
         let class_counts: HashMap<u32, usize> = {
@@ -454,10 +461,11 @@ pub async fn run_prediction(
                 // 检查浏览器池是否已关闭（用户点击了停止）
                 if pool.is_shutdown() { break; }
 
-                // 从调度器获取一批任务
+                // 从调度器获取一批任务（传入取消状态，避免取消后阶段跳转）
+                let is_cancelled = cancel_flag.load(AtomicOrdering::Relaxed);
                 let batch = {
                     let mut sched = scheduler.lock().await;
-                    sched.generate_batch()
+                    sched.generate_batch(is_cancelled)
                 };
 
                 let batch = match batch {
