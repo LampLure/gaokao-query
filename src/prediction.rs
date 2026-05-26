@@ -56,6 +56,7 @@ impl TaskScheduler {
     /// 生成下一批任务，返回 None 表示所有阶段完成
     fn generate_batch(&mut self, cancelled: bool) -> Option<TaskBatch> {
         // 如果已取消，不再生成新任务，只消耗队列中已有的
+        // 关键修复：取消时不触发任何阶段切换！
         if cancelled {
             if self.task_queue.is_empty() {
                 return None;
@@ -69,20 +70,27 @@ impl TaskScheduler {
         }
 
         // 根据当前阶段生成新任务
+        // 关键修复：每次只尝试当前阶段，不自动推进到下一阶段
+        // 阶段推进需要当前阶段确实完成（队列清空 + 无法再生成任务）
         match self.job.phase {
             ScanPhase::SeedDiscovery => {
                 self.generate_seed_tasks();
                 if self.task_queue.is_empty() {
-                    // 种子阶段完成（所有号码扫完或所有班级都有锚点），切换到班级扩展
+                    // 种子阶段确实无法再生成任务（所有号码扫完或所有班级都有锚点）
+                    // 只有在确实没有更多种子任务时才推进
+                    let old_phase = self.job.phase.clone();
                     self.job.phase = ScanPhase::ClassExpansion;
+                    eprintln!("[推算] 阶段推进: {} → {}", old_phase.label(), self.job.phase.label());
                     self.generate_expand_tasks();
+                    // 如果扩展阶段也无法生成任务，下一轮会继续推进
                 }
             }
             ScanPhase::ClassExpansion => {
                 self.generate_expand_tasks();
                 if self.task_queue.is_empty() {
-                    // 扩展完成，切换到残留清扫
+                    let old_phase = self.job.phase.clone();
                     self.job.phase = ScanPhase::Cleanup;
+                    eprintln!("[推算] 阶段推进: {} → {}", old_phase.label(), self.job.phase.label());
                     self.generate_cleanup_tasks();
                 }
             }

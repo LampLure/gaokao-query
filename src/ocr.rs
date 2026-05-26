@@ -37,18 +37,68 @@ static STARTED_PORTS: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
 static HEALTH_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
-/// HTTP 服务已确认失败的端口（本次运行不再重试，避免反复打印错误日志）
-static FAILED_PORTS: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
+/// HTTP 服务已确认失败的端口及其连续失败次数和上次失败时间
+/// 不再永久标记失败，而是允许指数退避重试
+struct FailedPortInfo {
+    port: u16,
+    fail_count: u32,
+    last_fail_ms: u64,
+}
+static FAILED_PORTS: std::sync::LazyLock<std::sync::Mutex<Vec<FailedPortInfo>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// 检查失败端口是否可以重试（指数退避：失败1次等5秒，2次等30秒，3次等120秒，4次以上等300秒）
+fn can_retry_failed_port(port: u16) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut failed = FAILED_PORTS.lock().unwrap();
+    if let Some(info) = failed.iter_mut().find(|i| i.port == port) {
+        let wait_ms = match info.fail_count {
+            0 => 0,
+            1 => 5_000,
+            2 => 30_000,
+            3 => 120_000,
+            _ => 300_000,
+        };
+        now.saturating_sub(info.last_fail_ms) >= wait_ms
+    } else {
+        true // 不在失败列表中，可以尝试
+    }
+}
+
+/// 记录端口失败
+fn record_port_failure(port: u16) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut failed = FAILED_PORTS.lock().unwrap();
+    if let Some(info) = failed.iter_mut().find(|i| i.port == port) {
+        info.fail_count += 1;
+        info.last_fail_ms = now;
+    } else {
+        failed.push(FailedPortInfo { port, fail_count: 1, last_fail_ms: now });
+    }
+    // 从健康缓存中移除
+    {
+        let mut cache = HEALTH_CACHE.lock().unwrap();
+        cache.retain(|&p| p != port);
+    }
+}
+
+/// 清除端口失败记录（HTTP服务恢复时调用）
+fn clear_port_failure(port: u16) {
+    let mut failed = FAILED_PORTS.lock().unwrap();
+    failed.retain(|i| i.port != port);
+}
 
 /// 自动启动 OCR HTTP 服务（如果未运行）
 async fn ensure_ocr_server(port: u16) {
-    // 检查是否已确认失败（本次运行不再重试）
-    {
-        let failed = FAILED_PORTS.lock().unwrap();
-        if failed.contains(&port) {
-            return;
-        }
+    // 检查是否可以重试（指数退避）
+    if !can_retry_failed_port(port) {
+        return;
     }
 
     // 检查是否已启动过
@@ -77,10 +127,7 @@ async fn ensure_ocr_server(port: u16) {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ocr_server.py");
     if !script.exists() {
         eprintln!("[OCR] ocr_server.py 不存在，跳过自动启动");
-        let mut failed = FAILED_PORTS.lock().unwrap();
-        if !failed.contains(&port) {
-            failed.push(port);
-        }
+        record_port_failure(port);
         return;
     }
 
@@ -132,10 +179,7 @@ async fn ensure_ocr_server(port: u16) {
                 match child_handle.try_wait() {
                     Ok(Some(status)) => {
                         eprintln!("[OCR] ❌ ocr_server.py 进程已退出，状态: {}", status);
-                        let mut failed = FAILED_PORTS.lock().unwrap();
-                        if !failed.contains(&port) {
-                            failed.push(port);
-                        }
+                        record_port_failure(port);
                         return;
                     }
                     Ok(None) => {
@@ -150,10 +194,7 @@ async fn ensure_ocr_server(port: u16) {
                     eprintln!("[OCR] ❌ HTTP服务启动超时 (port {}，等待{}秒)，将降级到子进程模式", port, timeout.as_secs());
                     // 尝试杀掉可能还在运行的进程
                     let _ = child_handle.kill().await;
-                    let mut failed = FAILED_PORTS.lock().unwrap();
-                    if !failed.contains(&port) {
-                        failed.push(port);
-                    }
+                    record_port_failure(port);
                     return;
                 }
 
@@ -163,10 +204,7 @@ async fn ensure_ocr_server(port: u16) {
         Err(e) => {
             eprintln!("[OCR] ❌ 启动 ocr_server.py 失败: {}，将降级到子进程模式", e);
             eprintln!("[OCR]    请确认 Python3 已安装且 ddddocr 模块可用: pip install ddddocr Pillow");
-            let mut failed = FAILED_PORTS.lock().unwrap();
-            if !failed.contains(&port) {
-                failed.push(port);
-            }
+            record_port_failure(port);
         }
     }
 }
@@ -245,12 +283,10 @@ pub async fn solve_captcha(
     let port = ocr_port(instance_id);
 
     // 检查是否已确认失败（本次运行不再尝试HTTP）
-    let skip_http = {
-        let failed = FAILED_PORTS.lock().unwrap();
-        failed.contains(&port)
-    };
+    // 检查是否可以重试失败的HTTP服务（指数退避）
+    let can_retry = can_retry_failed_port(port);
 
-    if !skip_http {
+    if can_retry {
         // 检查健康缓存，如果已知服务可用则直接用
         let use_http = {
             let cache = HEALTH_CACHE.lock().unwrap();
@@ -278,25 +314,17 @@ pub async fn solve_captcha(
             // 尝试 HTTP 常驻服务
             match try_http_ocr(&img_b64, expected_chars, port).await {
                 Ok(result) => {
-                    // 成功，确保端口在健康缓存中
+                    // 成功，确保端口在健康缓存中，清除失败记录
                     let mut cache = HEALTH_CACHE.lock().unwrap();
                     if !cache.contains(&port) {
                         cache.push(port);
                     }
+                    clear_port_failure(port);
                     return Ok(result);
                 }
                 Err(e) => {
-                    // HTTP 服务不可用，从健康缓存中移除，加入失败列表
-                    {
-                        let mut cache = HEALTH_CACHE.lock().unwrap();
-                        cache.retain(|&p| p != port);
-                    }
-                    {
-                        let mut failed = FAILED_PORTS.lock().unwrap();
-                        if !failed.contains(&port) {
-                            failed.push(port);
-                        }
-                    }
+                    // HTTP 服务不可用，记录失败（允许后续重试）
+                    record_port_failure(port);
                     eprintln!("[OCR] HTTP服务不可用(port {}): {}，降级到子进程模式", port, e);
                 }
             }

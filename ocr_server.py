@@ -26,7 +26,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 MODELS_LOADED = False
 
 def load_models():
-    """加载所有OCR模型，返回是否成功"""
+    """加载所有OCR模型，返回是否成功。
+    自动检测GPU可用性，优先使用GPU加速。
+    """
     global det_beta, det_default, ocr_beta, ocr_default, MODELS_LOADED
     try:
         import ddddocr
@@ -40,16 +42,30 @@ def load_models():
         print("[OCR Server] ❌ Pillow 未安装！请运行: pip install Pillow", flush=True)
         return False
 
+    # 自动检测GPU可用性
+    use_gpu = False
+    try:
+        import onnxruntime as ort
+        providers = ort.get_available_providers()
+        if 'CUDAExecutionProvider' in providers:
+            use_gpu = True
+            print(f"[OCR Server] 🚀 检测到CUDA GPU，启用GPU加速 (providers: {providers})", flush=True)
+        else:
+            print(f"[OCR Server] GPU不可用，使用CPU模式 (providers: {providers})", flush=True)
+    except ImportError:
+        print("[OCR Server] onnxruntime未安装，使用CPU模式", flush=True)
+
     try:
         print("[OCR Server] 正在加载检测模型(beta)...", flush=True)
-        det_beta = ddddocr.DdddOcr(det=True, beta=True, show_ad=False)
+        det_beta = ddddocr.DdddOcr(det=True, beta=True, show_ad=False, use_gpu=use_gpu)
         print("[OCR Server] 正在加载检测模型(default)...", flush=True)
-        det_default = ddddocr.DdddOcr(det=True, beta=False, show_ad=False)
+        det_default = ddddocr.DdddOcr(det=True, beta=False, show_ad=False, use_gpu=use_gpu)
         print("[OCR Server] 正在加载识别模型(beta)...", flush=True)
-        ocr_beta = ddddocr.DdddOcr(beta=True, show_ad=False)
+        ocr_beta = ddddocr.DdddOcr(beta=True, show_ad=False, use_gpu=use_gpu)
         print("[OCR Server] 正在加载识别模型(default)...", flush=True)
-        ocr_default = ddddocr.DdddOcr(show_ad=False)
-        print("[OCR Server] ✓ 所有模型加载完成", flush=True)
+        ocr_default = ddddocr.DdddOcr(show_ad=False, use_gpu=use_gpu)
+        mode_str = "GPU" if use_gpu else "CPU"
+        print(f"[OCR Server] ✓ 所有模型加载完成 (模式: {mode_str})", flush=True)
         MODELS_LOADED = True
         return True
     except Exception as e:
