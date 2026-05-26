@@ -1379,7 +1379,14 @@ impl GaokaoApp {
                             l.push(format!("[QUERY] {} 获取浏览器中...", record.name));
                         }
 
-                        let (permit, mut client) = pool.acquire().await;
+                        let (permit, mut client) = match pool.acquire().await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                let mut l = logs.lock().await;
+                                l.push(format!("[QUERY] {} 获取浏览器失败: {}", record.name, e));
+                                break;
+                            }
+                        };
 
                         let record_perf: Arc<Mutex<Vec<PerfEvent>>> = Arc::new(Mutex::new(Vec::new()));
                         client.set_perf(Some(record_perf.clone()));

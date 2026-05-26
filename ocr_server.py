@@ -32,8 +32,14 @@ def load_models():
     global det_beta, det_default, ocr_beta, ocr_default, MODELS_LOADED
     try:
         import ddddocr
-    except ImportError:
-        print("[OCR Server] ❌ ddddocr 未安装！请运行: pip install ddddocr", flush=True)
+    except ImportError as e:
+        mod_name = str(e)
+        if 'onnxruntime' in mod_name:
+            print("[OCR Server] ❌ ddddocr 依赖 onnxruntime 未安装！", flush=True)
+            print("[OCR Server] 请在虚拟环境中执行: pip install onnxruntime", flush=True)
+            print("[OCR Server] 或（如需AMD GPU加速）: pip install onnxruntime-rocm", flush=True)
+        else:
+            print(f"[OCR Server] ❌ ddddocr 未安装！请运行: pip install ddddocr ({e})", flush=True)
         return False
 
     try:

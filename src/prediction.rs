@@ -714,7 +714,13 @@ pub async fn run_prediction(
                     None => break,
                 };
 
-                let (permit, mut client) = pool.acquire().await;
+                let (permit, mut client) = match pool.acquire().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[Worker] 获取浏览器失败: {}", e);
+                        break;
+                    }
+                };
                 client.set_captcha_stats(Some(captcha_stats.clone()));
                 client.set_status(Some(browser_statuses.clone()));
                 client.set_turbo(true);

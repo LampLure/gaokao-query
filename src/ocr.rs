@@ -236,6 +236,8 @@ async fn ensure_ocr_server(port: u16) {
                 match child_handle.try_wait() {
                     Ok(Some(status)) => {
                         eprintln!("[OCR] ❌ ocr_server.py 进程已退出，状态: {}", status);
+                        eprintln!("[OCR]    请检查 .venv 中是否安装了所需依赖:");
+                        eprintln!("[OCR]    source .venv/bin/activate && pip install ddddocr onnxruntime Pillow");
                         record_port_failure(port);
                         return;
                     }
@@ -472,11 +474,12 @@ async fn solve_captcha_subprocess(
     instance_id: u64,
 ) -> Result<OcrResult, String> {
     let expected = expected_chars.join(" ");
+    let helper_script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ocr_helper.py");
 
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new(python_path())
-            .arg("ocr_helper.py")
+            .arg(&helper_script)
             .arg(image_path)
             .arg(&expected)
             .arg(instance_id.to_string())

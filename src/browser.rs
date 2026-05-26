@@ -703,8 +703,9 @@ impl BrowserClient {
                     self.log_msg("验证码已自动刷新，跳过手动刷新");
                     captcha_auto_refreshed = false;
                 } else {
-                    // 正常手动刷新
+                    // 正常手动刷新，增加延迟防止"点击过快"检测
                     self.log_msg("刷新验证码...");
+                    self.sleep_critical(500).await;  // 刷新前等500ms，防止频繁操作被检测
                     let _ = page.evaluate_expression(
                         r#"(function() {
                             const btn = document.getElementById('refreshCaptcha');
@@ -713,11 +714,19 @@ impl BrowserClient {
                         })()"#
                     ).await;
                 }
-                // 等待验证码图片加载（最多1.5s，缩短等待时间）
+                // 等待验证码图片加载（增加到3s，确保刷新后图片完全加载稳定）
+                self.sleep_critical(300).await;  // 先等300ms让验证码DOM稳定
                 let interval = if self.turbo { 80u64 } else { 200u64 };
-                for _ in 0..(1500 / interval).max(5) {
+                for _ in 0..(3000 / interval).max(10) {
                     let has_img: bool = page.evaluate_expression(
-                        r#"!!document.getElementById('captchaImage')"#
+                        r#"(function() {
+                            const img = document.getElementById('captchaImage');
+                            if (!img) return false;
+                            if (!img.complete || img.naturalWidth === 0) return false;
+                            // 确保src不是svg占位图且足够大（真正加载完成）
+                            const src = img.getAttribute('src') || '';
+                            return src.length > 100;
+                        })()"#
                     ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
                     if has_img { break; }
                     self.sleep_critical(interval).await;
@@ -726,10 +735,13 @@ impl BrowserClient {
             self.log_msg(&format!("验证码第 {}/{} 次尝试", attempt, max_retries));
             self.update_step(BrowserStep::LoadingCaptchaImage);
 
-            // Poll for captcha image (3s timeout, 缩短到3s)
+            // 等待验证码图片完全稳定（防止网站加载后自动刷新导致图片变化）
+            self.sleep_critical(500).await;
+
+            // Poll for captcha image (5s timeout，确保图片完全加载)
             let img_src: String = {
                 let interval = if self.turbo { 50u64 } else { 150u64 };
-                let attempts = (3000 / interval).max(10);
+                let attempts = (5000 / interval).max(10);
                 let mut last = String::new();
                 for _ in 0..attempts {
                     let src: String = page.evaluate_expression(
@@ -954,15 +966,21 @@ impl BrowserClient {
             self.log_msg(&format!("弹窗处理: {}", dismiss_result));
 
             // 短暂等待让网站完成自动刷新验证码
-            self.sleep_critical(200).await;
+            self.sleep_critical(300).await;
 
-            // 检查网站是否自动刷新了验证码
+            // 检查网站是否自动刷新了验证码（检查captchaModal是否仍可见且验证码图片已就绪）
+            // 只在图片已完全加载时标记为自动刷新，避免误判
             let auto_refreshed: bool = page.evaluate_expression(
                 r#"(function() {
+                    // 验证码弹窗必须仍可见
+                    const m = document.getElementById('captchaModal');
+                    if (!m || m.classList.contains('hidden')) return false;
+                    // 验证码图片必须已加载
                     const img = document.getElementById('captchaImage');
-                    if (img && img.complete && img.naturalWidth > 0) return true;
-                    const btn = document.getElementById('refreshCaptcha');
-                    return btn !== null;
+                    if (!img || !img.complete || img.naturalWidth === 0) return false;
+                    // 图片src必须是有效的（非svg占位图）
+                    const src = img.getAttribute('src') || '';
+                    return src.length > 100;
                 })()"#
             ).await.map(|r| r.into_value().unwrap_or(false)).unwrap_or(false);
 
@@ -1087,12 +1105,12 @@ impl BrowserPool {
         self.shutdown_flag.load(Ordering::SeqCst)
     }
 
-    pub async fn acquire(self: &Arc<Self>) -> (OwnedSemaphorePermit, BrowserClient) {
-        let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+    pub async fn acquire(self: &Arc<Self>) -> Result<(OwnedSemaphorePermit, BrowserClient), String> {
+        let permit = self.semaphore.clone().acquire_owned().await.map_err(|_| "信号量获取失败".to_string())?;
         let mut clients = self.clients.lock().await;
-        let client = clients.pop_front().unwrap();
+        let client = clients.pop_front().ok_or_else(|| "浏览器池耗尽：没有可用的浏览器实例".to_string())?;
         // 如果池已关闭，获取到的浏览器也要标记（不过正常流程中 acquire 前会检查 cancel_flag）
-        (permit, client)
+        Ok((permit, client))
     }
 
     pub fn release(self: &Arc<Self>, permit: OwnedSemaphorePermit, client: BrowserClient) {
