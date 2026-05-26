@@ -1,5 +1,6 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -7,7 +8,7 @@ use crate::config;
 use crate::data::*;
 use crate::matcher;
 use crate::parser;
-// prediction module is used via crate::prediction:: calls in async tasks
+use crate::job;
 
 #[derive(Clone, PartialEq)]
 enum QueryState {
@@ -40,11 +41,13 @@ pub struct GaokaoApp {
     pred_start_bkh: u64,             // 开始考号完整数值（14位数字）
     pred_end_str: String,            // 结束考号输入框（完整14位如 26421126151500）
     pred_end_bkh: u64,               // 结束考号完整数值（14位数字）
-    pred_search_margin: u32,         // 网格探针数量
     pred_results: Arc<Mutex<Vec<PredictedRecord>>>,
     pred_displayed_results: Vec<PredictedRecord>,
     pred_state: QueryState,
-    pred_continuous: bool,
+    // ---- 任务管理 ----
+    pred_job_list: Vec<PredictionJob>,
+    pred_selected_job_id: Option<String>,
+    pred_new_job_name: String,
     // ---- shared params ----
     concurrency: u32,
     delay_ms: u32,
@@ -106,11 +109,13 @@ impl GaokaoApp {
             pred_start_bkh: cfg.pred_start_bkh.parse().unwrap_or(0),
             pred_end_str: cfg.pred_end_bkh.clone(),
             pred_end_bkh: cfg.pred_end_bkh.parse().unwrap_or(0),
-            pred_search_margin: 10,
             pred_results: Arc::new(Mutex::new(Vec::new())),
             pred_displayed_results: Vec::new(),
             pred_state: QueryState::Idle,
-            pred_continuous: false,
+            // 任务管理
+            pred_job_list: job::list_jobs(),
+            pred_selected_job_id: None,
+            pred_new_job_name: format!("{}届推算", chrono::Local::now().format("%Y")),
             concurrency: cfg.concurrency,
             delay_ms: cfg.delay_ms,
             step_delay_ms: cfg.step_delay_ms,
@@ -972,11 +977,54 @@ impl GaokaoApp {
                 }
             });
 
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // ─── 任务列表 ───
+            ui.label(egui::RichText::new("📋 任务列表").strong());
+            ui.add_space(4.0);
+
+            if !self.pred_job_list.is_empty() {
+                egui::ScrollArea::vertical().id_salt("job_list").max_height(120.0).show(ui, |ui| {
+                    for job_entry in &self.pred_job_list {
+                        let is_selected = self.pred_selected_job_id.as_ref() == Some(&job_entry.id);
+                        let status_icon = match job_entry.status {
+                            JobStatus::Running => "🟢",
+                            JobStatus::Paused => "🟡",
+                            JobStatus::Completed => "✅",
+                        };
+                        let label = format!(
+                            "{} {} | {}/{} ({:.0}%) | {}",
+                            status_icon,
+                            job_entry.name,
+                            job_entry.matched_count,
+                            job_entry.total_students,
+                            job_entry.progress_pct(),
+                            job_entry.phase.label(),
+                        );
+                        if ui.selectable_label(is_selected, &label).clicked() {
+                            self.pred_selected_job_id = Some(job_entry.id.clone());
+                        }
+                    }
+                });
+            } else {
+                ui.label(egui::RichText::new("暂无任务，创建新任务开始推算").color(egui::Color32::GRAY));
+            }
+
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label("网格探针数：");
-                ui.add(egui::Slider::new(&mut self.pred_search_margin, 3..=30).text("个"));
-                ui.label("（均匀分布在扫描范围内）");
+                ui.label("任务名称：");
+                ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.pred_new_job_name));
+                if ui.button("🗑 删除选中").clicked() {
+                    if let Some(id) = &self.pred_selected_job_id {
+                        if let Err(e) = job::delete_job(id) {
+                            self.log(format!("删除任务失败: {}", e));
+                        }
+                        self.pred_job_list = job::list_jobs();
+                        self.pred_selected_job_id = None;
+                    }
+                }
             });
 
             ui.add_space(8.0);
@@ -1030,12 +1078,20 @@ impl GaokaoApp {
                         let completed = p.matched + p.not_found;
                         let ratio = if p.total > 0 { completed as f32 / p.total as f32 } else { 0.0 };
                         ui.add(egui::ProgressBar::new(ratio).text(format!("{}/{}", completed, p.total)));
-                        ui.label(format!(
-                            "✅ {}  ❌ {}  📌 {}",
-                            p.matched, p.not_found, p.current_name
-                        ));
+                        ui.horizontal(|ui| {
+                            ui.label(format!("✅ {}  ❌ {}", p.matched, p.not_found));
+                            if !p.phase.is_empty() {
+                                ui.label(egui::RichText::new(format!("阶段: {}", p.phase)).color(egui::Color32::LIGHT_BLUE));
+                            }
+                            if p.total_queries > 0 {
+                                ui.label(format!("查询: {}次", p.total_queries));
+                            }
+                        });
                         if !p.current_batch.is_empty() {
                             ui.label(egui::RichText::new(&p.current_batch).color(egui::Color32::LIGHT_BLUE));
+                        }
+                        if !p.current_name.is_empty() {
+                            ui.label(format!("📌 {}", p.current_name));
                         }
                     }
                 }
@@ -1402,12 +1458,51 @@ impl GaokaoApp {
         let browser_statuses = self.browser_statuses.clone();
         let pred_done = self.pred_done.clone();
 
-        // 全年级所有学生
+        // 创建 PredictionJob
         let all_sfz_records = self.pred_sfz_records.clone();
         let target_year = self.pred_year_filter as u32;
-        let scan_low = self.pred_start_bkh;   // 开始考号（完整14位数字）
-        let scan_high = self.pred_end_bkh;     // 结束考号（完整14位数字）
-        let probe_count = self.pred_search_margin.max(3);
+        let scan_low = self.pred_start_bkh;
+        let scan_high = self.pred_end_bkh;
+
+        // 学生信息（含班级号）
+        let students = parser::to_student_info(&all_sfz_records, target_year);
+
+        if students.is_empty() {
+            self.status_message = format!("入学年份 {} 无匹配学生", target_year);
+            self.pred_state = QueryState::Idle;
+            return;
+        }
+
+        // 已知报考号 → HashMap<name, exam_number>
+        let known_bkh: HashMap<String, u64> = self.pred_known_bkh.iter()
+            .filter_map(|r| r.baominghao.parse::<u64>().ok().map(|n| (r.name.clone(), n)))
+            .collect();
+
+        // 文件哈希
+        let sfz_hash = self.pred_sfz_path.as_ref().map(|p| job::file_hash(p)).unwrap_or_default();
+        let bkh_hash = self.pred_bkh_path.as_ref().map(|p| job::file_hash(p)).unwrap_or_default();
+
+        let job = PredictionJob::new(
+            self.pred_new_job_name.clone(),
+            target_url.clone(),
+            scan_low,
+            scan_high,
+            sfz_hash,
+            bkh_hash,
+            target_year,
+            students,
+        );
+
+        // 保存新任务
+        if let Err(e) = job::save_job(&job) {
+            self.log(format!("保存任务失败: {}", e));
+        }
+
+        // 更新任务列表
+        self.pred_job_list = job::list_jobs();
+        self.pred_selected_job_id = Some(job.id.clone());
+
+        let job_id = job.id.clone();
 
         tokio::spawn(async move {
             let pool = match crate::browser::BrowserPool::new(
@@ -1423,7 +1518,7 @@ impl GaokaoApp {
                 }
             };
 
-            // 初始化浏览器状态追踪（推算场景）
+            // 初始化浏览器状态追踪
             {
                 let mut statuses = browser_statuses.lock().await;
                 *statuses = (0..concurrency).map(|i| BrowserStatus {
@@ -1443,37 +1538,17 @@ impl GaokaoApp {
                 *cs = CaptchaStats::default();
             }
 
-            // 取全年级（指定入学年份）的所有学生
-            let mut students: Vec<(String, String)> = all_sfz_records.iter()
-                .filter(|r| {
-                    let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
-                    ruxue == target_year
-                })
-                .map(|r| (r.name.clone(), r.shenfenzheng.clone()))
-                .collect();
-
-            // 扫描从大号往小号，学生也倒序排列（17班在前，1班在后），命中率更高
-            students.reverse();
-
-            if students.is_empty() {
-                let mut l = logs.lock().await;
-                l.push(format!("[警告] 入学年份 {} 无匹配学生，终止", target_year));
-                pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-
             let mut l = logs.lock().await;
             l.push(format!("=================================================="));
-            l.push(format!("[考号推算] 启动！入学年份={} | 学生数={} | 扫描范围=[{},{}] (共{}个号)", target_year, students.len(), scan_low, scan_high, scan_high - scan_low));
+            l.push(format!("[班级锚点扩展] 启动！任务ID={} | 入学年份={} | 学生数={} | 扫描范围=[{},{}]",
+                job_id, target_year, 0, scan_low, scan_high)); // students.len() not available here, but logged inside prediction
             drop(l);
 
-            // 调用推算算法（使用完整数字范围）
+            // 调用新算法
             let results = crate::prediction::run_prediction(
                 pool,
-                students,
-                scan_low,
-                scan_high,
-                probe_count,
+                job,
+                known_bkh,
                 concurrency,
                 cancel,
                 pred_progress,
@@ -1492,7 +1567,6 @@ impl GaokaoApp {
             let mut l = logs.lock().await;
             l.push(format!("🏁 推算任务已完成。"));
 
-            // 通知主线程任务结束
             pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }

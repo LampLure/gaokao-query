@@ -1,5 +1,39 @@
 use calamine::{open_workbook, DataType, Reader, Xlsx};
-use crate::data::{BaoKaoHaoRecord, ShenFenZhengRecord};
+use crate::data::{BaoKaoHaoRecord, ShenFenZhengRecord, StudentInfo};
+
+/// 从 organization 字段提取班级号
+/// 格式: "黄冈市教育局-蕲春县-高中-实验高级中学-2025年-高三-17班"
+/// 提取最末尾 "数字班" 中的数字
+pub fn extract_class(organization: &str) -> u32 {
+    organization
+        .split('-')
+        .last()
+        .and_then(|s| {
+            // 去掉 "班" 字后尝试解析数字
+            let trimmed = s.trim().trim_end_matches("班");
+            trimmed.parse::<u32>().ok()
+        })
+        .unwrap_or(0)
+}
+
+/// 将身份证记录转换为带班级号的学生信息列表
+/// 过滤指定入学年份
+pub fn to_student_info(
+    records: &[ShenFenZhengRecord],
+    year_filter: u32,
+) -> Vec<StudentInfo> {
+    records.iter()
+        .filter(|r| {
+            let ruxue = r.ruxue_year.unwrap_or(0.0) as u32;
+            ruxue == year_filter
+        })
+        .map(|r| StudentInfo {
+            name: r.name.clone(),
+            sfz: r.shenfenzheng.clone(),
+            class_num: extract_class(&r.organization),
+        })
+        .collect()
+}
 
 fn cell_str<'a>(cell: &'a calamine::Data) -> Option<&'a str> {
     cell.get_string()

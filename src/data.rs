@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct BaoKaoHaoRecord {
@@ -59,7 +60,7 @@ pub struct QueryResult {
     pub error: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
     pub baokao_path: String,
     pub sfz_path: String,
@@ -142,12 +143,14 @@ pub enum PredictedStatus {
 
 #[derive(Debug, Clone, Default)]
 pub struct PredictionProgress {
-    pub total: usize,       // 当前班级总人数
-    pub matched: usize,     // 已成功匹配人数
-    pub not_found: usize,   // 扫射完仍未找到的人数
+    pub total: usize,
+    pub matched: usize,
+    pub not_found: usize,
     pub current_name: String,
     pub current_exam: String,
-    pub current_batch: String, // 用于 UI 实时显示："[雷达阶段] 正在探测考号: ..." 或 "[扫射阶段] ..."
+    pub current_batch: String,
+    pub phase: String,
+    pub total_queries: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -156,13 +159,13 @@ pub struct PerfEvent {
     pub elapsed_ms: u64,
 }
 
-/// 验证码统计：精确追踪每次验证码尝试
+/// 验证码统计
 #[derive(Debug, Clone, Default)]
 pub struct CaptchaStats {
-    pub total_attempts: u64,   // 总验证码尝试次数
-    pub total_passes: u64,     // 总通过次数
-    pub first_try_passes: u64, // 首次即通过次数
-    pub total_queries: u64,    // 总查询次数（含无需验证码的）
+    pub total_attempts: u64,
+    pub total_passes: u64,
+    pub first_try_passes: u64,
+    pub total_queries: u64,
 }
 
 impl CaptchaStats {
@@ -177,32 +180,32 @@ impl CaptchaStats {
 /// 单个浏览器的实时状态
 #[derive(Debug, Clone)]
 pub struct BrowserStatus {
-    pub id: u64,                    // 浏览器实例 ID
-    pub step: BrowserStep,          // 当前步骤
-    pub target: String,             // 当前操作目标（报名号）
-    pub name: String,               // 当前查询人姓名
-    pub captcha_attempt: u32,       // 当前验证码第几次尝试
-    pub captcha_max: u32,           // 验证码最大尝试次数
-    pub elapsed_ms: u64,            // 当前步骤已耗时(ms)
+    pub id: u64,
+    pub step: BrowserStep,
+    pub target: String,
+    pub name: String,
+    pub captcha_attempt: u32,
+    pub captcha_max: u32,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BrowserStep {
-    Idle,                       // 空闲等待
-    Acquiring,                  // 获取浏览器实例
-    CheckingPage,               // 检查页面就绪
-    FillingForm,                // 填写表单
-    Submitting,                 // 提交查询
-    WaitingCaptcha,             // 等待验证码弹窗
-    LoadingCaptchaImage,        // 加载验证码图片
-    OcrProcessing,              // OCR识别中
-    ClickingCaptcha,            // 点击验证码
-    WaitingCaptchaResult,       // 等待验证码结果
-    CaptchaFailed,              // 验证码失败，准备重试
-    DismissingAlert,            // 关闭错误弹窗
-    ReadingResult,              // 读取查询结果
-    GoingHome,                  // 导航回首页
-    Error(String),              // 出错
+    Idle,
+    Acquiring,
+    CheckingPage,
+    FillingForm,
+    Submitting,
+    WaitingCaptcha,
+    LoadingCaptchaImage,
+    OcrProcessing,
+    ClickingCaptcha,
+    WaitingCaptchaResult,
+    CaptchaFailed,
+    DismissingAlert,
+    ReadingResult,
+    GoingHome,
+    Error(String),
 }
 
 impl BrowserStep {
@@ -228,21 +231,21 @@ impl BrowserStep {
 
     pub fn color(&self) -> (u8, u8, u8) {
         match self {
-            BrowserStep::Idle => (128, 128, 128),         // 灰色
-            BrowserStep::Acquiring => (100, 149, 237),     // 蓝色
+            BrowserStep::Idle => (128, 128, 128),
+            BrowserStep::Acquiring => (100, 149, 237),
             BrowserStep::CheckingPage => (100, 149, 237),
             BrowserStep::FillingForm => (65, 105, 225),
             BrowserStep::Submitting => (65, 105, 225),
-            BrowserStep::WaitingCaptcha => (255, 165, 0),  // 橙色
+            BrowserStep::WaitingCaptcha => (255, 165, 0),
             BrowserStep::LoadingCaptchaImage => (255, 165, 0),
             BrowserStep::OcrProcessing => (255, 140, 0),
             BrowserStep::ClickingCaptcha => (255, 140, 0),
             BrowserStep::WaitingCaptchaResult => (255, 165, 0),
-            BrowserStep::CaptchaFailed => (255, 69, 0),    // 红橙
-            BrowserStep::DismissingAlert => (255, 99, 71),  // 番茄色
-            BrowserStep::ReadingResult => (50, 205, 50),   // 绿色
-            BrowserStep::GoingHome => (147, 112, 219),     // 紫色
-            BrowserStep::Error(_) => (255, 0, 0),          // 红色
+            BrowserStep::CaptchaFailed => (255, 69, 0),
+            BrowserStep::DismissingAlert => (255, 99, 71),
+            BrowserStep::ReadingResult => (50, 205, 50),
+            BrowserStep::GoingHome => (147, 112, 219),
+            BrowserStep::Error(_) => (255, 0, 0),
         }
     }
 }
@@ -261,4 +264,301 @@ impl PerfRecord {
     }
     pub fn max_ms(&self) -> u64 { self.times_ms.iter().copied().fold(0, u64::max) }
     pub fn min_ms(&self) -> u64 { self.times_ms.iter().copied().fold(u64::MAX, u64::min) }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  新增：任务队列 + 班级感知锚点扩展 相关数据结构
+// ═══════════════════════════════════════════════════════════
+
+/// 学生信息（含班级号）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudentInfo {
+    pub name: String,
+    pub sfz: String,
+    pub class_num: u32,
+}
+
+/// 查询任务类型
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TaskType {
+    SeedProbe,      // 阶段1: 种子探测
+    ClassExpand,    // 阶段2: 班级扩展
+    ClassProbe,     // 阶段2: 班级探测（找未发现班级的代表）
+    Cleanup,        // 阶段3: 残留清扫
+}
+
+/// 单个查询任务
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryTask {
+    pub exam_number: u64,
+    pub student_sfz: String,
+    pub student_name: String,
+    pub class_num: u32,
+    pub task_type: TaskType,
+}
+
+/// 任务批次（给一个工人的工作量）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskBatch {
+    pub tasks: Vec<QueryTask>,
+    pub batch_id: u32,
+}
+
+/// 单个任务的执行结果
+#[derive(Debug, Clone)]
+pub struct TaskResult {
+    pub exam_number: u64,
+    pub student_sfz: String,
+    pub student_name: String,
+    pub class_num: u32,
+    pub task_type: TaskType,
+    pub matched: bool,
+    pub error: String,
+}
+
+/// 班级锚点
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Anchor {
+    pub exam_number: u64,
+    pub student_name: String,
+    pub student_sfz: String,
+    pub class_num: u32,
+}
+
+/// 已发现的班级区域
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassZone {
+    pub class_num: u32,
+    pub start_number: u64,
+    pub end_number: u64,
+    pub matched_count: usize,
+    pub total_count: usize,
+}
+
+impl ClassZone {
+    pub fn contains(&self, number: u64) -> bool {
+        number >= self.start_number && number <= self.end_number
+    }
+
+    /// 扩展区域
+    pub fn expand_to_include(&mut self, number: u64) {
+        if number < self.start_number {
+            self.start_number = number;
+        }
+        if number > self.end_number {
+            self.end_number = number;
+        }
+    }
+}
+
+/// 已匹配的学生-考号对
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchedPair {
+    pub name: String,
+    pub sfz: String,
+    pub exam_number: u64,
+    pub class_num: u32,
+}
+
+/// 扫描阶段
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ScanPhase {
+    SeedDiscovery,    // 阶段1: 种子发现
+    ClassExpansion,   // 阶段2: 班级扩展
+    Cleanup,          // 阶段3: 残留清扫
+    Completed,        // 完成
+}
+
+impl ScanPhase {
+    pub fn label(&self) -> &str {
+        match self {
+            ScanPhase::SeedDiscovery => "种子发现",
+            ScanPhase::ClassExpansion => "班级扩展",
+            ScanPhase::Cleanup => "残留清扫",
+            ScanPhase::Completed => "已完成",
+        }
+    }
+}
+
+/// 任务状态
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum JobStatus {
+    Running,
+    Paused,
+    Completed,
+}
+
+/// 持久化的推算任务
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictionJob {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub status: JobStatus,
+
+    // 输入参数
+    pub target_url: String,
+    pub start_bkh: u64,
+    pub end_bkh: u64,
+    pub sfz_file_hash: String,
+    pub bkh_file_hash: String,
+    pub year_filter: u32,
+
+    // 进度
+    pub total_students: usize,
+    pub matched_count: usize,
+
+    // 核心数据
+    pub matched_pairs: Vec<MatchedPair>,
+    pub unmatched_students: Vec<StudentInfo>,
+    pub scanned_numbers: HashSet<u64>,
+
+    // 算法阶段
+    pub phase: ScanPhase,
+    pub anchors: Vec<Anchor>,
+    pub class_zones: Vec<ClassZone>,
+
+    // 统计
+    pub total_queries: u64,
+}
+
+impl PredictionJob {
+    pub fn new(
+        name: String,
+        target_url: String,
+        start_bkh: u64,
+        end_bkh: u64,
+        sfz_file_hash: String,
+        bkh_file_hash: String,
+        year_filter: u32,
+        students: Vec<StudentInfo>,
+    ) -> Self {
+        let total_students = students.len();
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let id = format!("job_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
+
+        Self {
+            id,
+            name,
+            created_at: now.clone(),
+            updated_at: now,
+            status: JobStatus::Paused,
+            target_url,
+            start_bkh,
+            end_bkh,
+            sfz_file_hash,
+            bkh_file_hash,
+            year_filter,
+            total_students,
+            matched_count: 0,
+            matched_pairs: Vec::new(),
+            unmatched_students: students,
+            scanned_numbers: HashSet::new(),
+            phase: ScanPhase::SeedDiscovery,
+            anchors: Vec::new(),
+            class_zones: Vec::new(),
+            total_queries: 0,
+        }
+    }
+
+    /// 获取指定班级的未匹配学生
+    pub fn unmatched_of_class(&self, class_num: u32) -> Vec<&StudentInfo> {
+        self.unmatched_students.iter()
+            .filter(|s| s.class_num == class_num)
+            .collect()
+    }
+
+    /// 获取所有存在的班级号（从未匹配学生中提取）
+    pub fn active_classes(&self) -> Vec<u32> {
+        let mut classes: Vec<u32> = self.unmatched_students.iter()
+            .map(|s| s.class_num)
+            .filter(|&c| c > 0)
+            .collect();
+        classes.sort();
+        classes.dedup();
+        classes
+    }
+
+    /// 获取已有锚点的班级号
+    pub fn anchored_classes(&self) -> Vec<u32> {
+        let mut classes: Vec<u32> = self.anchors.iter()
+            .map(|a| a.class_num)
+            .collect();
+        classes.sort();
+        classes.dedup();
+        classes
+    }
+
+    /// 获取尚未有锚点的班级号
+    pub fn unanchored_classes(&self) -> Vec<u32> {
+        let anchored = self.anchored_classes();
+        self.active_classes().into_iter()
+            .filter(|c| !anchored.contains(c))
+            .collect()
+    }
+
+    /// 标记一个匹配
+    pub fn record_match(&mut self, name: &str, sfz: &str, exam_number: u64, class_num: u32) {
+        // 从未匹配列表移除
+        self.unmatched_students.retain(|s| s.sfz != sfz);
+
+        // 添加到已匹配列表
+        self.matched_pairs.push(MatchedPair {
+            name: name.to_string(),
+            sfz: sfz.to_string(),
+            exam_number,
+            class_num,
+        });
+
+        self.matched_count = self.matched_pairs.len();
+
+        // 添加锚点
+        if !self.anchors.iter().any(|a| a.student_sfz == sfz) {
+            self.anchors.push(Anchor {
+                exam_number,
+                student_name: name.to_string(),
+                student_sfz: sfz.to_string(),
+                class_num,
+            });
+        }
+
+        // 更新或创建班级区域
+        if let Some(zone) = self.class_zones.iter_mut().find(|z| z.class_num == class_num) {
+            zone.expand_to_include(exam_number);
+            zone.matched_count += 1;
+        } else {
+            self.class_zones.push(ClassZone {
+                class_num,
+                start_number: exam_number,
+                end_number: exam_number,
+                matched_count: 1,
+                total_count: 0, // 暂时未知
+            });
+        }
+
+        self.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+
+    /// 获取进度百分比
+    pub fn progress_pct(&self) -> f64 {
+        if self.total_students == 0 { 0.0 }
+        else { self.matched_count as f64 / self.total_students as f64 * 100.0 }
+    }
+
+    /// 获取简要描述
+    pub fn summary(&self) -> String {
+        format!(
+            "{}/{} 匹配 ({:.0}%) | {} | {}",
+            self.matched_count,
+            self.total_students,
+            self.progress_pct(),
+            self.phase.label(),
+            match self.status {
+                JobStatus::Running => "运行中",
+                JobStatus::Paused => "暂停",
+                JobStatus::Completed => "完成",
+            }
+        )
+    }
 }

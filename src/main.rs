@@ -6,6 +6,7 @@ mod matcher;
 mod browser;
 mod ocr;
 mod prediction;
+mod job;
 
 use eframe::egui;
 use egui::FontDefinitions;
