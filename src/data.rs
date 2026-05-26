@@ -281,10 +281,10 @@ pub struct StudentInfo {
 /// 查询任务类型
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TaskType {
-    SeedProbe,      // 阶段1: 种子探测
-    ClassExpand,    // 阶段2: 班级扩展
-    ClassProbe,     // 阶段2: 班级探测（找未发现班级的代表）
-    Cleanup,        // 阶段3: 残留清扫
+    SeedProbe,      // 种子探测：用两班学生撞击种子号码
+    ClassExpand,    // 班级扩展：从锚点向两侧扩展
+    ClassScan,      // 班级扫描：在班级区域内扫描剩余学生
+    Cleanup,        // 残留清扫：处理最后未匹配的学生
 }
 
 /// 单个查询任务
@@ -363,17 +363,19 @@ pub struct MatchedPair {
 /// 扫描阶段
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ScanPhase {
-    SeedDiscovery,    // 阶段1: 种子发现
-    ClassExpansion,   // 阶段2: 班级扩展
-    Cleanup,          // 阶段3: 残留清扫
-    Completed,        // 完成
+    PairSeed,           // 两班种子：用2个班的学生撞5个种子号码
+    PairExpand,         // 两班扩展：在锚点附近扩展搜索
+    PairScan,           // 两班扫描：在确认的班级区域内扫描
+    Cleanup,            // 残留清扫：处理最后未匹配的学生
+    Completed,          // 完成
 }
 
 impl ScanPhase {
     pub fn label(&self) -> &str {
         match self {
-            ScanPhase::SeedDiscovery => "种子发现",
-            ScanPhase::ClassExpansion => "班级扩展",
+            ScanPhase::PairSeed => "两班种子",
+            ScanPhase::PairExpand => "两班扩展",
+            ScanPhase::PairScan => "两班扫描",
             ScanPhase::Cleanup => "残留清扫",
             ScanPhase::Completed => "已完成",
         }
@@ -420,6 +422,12 @@ pub struct PredictionJob {
     pub class_zones: Vec<ClassZone>,
     pub seed_cursor: u64,       // 种子扫描游标（持久化，恢复时不再重置）
 
+    // 两班递进扫描状态
+    pub class_pair_idx: usize,       // 当前处理的班级对索引
+    pub pair_cursor: u64,            // 当前对的搜索起点（end_bkh递减）
+    pub pair_round: usize,           // 当前对内第几轮（0=种子,1=扩展,2=扫描）
+    pub completed_class_nums: Vec<u32>,  // 已完成的班级号列表
+
     // 统计
     pub total_queries: u64,
 }
@@ -456,10 +464,14 @@ impl PredictionJob {
             matched_pairs: Vec::new(),
             unmatched_students: students,
             scanned_numbers: HashSet::new(),
-            phase: ScanPhase::SeedDiscovery,
+            phase: ScanPhase::PairSeed,
             anchors: Vec::new(),
             class_zones: Vec::new(),
-            seed_cursor: end_bkh,  // 初始从 end_bkh 开始向下扫描
+            seed_cursor: end_bkh,
+            class_pair_idx: 0,
+            pair_cursor: end_bkh,
+            pair_round: 0,
+            completed_class_nums: Vec::new(),
             total_queries: 0,
         }
     }

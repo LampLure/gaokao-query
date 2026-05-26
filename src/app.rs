@@ -1651,12 +1651,20 @@ impl GaokaoApp {
                 perf_logs,
                 captcha_stats,
                 browser_statuses,
+                pred_results.clone(),
             ).await;
 
-            // 写入结果
+            // 最终结果写入（实时结果已在 worker 中更新）
             {
                 let mut r_lock = pred_results.lock().await;
-                *r_lock = results;
+                // 添加未匹配的学生
+                for student in &results {
+                    if student.status == PredictedStatus::NotFound {
+                        if !r_lock.iter().any(|r| r.shenfenzheng == student.shenfenzheng) {
+                            r_lock.push(student.clone());
+                        }
+                    }
+                }
             }
 
             let mut l = logs.lock().await;
@@ -1801,12 +1809,20 @@ impl GaokaoApp {
                 perf_logs,
                 captcha_stats,
                 browser_statuses,
+                pred_results.clone(),
             ).await;
 
-            // 写入结果
+            // 最终结果写入（实时结果已在 worker 中更新）
             {
                 let mut r_lock = pred_results.lock().await;
-                *r_lock = results;
+                // 添加未匹配的学生
+                for student in &results {
+                    if student.status == PredictedStatus::NotFound {
+                        if !r_lock.iter().any(|r| r.shenfenzheng == student.shenfenzheng) {
+                            r_lock.push(student.clone());
+                        }
+                    }
+                }
             }
 
             let mut l = logs.lock().await;
