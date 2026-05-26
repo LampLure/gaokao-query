@@ -418,6 +418,7 @@ pub struct PredictionJob {
     pub phase: ScanPhase,
     pub anchors: Vec<Anchor>,
     pub class_zones: Vec<ClassZone>,
+    pub seed_cursor: u64,       // 种子扫描游标（持久化，恢复时不再重置）
 
     // 统计
     pub total_queries: u64,
@@ -458,6 +459,7 @@ impl PredictionJob {
             phase: ScanPhase::SeedDiscovery,
             anchors: Vec::new(),
             class_zones: Vec::new(),
+            seed_cursor: end_bkh,  // 初始从 end_bkh 开始向下扫描
             total_queries: 0,
         }
     }

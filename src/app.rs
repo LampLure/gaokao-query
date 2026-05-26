@@ -1022,6 +1022,15 @@ impl GaokaoApp {
                         );
                         if ui.selectable_label(is_selected, &label).clicked() {
                             self.pred_selected_job_id = Some(job_entry.id.clone());
+                            // 恢复选中任务的扫描范围到输入框
+                            self.pred_start_bkh = job_entry.start_bkh;
+                            self.pred_start_str = job_entry.start_bkh.to_string();
+                            self.pred_end_bkh = job_entry.end_bkh;
+                            self.pred_end_str = job_entry.end_bkh.to_string();
+                            self.pred_year_filter = job_entry.year_filter as f64;
+                            self.log(format!("选中任务: {} (阶段={}, 匹配={}/{})",
+                                job_entry.name, job_entry.phase.label(),
+                                job_entry.matched_count, job_entry.total_students));
                         }
                     }
                 });
@@ -1066,16 +1075,29 @@ impl GaokaoApp {
 
             ui.add_space(8.0);
 
-            // start / stop buttons
+            // start / stop / resume buttons
             ui.horizontal(|ui| {
                 if self.pred_state == QueryState::Idle {
-                    let can_start = self.pred_start_bkh > 0 && self.pred_end_bkh > 0 && self.pred_end_bkh > self.pred_start_bkh;
-                    if can_start {
-                        if ui.button(egui::RichText::new("▶ 开始推算").heading().color(egui::Color32::WHITE)).clicked() {
-                            self.start_prediction(ctx);
+                    // 检查是否选中了已有任务（可继续）
+                    let selected_job_resumable = self.pred_selected_job_id.as_ref()
+                        .and_then(|id| self.pred_job_list.iter().find(|j| &j.id == id))
+                        .map(|j| j.phase != ScanPhase::Completed)
+                        .unwrap_or(false);
+
+                    if selected_job_resumable {
+                        if ui.button(egui::RichText::new("▶ 继续推算").heading().color(egui::Color32::GREEN)).clicked() {
+                            self.resume_prediction(ctx);
                         }
+                        ui.label(egui::RichText::new("（接续选中的任务）").color(egui::Color32::LIGHT_BLUE));
                     } else {
-                        let _ = ui.button(egui::RichText::new("▶ 请设定开始/结束考号").heading().color(egui::Color32::GRAY));
+                        let can_start = self.pred_start_bkh > 0 && self.pred_end_bkh > 0 && self.pred_end_bkh > self.pred_start_bkh;
+                        if can_start {
+                            if ui.button(egui::RichText::new("▶ 开始推算").heading().color(egui::Color32::WHITE)).clicked() {
+                                self.start_prediction(ctx);
+                            }
+                        } else {
+                            let _ = ui.button(egui::RichText::new("▶ 请设定开始/结束考号").heading().color(egui::Color32::GRAY));
+                        }
                     }
                 }
                 if self.pred_state == QueryState::Running {
@@ -1562,6 +1584,139 @@ impl GaokaoApp {
             drop(l);
 
             // 调用新算法
+            let results = crate::prediction::run_prediction(
+                pool,
+                job,
+                known_bkh,
+                concurrency,
+                cancel,
+                pred_progress,
+                logs.clone(),
+                perf_logs,
+                captcha_stats,
+                browser_statuses,
+            ).await;
+
+            // 写入结果
+            {
+                let mut r_lock = pred_results.lock().await;
+                *r_lock = results;
+            }
+
+            let mut l = logs.lock().await;
+            l.push(format!("🏁 推算任务已完成。"));
+
+            pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
+    /// 继续已选中的推算任务（从磁盘加载状态）
+    fn resume_prediction(&mut self, _ctx: &egui::Context) {
+        let job_id = match &self.pred_selected_job_id {
+            Some(id) => id.clone(),
+            None => {
+                self.status_message = "请先选择一个任务".to_string();
+                return;
+            }
+        };
+
+        // 从磁盘加载任务
+        let mut job = match job::load_job(&job_id) {
+            Ok(j) => j,
+            Err(e) => {
+                self.status_message = format!("加载任务失败: {}", e);
+                self.log(&self.status_message);
+                return;
+            }
+        };
+
+        // 检查任务是否可以继续
+        if job.phase == ScanPhase::Completed {
+            self.status_message = "该任务已完成，无需继续".to_string();
+            return;
+        }
+
+        self.log(format!("📋 恢复任务: {} | 阶段={} | 匹配={}/{} | 已扫描={}个号",
+            job.name, job.phase.label(), job.matched_count, job.total_students, job.scanned_numbers.len()));
+
+        // 恢复UI状态
+        self.pred_state = QueryState::Running;
+        *self.pred_results.try_lock().unwrap() = Vec::new();
+        self.pred_displayed_results.clear();
+        self.cancel_flag.store(false, AtomicOrdering::Relaxed);
+
+        let concurrency = self.concurrency as usize;
+        let hide_browser = self.hide_browser;
+        let step_delay = self.step_delay_ms as u64;
+        let captcha_retries = self.captcha_retries;
+        let captcha_wait_ms = self.captcha_wait_ms as u64;
+        let target_url = job.target_url.clone();
+        let turbo = self.config.turbo;
+        let logs = self.debug_logs.clone();
+        let perf_logs = self.perf_logs.clone();
+        let cancel = self.cancel_flag.clone();
+        let pred_results = self.pred_results.clone();
+        let pred_progress = self.pred_progress.clone();
+        let captcha_stats = self.captcha_stats.clone();
+        let browser_statuses = self.browser_statuses.clone();
+        let pred_done = self.pred_done.clone();
+
+        // 已知报考号 → HashMap<name, exam_number>
+        let known_bkh: HashMap<String, u64> = self.pred_known_bkh.iter()
+            .filter_map(|r| r.baominghao.parse::<u64>().ok().map(|n| (r.name.clone(), n)))
+            .collect();
+
+        // 标记任务状态为运行中
+        job.status = JobStatus::Running;
+        if let Err(e) = job::save_job(&job) {
+            self.log(format!("保存任务状态失败: {}", e));
+        }
+
+        // 更新任务列表
+        self.pred_job_list = job::list_jobs();
+
+        let job_name = job.name.clone();
+
+        tokio::spawn(async move {
+            let pool = match crate::browser::BrowserPool::new(
+                concurrency, hide_browser, step_delay, captcha_retries, captcha_wait_ms,
+                &target_url, Some(logs.clone()), turbo,
+            ).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let mut l = logs.lock().await;
+                    l.push(format!("[ERROR] 浏览器池启动失败：{}", e));
+                    pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            };
+
+            // 初始化浏览器状态追踪
+            {
+                let mut statuses = browser_statuses.lock().await;
+                *statuses = (0..concurrency).map(|i| BrowserStatus {
+                    id: i as u64,
+                    step: BrowserStep::Idle,
+                    target: String::new(),
+                    name: String::new(),
+                    captcha_attempt: 0,
+                    captcha_max: 0,
+                    elapsed_ms: 0,
+                }).collect();
+            }
+
+            // 重置验证码统计
+            {
+                let mut cs = captcha_stats.lock().await;
+                *cs = CaptchaStats::default();
+            }
+
+            let mut l = logs.lock().await;
+            l.push(format!("=================================================="));
+            l.push(format!("[恢复任务] {} | 继续推算", job_name));
+            drop(l);
+
+            // 调用推算算法（传入已有的 job，含 scanned_numbers/matched_pairs 等）
             let results = crate::prediction::run_prediction(
                 pool,
                 job,

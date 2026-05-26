@@ -38,7 +38,10 @@ struct TaskScheduler {
 
 impl TaskScheduler {
     fn new(job: PredictionJob, known_bkh: HashMap<String, u64>) -> Self {
-        let seed_cursor = job.end_bkh;
+        // seed_cursor 从 job 中恢复（已持久化），新任务时为 end_bkh
+        let seed_cursor = job.seed_cursor;
+        // 如果任务已有匹配记录，说明 known_bkh 之前已处理过
+        let known_bkh_processed = !job.matched_pairs.is_empty() || known_bkh.is_empty();
         Self {
             job,
             task_queue: VecDeque::new(),
@@ -46,7 +49,7 @@ impl TaskScheduler {
             batch_counter: 0,
             seed_cursor,
             rep_rotation: 0,
-            known_bkh_processed: false,
+            known_bkh_processed,
         }
     }
 
@@ -557,6 +560,9 @@ pub async fn run_prediction(
                         p.phase = phase;
                         p.not_found = scanned - matched_count;
                     }
+
+                    // 同步 seed_cursor 到 job（持久化时需要保存）
+                    sched.job.seed_cursor = sched.seed_cursor;
 
                     // 持久化任务（每批处理完保存一次）
                     let save_err = crate::job::save_job(&sched.job).err();
