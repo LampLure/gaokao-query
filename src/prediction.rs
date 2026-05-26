@@ -12,17 +12,14 @@ use crate::data::{
 /// 批次大小：每个工人每次领取的任务数
 const BATCH_SIZE: usize = 10;
 
-/// 班级扩展时，每个号码最多尝试的同班学生数
-const EXPAND_MAX_TRIES_PER_NUMBER: usize = 50;
+/// 种子扫描时，每个号码尝试几个班级代表（轮转）
+const SEED_REPS_PER_NUMBER: usize = 3;
 
-/// 种子探测时，每个号码尝试的学生数
-const SEED_PROBE_STUDENTS_PER_NUMBER: usize = 10;
-
-/// 班级探测时，每个代表学生尝试的号码范围
-const CLASS_PROBE_RANGE: u64 = 200;
+/// 一次生成任务的上限（防止队列过长）
+const MAX_TASKS_PER_GENERATION: usize = BATCH_SIZE * 5;
 
 // ═══════════════════════════════════════════════════════════
-//  任务调度器：根据当前阶段生成任务
+//  任务调度器：号码中心扫描 + 班级代表轮转
 // ═══════════════════════════════════════════════════════════
 
 struct TaskScheduler {
@@ -30,15 +27,25 @@ struct TaskScheduler {
     task_queue: VecDeque<QueryTask>,
     known_bkh: HashMap<String, u64>,  // name → exam_number (from known bkh table)
     batch_counter: u32,
+    /// 种子扫描游标：从 end_bkh 向 start_bkh 递减扫描
+    seed_cursor: u64,
+    /// 班级代表轮转索引
+    rep_rotation: usize,
+    /// 是否已处理过已知报考号
+    known_bkh_processed: bool,
 }
 
 impl TaskScheduler {
     fn new(job: PredictionJob, known_bkh: HashMap<String, u64>) -> Self {
+        let seed_cursor = job.end_bkh;
         Self {
             job,
             task_queue: VecDeque::new(),
             known_bkh,
             batch_counter: 0,
+            seed_cursor,
+            rep_rotation: 0,
+            known_bkh_processed: false,
         }
     }
 
@@ -54,7 +61,7 @@ impl TaskScheduler {
             ScanPhase::SeedDiscovery => {
                 self.generate_seed_tasks();
                 if self.task_queue.is_empty() {
-                    // 种子阶段完成，切换到班级扩展
+                    // 种子阶段完成（所有号码扫完或所有班级都有锚点），切换到班级扩展
                     self.job.phase = ScanPhase::ClassExpansion;
                     self.generate_expand_tasks();
                 }
@@ -98,13 +105,18 @@ impl TaskScheduler {
         Some(TaskBatch { tasks, batch_id })
     }
 
-    /// 阶段1: 种子发现
-    /// - 如果有已知报考号表，直接用
-    /// - 否则，对每个班级选代表学生，在范围内稀疏探测
+    // ═══════════════════════════════════════════════════════════
+    //  阶段1: 种子发现（号码中心扫描）
+    //
+    //  核心思路：从 end_bkh 向 start_bkh 逐号扫描
+    //  每个号码尝试几个不同班级的代表（轮转），而非一个人试很多号
+    //  这样每批10个任务里会有不同班级的学生，不会"一直拿同一个人撞"
+    // ═══════════════════════════════════════════════════════════
+
     fn generate_seed_tasks(&mut self) {
         // 先用已知报考号表做种子（0查询成本）
-        if !self.known_bkh.is_empty() {
-            // 已知表里的人直接加入匹配（不需要查询）
+        if !self.known_bkh_processed && !self.known_bkh.is_empty() {
+            self.known_bkh_processed = true;
             let known_pairs: Vec<(String, String, u64, u32)> = self.job.unmatched_students.iter()
                 .filter_map(|s| {
                     if let Some(&exam_num) = self.known_bkh.get(&s.name) {
@@ -118,62 +130,90 @@ impl TaskScheduler {
             for (name, sfz, exam_num, class_num) in &known_pairs {
                 self.job.record_match(name, sfz, *exam_num, *class_num);
             }
-            // 种子直接来自已知表，无需查询
             self.task_queue.clear();
             return;
         }
 
-        // 无已知表：稀疏探测
+        // 获取所有无锚点的班级
         let unanchored = self.job.unanchored_classes();
         if unanchored.is_empty() {
+            // 所有班级都找到了锚点，种子阶段完成
             return;
         }
 
-        let scan_low = self.job.start_bkh;
-        let scan_high = self.job.end_bkh;
-        let range = scan_high - scan_low;
+        // 为每个无锚点班级选一个代表学生
+        let reps: Vec<(u32, StudentInfo)> = unanchored.iter()
+            .filter_map(|&c| {
+                self.job.unmatched_of_class(c).first().cloned().map(|s| (c, s.clone()))
+            })
+            .collect();
 
-        // 对每个无锚点的班级，选一个代表学生
-        for class_num in &unanchored {
-            let rep = self.job.unmatched_of_class(*class_num).first().cloned();
-            if let Some(rep) = rep {
-                // 均匀探测：从范围中取若干点
-                let num_probes = (range / 50).min(40).max(10) as usize;
-                for i in 0..num_probes {
-                    let offset = (range as usize * i / num_probes) as u64;
-                    let probe_number = scan_low + offset;
-                    if !self.job.scanned_numbers.contains(&probe_number) {
-                        self.task_queue.push_back(QueryTask {
-                            exam_number: probe_number,
-                            student_sfz: rep.sfz.clone(),
-                            student_name: rep.name.clone(),
-                            class_num: *class_num,
-                            task_type: TaskType::SeedProbe,
-                        });
-                    }
-                }
+        if reps.is_empty() {
+            return;
+        }
+
+        // 号码中心扫描：从 seed_cursor 向下扫描
+        let mut tasks_generated = 0;
+
+        while self.seed_cursor >= self.job.start_bkh && tasks_generated < MAX_TASKS_PER_GENERATION {
+            let num = self.seed_cursor;
+
+            // 向下移动游标（不管当前号码是否跳过，游标都要前进）
+            if self.seed_cursor == 0 {
+                break;
             }
+            self.seed_cursor -= 1;
+
+            // 跳过已扫描的号码
+            if self.job.scanned_numbers.contains(&num) {
+                continue;
+            }
+
+            // 轮转选取班级代表：每次取 SEED_REPS_PER_NUMBER 个代表
+            let reps_count = reps.len();
+            for i in 0..SEED_REPS_PER_NUMBER.min(reps_count) {
+                let idx = (self.rep_rotation + i) % reps_count;
+                let (class_num, rep) = &reps[idx];
+                self.task_queue.push_back(QueryTask {
+                    exam_number: num,
+                    student_sfz: rep.sfz.clone(),
+                    student_name: rep.name.clone(),
+                    class_num: *class_num,
+                    task_type: TaskType::SeedProbe,
+                });
+                tasks_generated += 1;
+            }
+
+            // 轮转偏移，让下一轮号码尝试不同的班级组合
+            self.rep_rotation = (self.rep_rotation + 1) % reps_count;
         }
     }
 
-    /// 阶段2: 班级扩展
-    /// - 对已有锚点的班级，向两侧扩展
-    /// - 对无锚点的班级，选代表学生在已知区域附近探测
+    // ═══════════════════════════════════════════════════════════
+    //  阶段2: 班级扩展
+    //
+    //  对已有锚点的班级：从锚点向两侧扩展，每边每次只扩展1个号码
+    //  对每个边界号码，只尝试1个未匹配学生（轮流），而非一次试50个
+    //  对无锚点班级：继续用号码中心扫描（与种子阶段相同策略）
+    // ═══════════════════════════════════════════════════════════
+
     fn generate_expand_tasks(&mut self) {
         let anchored = self.job.anchored_classes();
+        let unanchored = self.job.unanchored_classes();
 
+        // 对有锚点的班级，向两侧扩展
         for class_num in &anchored {
             self.generate_expand_for_class(*class_num);
         }
 
-        // 对无锚点班级，在已知区域间隙中探测
-        let unanchored = self.job.unanchored_classes();
-        for class_num in &unanchored {
-            self.generate_class_probe(*class_num);
+        // 对无锚点的班级，继续号码中心扫描（复用种子扫描的游标）
+        if !unanchored.is_empty() {
+            self.generate_seed_tasks();
         }
     }
 
-    /// 为单个班级生成扩展任务
+    /// 为单个有锚点班级生成扩展任务
+    /// 每个边界号码只尝试1个未匹配学生，轮流使用不同学生
     fn generate_expand_for_class(&mut self, class_num: u32) {
         let anchors: Vec<&Anchor> = self.job.anchors.iter()
             .filter(|a| a.class_num == class_num)
@@ -195,23 +235,21 @@ impl TaskScheduler {
         let (left_bound, right_bound) = if let Some(z) = zone {
             (z.start_number, z.end_number)
         } else {
-            // 没有zone，用锚点的最小/最大号码
             let min = anchors.iter().map(|a| a.exam_number).min().unwrap_or(0);
             let max = anchors.iter().map(|a| a.exam_number).max().unwrap_or(0);
             (min, max)
         };
 
-        // 向左扩展 (left_bound - 1, left_bound - 2, ...)
-        let left_start = if left_bound > self.job.start_bkh { left_bound - 1 } else { self.job.start_bkh };
-        for offset in 1..=EXPAND_MAX_TRIES_PER_NUMBER as u64 {
-            let num = if left_start >= offset { left_start - offset + 1 } else { break };
-            // 不超过班级预期大小（约50人）的距离
-            if offset > 60 { break; }
-            if self.job.scanned_numbers.contains(&num) { continue; }
-            if num < self.job.start_bkh { break; }
+        // 向左扩展：找到下一个未扫描的号码，只试1个学生
+        if left_bound > self.job.start_bkh {
+            for offset in 1..=60u64 {
+                let num = if left_bound >= offset { left_bound - offset } else { break };
+                if num < self.job.start_bkh { break; }
+                if self.job.scanned_numbers.contains(&num) { continue; }
 
-            // 为这个号码尝试同班未匹配学生（最多EXPAND_MAX_TRIES_PER_NUMBER个）
-            for student in unmatched_class.iter().take(EXPAND_MAX_TRIES_PER_NUMBER) {
+                // 只选1个未匹配学生（轮流选取）
+                let student_idx = (num as usize) % unmatched_class.len();
+                let student = &unmatched_class[student_idx];
                 self.task_queue.push_back(QueryTask {
                     exam_number: num,
                     student_sfz: student.sfz.clone(),
@@ -219,19 +257,19 @@ impl TaskScheduler {
                     class_num,
                     task_type: TaskType::ClassExpand,
                 });
+                break; // 每次只扩展1个号码
             }
-            break; // 每次只扩展1个号码，等结果后再继续
         }
 
-        // 向右扩展 (right_bound + 1, right_bound + 2, ...)
-        let right_start = if right_bound < self.job.end_bkh { right_bound + 1 } else { self.job.end_bkh };
-        for offset in 0..EXPAND_MAX_TRIES_PER_NUMBER as u64 {
-            let num = right_start + offset;
-            if offset > 60 { break; }
-            if self.job.scanned_numbers.contains(&num) { continue; }
-            if num > self.job.end_bkh { break; }
+        // 向右扩展：同理
+        if right_bound < self.job.end_bkh {
+            for offset in 1..=60u64 {
+                let num = right_bound + offset;
+                if num > self.job.end_bkh { break; }
+                if self.job.scanned_numbers.contains(&num) { continue; }
 
-            for student in unmatched_class.iter().take(EXPAND_MAX_TRIES_PER_NUMBER) {
+                let student_idx = (num as usize) % unmatched_class.len();
+                let student = &unmatched_class[student_idx];
                 self.task_queue.push_back(QueryTask {
                     exam_number: num,
                     student_sfz: student.sfz.clone(),
@@ -239,121 +277,51 @@ impl TaskScheduler {
                     class_num,
                     task_type: TaskType::ClassExpand,
                 });
-            }
-            break;
-        }
-    }
-
-    /// 为无锚点班级生成探测任务
-    fn generate_class_probe(&mut self, class_num: u32) {
-        let rep = self.job.unmatched_of_class(class_num).first().cloned();
-        if let Some(rep) = rep {
-            // 在已知班级区域的间隙中搜索
-            let mut candidate_numbers: Vec<u64> = Vec::new();
-
-            // 在已知区域之间找间隙
-            let mut zone_boundaries: Vec<u64> = self.job.class_zones.iter()
-                .flat_map(|z| [z.start_number, z.end_number])
-                .collect();
-            zone_boundaries.sort();
-
-            if zone_boundaries.is_empty() {
-                // 没有任何已知区域，从范围中间开始探测
-                let mid = (self.job.start_bkh + self.job.end_bkh) / 2;
-                for offset in 0..CLASS_PROBE_RANGE {
-                    let num = mid + offset;
-                    if num <= self.job.end_bkh && !self.job.scanned_numbers.contains(&num) {
-                        candidate_numbers.push(num);
-                    }
-                    if offset > 0 {
-                        let num = mid - offset;
-                        if num >= self.job.start_bkh && !self.job.scanned_numbers.contains(&num) {
-                            candidate_numbers.push(num);
-                        }
-                    }
-                }
-            } else {
-                // 在区域间隙中搜索
-                for i in 0..zone_boundaries.len().saturating_sub(1) {
-                    let gap_start = zone_boundaries[i] + 1;
-                    let gap_end = zone_boundaries[i + 1].saturating_sub(1);
-                    if gap_start >= gap_end { continue; }
-
-                    // 在间隙中均匀取点
-                    let gap_size = gap_end - gap_start;
-                    let step = (gap_size / 10).max(1);
-                    let mut num = gap_start;
-                    while num <= gap_end {
-                        if !self.job.scanned_numbers.contains(&num) {
-                            candidate_numbers.push(num);
-                        }
-                        num += step;
-                    }
-                }
-
-                // 也在范围两端搜索
-                for offset in 0..CLASS_PROBE_RANGE.min(100) {
-                    let num = self.job.start_bkh + offset;
-                    if num <= self.job.end_bkh && !self.job.scanned_numbers.contains(&num) {
-                        candidate_numbers.push(num);
-                    }
-                    let num = self.job.end_bkh - offset;
-                    if num >= self.job.start_bkh && !self.job.scanned_numbers.contains(&num) {
-                        candidate_numbers.push(num);
-                    }
-                }
-            }
-
-            candidate_numbers.sort();
-            candidate_numbers.dedup();
-
-            for num in candidate_numbers.into_iter().take(200) {
-                self.task_queue.push_back(QueryTask {
-                    exam_number: num,
-                    student_sfz: rep.sfz.clone(),
-                    student_name: rep.name.clone(),
-                    class_num,
-                    task_type: TaskType::ClassProbe,
-                });
+                break; // 每次只扩展1个号码
             }
         }
     }
 
-    /// 阶段3: 残留清扫
+    // ═══════════════════════════════════════════════════════════
+    //  阶段3: 残留清扫
+    //
+    //  对剩余未匹配学生，在班级区域边界和范围中搜索
+    //  每个号码只尝试1个学生（交错分配），避免一个人撞所有号
+    // ═══════════════════════════════════════════════════════════
+
     fn generate_cleanup_tasks(&mut self) {
         let unmatched = self.job.unmatched_students.clone();
         if unmatched.is_empty() {
             return;
         }
 
-        // 对每个未匹配学生，在所有未被标记为已匹配的号码上尝试
         let matched_numbers: HashSet<u64> = self.job.matched_pairs.iter()
             .map(|p| p.exam_number)
             .collect();
 
-        // 优先在已知班级区域的边界附近搜索
+        // 收集候选号码
         let mut candidate_numbers: Vec<u64> = Vec::new();
 
-        // 班级区域边界附近 ±5
+        // 优先在班级区域边界附近搜索 ±10
         for zone in &self.job.class_zones {
-            for offset in 1..=5u64 {
+            for offset in 1..=10u64 {
                 let left = zone.start_number.saturating_sub(offset);
                 let right = zone.end_number + offset;
-                if left >= self.job.start_bkh && !matched_numbers.contains(&left) {
+                if left >= self.job.start_bkh && !matched_numbers.contains(&left) && !self.job.scanned_numbers.contains(&left) {
                     candidate_numbers.push(left);
                 }
-                if right <= self.job.end_bkh && !matched_numbers.contains(&right) {
+                if right <= self.job.end_bkh && !matched_numbers.contains(&right) && !self.job.scanned_numbers.contains(&right) {
                     candidate_numbers.push(right);
                 }
             }
         }
 
-        // 然后在整个范围内均匀搜索
+        // 然后在未扫描的号码中均匀搜索
         let range = self.job.end_bkh - self.job.start_bkh;
         let step = (range / 200).max(1);
         let mut num = self.job.start_bkh;
         while num <= self.job.end_bkh {
-            if !matched_numbers.contains(&num) {
+            if !matched_numbers.contains(&num) && !self.job.scanned_numbers.contains(&num) {
                 candidate_numbers.push(num);
             }
             num += step;
@@ -362,17 +330,21 @@ impl TaskScheduler {
         candidate_numbers.sort();
         candidate_numbers.dedup();
 
-        // 每个未匹配学生 × 候选号码
-        for student in &unmatched {
-            for &num in candidate_numbers.iter().take(300) {
-                self.task_queue.push_back(QueryTask {
-                    exam_number: num,
-                    student_sfz: student.sfz.clone(),
-                    student_name: student.name.clone(),
-                    class_num: student.class_num,
-                    task_type: TaskType::Cleanup,
-                });
-            }
+        // 交错分配：每个号码分配给不同的学生
+        // 而非每个学生试所有号码（那样会导致同一个人反复出现）
+        let nums_to_try = candidate_numbers.into_iter().take(500).collect::<Vec<_>>();
+        let student_count = unmatched.len();
+
+        for (i, &num) in nums_to_try.iter().enumerate() {
+            // 交错：第i个号码分配给第(i % student_count)个学生
+            let student = &unmatched[i % student_count];
+            self.task_queue.push_back(QueryTask {
+                exam_number: num,
+                student_sfz: student.sfz.clone(),
+                student_name: student.name.clone(),
+                class_num: student.class_num,
+                task_type: TaskType::Cleanup,
+            });
         }
     }
 
@@ -392,7 +364,7 @@ impl TaskScheduler {
             }
         }
 
-        // 检查阶段切换
+        // 检查阶段切换：种子阶段一旦有锚点就切换到扩展
         if self.job.phase == ScanPhase::SeedDiscovery && !self.job.anchors.is_empty() {
             self.job.phase = ScanPhase::ClassExpansion;
         }
@@ -450,8 +422,9 @@ pub async fn run_prediction(
 
     {
         let mut l = logs.lock().await;
-        l.push(format!("🚀 [班级锚点扩展] 启动！任务={} | 学生数={} | 已匹配={} | 阶段={}",
+        l.push(format!("🚀 [号码中心扫描] 启动！任务={} | 学生数={} | 已匹配={} | 阶段={}",
             job_name, total_students, job.matched_count, job.phase.label()));
+        l.push(format!("   策略：逐号扫描 + 班级代表轮转，每号尝试{}个不同班级代表", SEED_REPS_PER_NUMBER));
     }
 
     // 初始化调度器
@@ -521,8 +494,6 @@ pub async fn run_prediction(
                         &task.student_name,
                     ).await;
 
-                    // go_home 在 pool.release() 中自动调用，无需手动
-
                     let matched = match &result {
                         Ok(res) => {
                             // 检查返回的姓名是否匹配
@@ -572,21 +543,32 @@ pub async fn run_prediction(
 
                     // 更新进度
                     let matched_count = sched.job.matched_count;
-                    let unmatched_count = sched.job.unmatched_students.len();
                     let total_queries = sched.job.total_queries;
                     let phase = sched.job.phase.label().to_string();
+                    let cursor = sched.seed_cursor;
+                    let scanned = sched.job.scanned_numbers.len();
 
                     {
                         let mut p = progress.lock().await;
                         p.matched = matched_count;
                         p.total_queries = total_queries;
                         p.phase = phase;
+                        p.not_found = scanned - matched_count;
                     }
 
                     // 持久化任务（每批处理完保存一次）
                     if let Err(e) = crate::job::save_job(&sched.job) {
                         let mut l = logs.lock().await;
                         l.push(format!("⚠️ 保存任务进度失败: {}", e));
+                    }
+
+                    // 日志：每批输出扫描进度
+                    {
+                        let mut l = logs.lock().await;
+                        l.push(format!(
+                            "📊 扫描游标={} | 已扫描={} | 已匹配={}/{} | 查询={}",
+                            cursor, scanned, matched_count, sched.job.total_students, total_queries
+                        ));
                     }
                 }
             }
@@ -653,7 +635,7 @@ pub async fn run_prediction(
 impl QueryTask {
     fn task_type_label(&self) -> &str {
         match self.task_type {
-            TaskType::SeedProbe => "种子探测",
+            TaskType::SeedProbe => "种子扫描",
             TaskType::ClassExpand => "班级扩展",
             TaskType::ClassProbe => "班级探测",
             TaskType::Cleanup => "残留清扫",
