@@ -247,7 +247,8 @@ impl eframe::App for GaokaoApp {
                 }
             }
             if let Ok(r) = self.pred_results.try_lock() {
-                if r.len() != self.pred_displayed_results.len() {
+                // 内容或长度变化时都要更新（不能只比较长度，因为中间记录可能更新了科类/考点信息）
+                if r.len() != self.pred_displayed_results.len() || !r.iter().zip(self.pred_displayed_results.iter()).all(|(a, b)| a.name == b.name && a.exam_number == b.exam_number) {
                     self.pred_displayed_results = r.clone();
                 }
             }
@@ -1191,10 +1192,14 @@ impl GaokaoApp {
                             .column(Column::auto().resizable(true))
                             .column(Column::auto().resizable(true))
                             .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
+                            .column(Column::auto().resizable(true))
                             .header(20.0, |mut h| {
                                 h.col(|ui| { ui.label("姓名"); });
                                 h.col(|ui| { ui.label("身份证号"); });
                                 h.col(|ui| { ui.label("推算报考号"); });
+                                h.col(|ui| { ui.label("科类"); });
+                                h.col(|ui| { ui.label("考点"); });
                                 h.col(|ui| { ui.label("状态"); });
                             })
                             .body(|body| {
@@ -1205,6 +1210,8 @@ impl GaokaoApp {
                                         row.col(|ui| { ui.label(&r.name); });
                                         row.col(|ui| { ui.label(&r.shenfenzheng); });
                                         row.col(|ui| { ui.label(&r.exam_number); });
+                                        row.col(|ui| { ui.label(&r.kemumingcheng); });
+                                        row.col(|ui| { ui.label(&r.kaodianmingcheng); });
                                         row.col(|ui| {
                                             match &r.status {
                                                 PredictedStatus::Matched => {
@@ -1716,8 +1723,21 @@ impl GaokaoApp {
 
         // 恢复UI状态
         self.pred_state = QueryState::Running;
-        *self.pred_results.try_lock().unwrap() = Vec::new();
-        self.pred_displayed_results.clear();
+        // 将已匹配的结果立即加载到 UI 中（不再清空，保留已有结果）
+        {
+            let mut r_lock = self.pred_results.try_lock().unwrap();
+            *r_lock = job.matched_pairs.iter()
+                .map(|p| PredictedRecord {
+                    name: p.name.clone(),
+                    shenfenzheng: p.sfz.clone(),
+                    exam_number: p.exam_number.to_string(),
+                    kemumingcheng: p.kemumingcheng.clone(),
+                    kaodianmingcheng: p.kaodianmingcheng.clone(),
+                    status: PredictedStatus::Matched,
+                })
+                .collect();
+        }
+        self.pred_displayed_results.clear();  // 强制刷新显示
         self.cancel_flag.store(false, AtomicOrdering::Relaxed);
 
         // 递增 generation counter，防止旧任务的 pred_done 干扰
@@ -1849,7 +1869,7 @@ impl GaokaoApp {
             use rust_xlsxwriter::*;
             let mut workbook = Workbook::new();
             let sheet = workbook.add_worksheet();
-            let headers = ["姓名", "身份证号", "推算报考号", "状态"];
+            let headers = ["姓名", "身份证号", "推算报考号", "科类", "考点", "状态"];
             for (col, h) in headers.iter().enumerate() {
                 let _ = sheet.write_string(0, col as u16, *h);
             }
@@ -1858,11 +1878,13 @@ impl GaokaoApp {
                 let _ = sheet.write_string(ri, 0, &r.name);
                 let _ = sheet.write_string(ri, 1, &r.shenfenzheng);
                 let _ = sheet.write_string(ri, 2, &r.exam_number);
+                let _ = sheet.write_string(ri, 3, &r.kemumingcheng);
+                let _ = sheet.write_string(ri, 4, &r.kaodianmingcheng);
                 let status = match &r.status {
                     PredictedStatus::Matched => "已匹配",
                     PredictedStatus::NotFound => "未找到",
                 };
-                let _ = sheet.write_string(ri, 3, status);
+                let _ = sheet.write_string(ri, 5, status);
             }
             let _ = workbook.save(&path);
         }

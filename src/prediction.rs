@@ -280,51 +280,52 @@ impl TaskScheduler {
             // 获取扩展偏移
             let offset = self.expand_cursors.entry(class_num).or_insert(1);
 
-            // 向左扩展
+            // 向左扩展：每次扩展2个考号，每个考号用所有未匹配学生撞
             if left_bound > self.job.start_bkh {
-                for delta in *offset..=*offset + 5 {
+                for delta in *offset..=*offset + 1 {
                     let num = if left_bound >= delta { left_bound - delta } else { break };
                     if num < self.job.start_bkh { break; }
                     if self.job.scanned_numbers.contains(&num) { continue; }
                     if self.job.matched_pairs.iter().any(|p| p.exam_number == num) { continue; }
 
-                    // 轮流选一个未匹配学生
-                    let student_idx = (num as usize) % unmatched.len();
-                    let student = &unmatched[student_idx];
-                    self.task_queue.push_back(QueryTask {
-                        exam_number: num,
-                        student_sfz: student.sfz.clone(),
-                        student_name: student.name.clone(),
-                        class_num,
-                        task_type: TaskType::ClassExpand,
-                    });
-                    tasks_generated += 1;
+                    // 用所有未匹配学生撞这个考号（暴力搜索）
+                    for student in &unmatched {
+                        self.task_queue.push_back(QueryTask {
+                            exam_number: num,
+                            student_sfz: student.sfz.clone(),
+                            student_name: student.name.clone(),
+                            class_num,
+                            task_type: TaskType::ClassExpand,
+                        });
+                        tasks_generated += 1;
+                    }
                 }
             }
 
-            // 向右扩展
+            // 向右扩展：每次扩展2个考号，每个考号用所有未匹配学生撞
             if right_bound < self.job.end_bkh {
-                for delta in *offset..=*offset + 5 {
+                for delta in *offset..=*offset + 1 {
                     let num = right_bound + delta;
                     if num > self.job.end_bkh { break; }
                     if self.job.scanned_numbers.contains(&num) { continue; }
                     if self.job.matched_pairs.iter().any(|p| p.exam_number == num) { continue; }
 
-                    let student_idx = (num as usize) % unmatched.len();
-                    let student = &unmatched[student_idx];
-                    self.task_queue.push_back(QueryTask {
-                        exam_number: num,
-                        student_sfz: student.sfz.clone(),
-                        student_name: student.name.clone(),
-                        class_num,
-                        task_type: TaskType::ClassExpand,
-                    });
-                    tasks_generated += 1;
+                    // 用所有未匹配学生撞这个考号
+                    for student in &unmatched {
+                        self.task_queue.push_back(QueryTask {
+                            exam_number: num,
+                            student_sfz: student.sfz.clone(),
+                            student_name: student.name.clone(),
+                            class_num,
+                            task_type: TaskType::ClassExpand,
+                        });
+                        tasks_generated += 1;
+                    }
                 }
             }
 
-            // 推进偏移
-            *offset += 6;
+            // 推进偏移（每次扩展2个考号位置）
+            *offset += 2;
 
             if tasks_generated >= MAX_TASKS_PER_GENERATION {
                 return;
@@ -337,27 +338,31 @@ impl TaskScheduler {
                 let unmatched = self.job.unmatched_of_class(class_num);
                 if unmatched.is_empty() { continue; }
 
-                // 从种子区域往前继续搜索
+                // 从种子区域往前继续搜索，每次取3个考号，用所有学生撞
                 let search_start = self.current_seeds.last().copied().unwrap_or(self.job.pair_cursor);
                 let search_end = self.job.pair_cursor;
 
+                let mut nums_to_scan = Vec::new();
                 for num in (search_start..=search_end).rev() {
                     if num < self.job.start_bkh { break; }
                     if self.job.scanned_numbers.contains(&num) { continue; }
+                    nums_to_scan.push(num);
+                    if nums_to_scan.len() >= 3 { break; }  // 每次3个考号
+                }
 
-                    // 每个号码只用1个学生试探
-                    let student_idx = (num as usize) % unmatched.len();
-                    let student = &unmatched[student_idx];
-                    self.task_queue.push_back(QueryTask {
-                        exam_number: num,
-                        student_sfz: student.sfz.clone(),
-                        student_name: student.name.clone(),
-                        class_num,
-                        task_type: TaskType::ClassExpand,
-                    });
-                    tasks_generated += 1;
-                    if tasks_generated >= MAX_TASKS_PER_GENERATION {
-                        return;
+                for num in nums_to_scan {
+                    for student in &unmatched {
+                        self.task_queue.push_back(QueryTask {
+                            exam_number: num,
+                            student_sfz: student.sfz.clone(),
+                            student_name: student.name.clone(),
+                            class_num,
+                            task_type: TaskType::ClassExpand,
+                        });
+                        tasks_generated += 1;
+                        if tasks_generated >= MAX_TASKS_PER_GENERATION {
+                            return;
+                        }
                     }
                 }
             }
@@ -387,7 +392,7 @@ impl TaskScheduler {
                 continue; // 没有区域信息，无法扫描
             };
 
-            // 在班级区域 ±EXPAND_SEARCH_RADIUS 内，对未扫描的号码尝试未匹配学生
+            // 在班级区域 ±EXPAND_SEARCH_RADIUS 内，对未扫描的号码尝试所有未匹配学生
             let scan_start = zone_start.saturating_sub(EXPAND_SEARCH_RADIUS);
             let scan_end = std::cmp::min(zone_end + EXPAND_SEARCH_RADIUS, self.job.end_bkh);
 
@@ -396,19 +401,19 @@ impl TaskScheduler {
                 if self.job.scanned_numbers.contains(&num) { continue; }
                 if self.job.matched_pairs.iter().any(|p| p.exam_number == num) { continue; }
 
-                // 轮流分配学生
-                let student_idx = (num as usize) % unmatched.len();
-                let student = &unmatched[student_idx];
-                self.task_queue.push_back(QueryTask {
-                    exam_number: num,
-                    student_sfz: student.sfz.clone(),
-                    student_name: student.name.clone(),
-                    class_num,
-                    task_type: TaskType::ClassScan,
-                });
-                tasks_generated += 1;
-                if tasks_generated >= MAX_TASKS_PER_GENERATION {
-                    return;
+                // 对每个考号，用所有未匹配学生暴力撞击
+                for student in &unmatched {
+                    self.task_queue.push_back(QueryTask {
+                        exam_number: num,
+                        student_sfz: student.sfz.clone(),
+                        student_name: student.name.clone(),
+                        class_num,
+                        task_type: TaskType::ClassScan,
+                    });
+                    tasks_generated += 1;
+                    if tasks_generated >= MAX_TASKS_PER_GENERATION {
+                        return;
+                    }
                 }
             }
         }
@@ -421,26 +426,31 @@ impl TaskScheduler {
             let has_zone = self.job.class_zones.iter().any(|z| z.class_num == class_num);
             if has_zone { continue; }
 
-            // 没有区域的班级：在种子范围 ±200 内搜索
+            // 没有区域的班级：在种子范围 ±200 内搜索，每次3个考号
             let search_start = self.job.pair_cursor.saturating_sub(SEED_RANGE + 100);
             let search_end = std::cmp::min(self.job.pair_cursor + 50, self.job.end_bkh);
 
+            let mut nums_to_scan = Vec::new();
             for num in (search_start..=search_end).rev() {
                 if num < self.job.start_bkh { continue; }
                 if self.job.scanned_numbers.contains(&num) { continue; }
+                nums_to_scan.push(num);
+                if nums_to_scan.len() >= 3 { break; }
+            }
 
-                let student_idx = (num as usize) % unmatched.len();
-                let student = &unmatched[student_idx];
-                self.task_queue.push_back(QueryTask {
-                    exam_number: num,
-                    student_sfz: student.sfz.clone(),
-                    student_name: student.name.clone(),
-                    class_num,
-                    task_type: TaskType::ClassScan,
-                });
-                tasks_generated += 1;
-                if tasks_generated >= MAX_TASKS_PER_GENERATION {
-                    return;
+            for num in nums_to_scan {
+                for student in &unmatched {
+                    self.task_queue.push_back(QueryTask {
+                        exam_number: num,
+                        student_sfz: student.sfz.clone(),
+                        student_name: student.name.clone(),
+                        class_num,
+                        task_type: TaskType::ClassScan,
+                    });
+                    tasks_generated += 1;
+                    if tasks_generated >= MAX_TASKS_PER_GENERATION {
+                        return;
+                    }
                 }
             }
         }
@@ -598,12 +608,15 @@ impl TaskScheduler {
             .collect();
 
         for (name, sfz, exam_num, class_num) in &known_pairs {
-            self.job.record_match(name, sfz, *exam_num, *class_num);
+            self.job.record_match(name, sfz, *exam_num, *class_num, "", "");
         }
     }
 
     /// 处理任务结果
     fn process_results(&mut self, results: &[TaskResult]) {
+        // 收集本轮新命中的考号
+        let mut newly_matched_numbers: HashSet<u64> = HashSet::new();
+
         for result in results {
             self.job.scanned_numbers.insert(result.exam_number);
             self.job.total_queries += 1;
@@ -614,13 +627,23 @@ impl TaskScheduler {
                     &result.student_sfz,
                     result.exam_number,
                     result.class_num,
+                    &result.kemumingcheng,
+                    &result.kaodianmingcheng,
                 );
+                newly_matched_numbers.insert(result.exam_number);
 
                 // 如果命中的是种子号码，标记种子命中
                 if self.current_seeds.contains(&result.exam_number) {
                     self.seed_hits.insert(result.exam_number);
                 }
             }
+        }
+
+        // 优化：清除队列中针对已命中考号的冗余任务（省去无意义的查询）
+        if !newly_matched_numbers.is_empty() {
+            self.task_queue.retain(|task| {
+                !newly_matched_numbers.contains(&task.exam_number)
+            });
         }
 
         // 更新班级区域的总人数
@@ -763,6 +786,12 @@ pub async fn run_prediction(
                         _ => String::new(),
                     };
 
+                    // 从网站结果中提取科类和考点信息
+                    let (kemumingcheng, kaodianmingcheng) = match &result {
+                        Ok(res) => (res.kemumingcheng.clone(), res.kaodianmingcheng.clone()),
+                        Err(_) => (String::new(), String::new()),
+                    };
+
                     batch_results.push(TaskResult {
                         exam_number: task.exam_number,
                         student_sfz: task.student_sfz.clone(),
@@ -771,6 +800,8 @@ pub async fn run_prediction(
                         task_type: task.task_type.clone(),
                         matched,
                         error,
+                        kemumingcheng,
+                        kaodianmingcheng,
                     });
 
                     if matched {
@@ -824,6 +855,8 @@ pub async fn run_prediction(
                                 name: p.name.clone(),
                                 shenfenzheng: p.sfz.clone(),
                                 exam_number: p.exam_number.to_string(),
+                                kemumingcheng: p.kemumingcheng.clone(),
+                                kaodianmingcheng: p.kaodianmingcheng.clone(),
                                 status: PredictedStatus::Matched,
                             })
                             .collect();
@@ -865,6 +898,8 @@ pub async fn run_prediction(
             name: pair.name.clone(),
             shenfenzheng: pair.sfz.clone(),
             exam_number: pair.exam_number.to_string(),
+            kemumingcheng: pair.kemumingcheng.clone(),
+            kaodianmingcheng: pair.kaodianmingcheng.clone(),
             status: PredictedStatus::Matched,
         });
     }
@@ -874,6 +909,8 @@ pub async fn run_prediction(
             name: student.name.clone(),
             shenfenzheng: student.sfz.clone(),
             exam_number: "扫描范围外".to_string(),
+            kemumingcheng: String::new(),
+            kaodianmingcheng: String::new(),
             status: PredictedStatus::NotFound,
         });
     }

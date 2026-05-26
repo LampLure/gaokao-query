@@ -132,6 +132,8 @@ pub struct PredictedRecord {
     pub name: String,
     pub shenfenzheng: String,
     pub exam_number: String,
+    pub kemumingcheng: String,      // 科类名称（从网站获取）
+    pub kaodianmingcheng: String,   // 考点名称（从网站获取）
     pub status: PredictedStatus,
 }
 
@@ -314,6 +316,8 @@ pub struct TaskResult {
     pub task_type: TaskType,
     pub matched: bool,
     pub error: String,
+    pub kemumingcheng: String,      // 科类名称（从网站获取）
+    pub kaodianmingcheng: String,   // 考点名称（从网站获取）
 }
 
 /// 班级锚点
@@ -358,6 +362,8 @@ pub struct MatchedPair {
     pub sfz: String,
     pub exam_number: u64,
     pub class_num: u32,
+    pub kemumingcheng: String,      // 科类名称（从网站获取）
+    pub kaodianmingcheng: String,   // 考点名称（从网站获取）
 }
 
 /// 扫描阶段
@@ -513,7 +519,8 @@ impl PredictionJob {
     }
 
     /// 标记一个匹配
-    pub fn record_match(&mut self, name: &str, sfz: &str, exam_number: u64, class_num: u32) {
+    pub fn record_match(&mut self, name: &str, sfz: &str, exam_number: u64, class_num: u32,
+                        kemumingcheng: &str, kaodianmingcheng: &str) {
         // 从未匹配列表移除
         self.unmatched_students.retain(|s| s.sfz != sfz);
 
@@ -523,6 +530,8 @@ impl PredictionJob {
             sfz: sfz.to_string(),
             exam_number,
             class_num,
+            kemumingcheng: kemumingcheng.to_string(),
+            kaodianmingcheng: kaodianmingcheng.to_string(),
         });
 
         self.matched_count = self.matched_pairs.len();
