@@ -2,6 +2,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use tokio::sync::Mutex;
 
 use crate::config;
@@ -70,10 +71,12 @@ pub struct GaokaoApp {
     captcha_stats: Arc<Mutex<CaptchaStats>>,
     browser_statuses: Arc<Mutex<Vec<BrowserStatus>>>,
     displayed_browser_statuses: Vec<BrowserStatus>,
-    // cancellation
-    cancel_flag: Arc<Mutex<bool>>,
+    // cancellation (AtomicBool: no lock contention)
+    cancel_flag: Arc<AtomicBool>,
     // prediction completion signal
-    pred_done: Arc<std::sync::atomic::AtomicBool>,
+    pred_done: Arc<AtomicBool>,
+    // config save debounce
+    last_config_save: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,8 +137,9 @@ impl GaokaoApp {
             captcha_stats: Arc::new(Mutex::new(CaptchaStats::default())),
             browser_statuses: Arc::new(Mutex::new(Vec::new())),
             displayed_browser_statuses: Vec::new(),
-            cancel_flag: Arc::new(Mutex::new(false)),
-            pred_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            pred_done: Arc::new(AtomicBool::new(false)),
+            last_config_save: std::time::Instant::now(),
         };
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
             app.parse_and_match();
@@ -162,6 +166,10 @@ impl GaokaoApp {
 
     fn auto_save_config(&mut self) {
         if !self.config_dirty { return; }
+        // 防抖：最少间隔 2 秒才写入文件
+        if self.last_config_save.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
         self.config.baokao_path = self.baokao_path.as_ref().cloned().unwrap_or_default();
         self.config.sfz_path = self.sfz_path.as_ref().cloned().unwrap_or_default();
         self.config.pred_sfz_path = self.pred_sfz_path.as_ref().cloned().unwrap_or_default();
@@ -179,6 +187,7 @@ impl GaokaoApp {
         self.config.turbo = self.config.turbo;
         config::save(&self.config);
         self.config_dirty = false;
+        self.last_config_save = std::time::Instant::now();
     }
 
     // ---- 统计指定年份人数 ----
@@ -203,50 +212,58 @@ impl GaokaoApp {
 impl eframe::App for GaokaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 检查推算任务是否完成
-        if self.pred_state == QueryState::Running && self.pred_done.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.pred_state == QueryState::Running && self.pred_done.load(AtomicOrdering::Relaxed) {
             self.pred_state = QueryState::Idle;
-            self.pred_done.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.pred_done.store(false, AtomicOrdering::Relaxed);
             self.status_message = "推算任务已完成".to_string();
         }
 
-        // sync results
-        if let Ok(r) = self.results.try_lock() {
-            if r.len() != self.displayed_results.len() {
-                let mut sorted = r.clone();
-                sorted.sort_by(|a, b| a.baominghao.cmp(&b.baominghao));
-                self.displayed_results = sorted;
-            }
-        }
-        if let Ok(r) = self.pred_results.try_lock() {
-            if r.len() != self.pred_displayed_results.len() {
-                self.pred_displayed_results = r.clone();
-            }
-        }
-        if let Ok(l) = self.debug_logs.try_lock() {
-            if l.len() != self.displayed_logs.len() {
-                self.displayed_logs = l.clone();
-            }
-        }
-        if let Ok(bs) = self.browser_statuses.try_lock() {
-            if bs.len() != self.displayed_browser_statuses.len() || bs.iter().zip(self.displayed_browser_statuses.iter()).any(|(a, b)| a.step != b.step || a.target != b.target || a.name != b.name || a.captcha_attempt != b.captcha_attempt) {
-                self.displayed_browser_statuses = bs.clone();
-            }
-        }
+        // 同步数据：只在运行时同步，空闲时不锁（减少锁竞争）
+        let is_running = self.query_state == QueryState::Running
+            || self.pred_state == QueryState::Running;
 
-        // aggregate perf logs into stats
-        if let Ok(pl) = self.perf_logs.try_lock() {
-            if !pl.is_empty() {
-                let mut stats: std::collections::HashMap<&'static str, Vec<u64>> = std::collections::HashMap::new();
-                for record in pl.iter() {
-                    for event in record {
-                        stats.entry(event.label).or_default().push(event.elapsed_ms);
-                    }
+        if is_running {
+            // try_lock 非阻塞，拿不到锁就跳过这一帧
+            if let Ok(r) = self.results.try_lock() {
+                if r.len() != self.displayed_results.len() {
+                    let mut sorted = r.clone();
+                    sorted.sort_by(|a, b| a.baominghao.cmp(&b.baominghao));
+                    self.displayed_results = sorted;
                 }
-                let mut new_stats: Vec<PerfRecord> = stats.into_iter()
-                    .map(|(label, times_ms)| PerfRecord { label, times_ms })
-                    .collect();
-                new_stats.sort_by(|a, b| a.label.cmp(b.label));
-                self.perf_stats = new_stats;
+            }
+            if let Ok(r) = self.pred_results.try_lock() {
+                if r.len() != self.pred_displayed_results.len() {
+                    self.pred_displayed_results = r.clone();
+                }
+            }
+            if let Ok(l) = self.debug_logs.try_lock() {
+                if l.len() != self.displayed_logs.len() {
+                    // 只追加新日志，而非每次全量克隆
+                    let start = self.displayed_logs.len();
+                    self.displayed_logs.extend(l.iter().skip(start).cloned());
+                }
+            }
+            if let Ok(bs) = self.browser_statuses.try_lock() {
+                if bs.len() != self.displayed_browser_statuses.len() || bs.iter().zip(self.displayed_browser_statuses.iter()).any(|(a, b)| a.step != b.step || a.target != b.target || a.name != b.name || a.captcha_attempt != b.captcha_attempt) {
+                    self.displayed_browser_statuses = bs.clone();
+                }
+            }
+
+            // perf stats 只在有新数据时重新计算
+            if let Ok(pl) = self.perf_logs.try_lock() {
+                if !pl.is_empty() {
+                    let mut stats: HashMap<&'static str, Vec<u64>> = HashMap::new();
+                    for record in pl.iter() {
+                        for event in record {
+                            stats.entry(event.label).or_default().push(event.elapsed_ms);
+                        }
+                    }
+                    let mut new_stats: Vec<PerfRecord> = stats.into_iter()
+                        .map(|(label, times_ms)| PerfRecord { label, times_ms })
+                        .collect();
+                    new_stats.sort_by(|a, b| a.label.cmp(b.label));
+                    self.perf_stats = new_stats;
+                }
             }
         }
 
@@ -507,7 +524,7 @@ impl GaokaoApp {
         if self.query_state == QueryState::Running {
             ui.push_id("pause_btn", |ui| {
                 if ui.button(egui::RichText::new("⏸ 暂停").heading()).clicked() {
-                    *self.cancel_flag.try_lock().unwrap() = true;
+                    self.cancel_flag.store(true, AtomicOrdering::Relaxed);
                     self.query_state = QueryState::Paused;
                     self.log("查询暂停");
                 }
@@ -562,13 +579,13 @@ impl GaokaoApp {
         if self.query_state == QueryState::Paused {
             ui.horizontal(|ui| {
                 if ui.button("▶ 继续").clicked() {
-                    *self.cancel_flag.try_lock().unwrap() = false;
+                    self.cancel_flag.store(false, AtomicOrdering::Relaxed);
                     self.query_state = QueryState::Running;
                     self.log("查询继续");
                     self.start_query(ctx);
                 }
                 if ui.button("⏹ 重新开始").clicked() {
-                    *self.cancel_flag.try_lock().unwrap() = true;
+                    self.cancel_flag.store(true, AtomicOrdering::Relaxed);
                     self.query_state = QueryState::Idle;
                     self.log("查询已终止，准备重新开始");
                 }
@@ -1063,7 +1080,7 @@ impl GaokaoApp {
                 }
                 if self.pred_state == QueryState::Running {
                     if ui.button(egui::RichText::new("⏹ 停止").heading()).clicked() {
-                        *self.cancel_flag.try_lock().unwrap() = true;
+                        self.cancel_flag.store(true, AtomicOrdering::Relaxed);
                         self.pred_state = QueryState::Idle;
                         self.log("推算已停止");
                     }
@@ -1206,7 +1223,7 @@ impl GaokaoApp {
         self.query_state = QueryState::Running;
         self.displayed_results.clear();
         *self.results.try_lock().unwrap() = Vec::new();
-        *self.cancel_flag.try_lock().unwrap() = false;
+        self.cancel_flag.store(false, AtomicOrdering::Relaxed);
 
         let mut seen = std::collections::HashSet::new();
         let matched: Vec<_> = self.matched_records.iter()
@@ -1276,7 +1293,7 @@ impl GaokaoApp {
             let browser_statuses = browser_statuses.clone();
             let mut handles = Vec::new();
             for record in &matched {
-                if *cancel.lock().await { break; }
+                if cancel.load(AtomicOrdering::Relaxed) { break; }
 
                 let pool = pool.clone();
                 let results = results.clone();
@@ -1290,7 +1307,7 @@ impl GaokaoApp {
                 let delay = delay;
 
                 handles.push(tokio::spawn(async move {
-                    if *cancel.lock().await { return; }
+                    if cancel.load(AtomicOrdering::Relaxed) { return; }
 
                     let mut l = logs.lock().await;
                     l.push(format!("[QUERY] 开始处理: {} {}", record.name, record.baominghao));
@@ -1311,7 +1328,7 @@ impl GaokaoApp {
                     let mut last_err = String::new();
 
                     for (ci, sfz) in candidates.iter().enumerate() {
-                        if *cancel.lock().await { break; }
+                        if cancel.load(AtomicOrdering::Relaxed) { break; }
 
                         {
                             let mut l = logs.lock().await;
@@ -1387,7 +1404,7 @@ impl GaokaoApp {
                         if ok { p.success += 1; } else { p.failed += 1; }
                     }
 
-                    if !turbo && delay > 0 && !*cancel.lock().await {
+                    if !turbo && delay > 0 && !cancel.load(AtomicOrdering::Relaxed) {
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     }
                 }));
@@ -1440,7 +1457,7 @@ impl GaokaoApp {
         self.pred_state = QueryState::Running;
         *self.pred_results.try_lock().unwrap() = Vec::new();
         self.pred_displayed_results.clear();
-        *self.cancel_flag.try_lock().unwrap() = false;
+        self.cancel_flag.store(false, AtomicOrdering::Relaxed);
 
         let concurrency = self.concurrency as usize;
         let hide_browser = self.hide_browser;

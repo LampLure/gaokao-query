@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use tokio::sync::Mutex;
 use crate::browser::BrowserPool;
 use crate::data::{
@@ -400,7 +401,7 @@ pub async fn run_prediction(
     job: PredictionJob,
     known_bkh: HashMap<String, u64>,
     concurrency: usize,
-    cancel_flag: Arc<Mutex<bool>>,
+    cancel_flag: Arc<AtomicBool>,
     progress: Arc<Mutex<PredictionProgress>>,
     logs: Arc<Mutex<Vec<String>>>,
     perf_logs: Arc<Mutex<Vec<Vec<PerfEvent>>>>,
@@ -445,7 +446,7 @@ pub async fn run_prediction(
 
         worker_handles.push(tokio::spawn(async move {
             loop {
-                if *cancel_flag.lock().await { break; }
+                if cancel_flag.load(AtomicOrdering::Relaxed) { break; }
 
                 // 从调度器获取一批任务
                 let batch = {
@@ -469,7 +470,7 @@ pub async fn run_prediction(
                 // 执行批次中的所有任务
                 let mut batch_results = Vec::new();
                 for task in &batch.tasks {
-                    if *cancel_flag.lock().await { break; }
+                    if cancel_flag.load(AtomicOrdering::Relaxed) { break; }
 
                     let full_exam_number = task.exam_number.to_string();
 
@@ -547,6 +548,7 @@ pub async fn run_prediction(
                     let phase = sched.job.phase.label().to_string();
                     let cursor = sched.seed_cursor;
                     let scanned = sched.job.scanned_numbers.len();
+                    let total_students = sched.job.total_students;
 
                     {
                         let mut p = progress.lock().await;
@@ -557,17 +559,17 @@ pub async fn run_prediction(
                     }
 
                     // 持久化任务（每批处理完保存一次）
-                    if let Err(e) = crate::job::save_job(&sched.job) {
-                        let mut l = logs.lock().await;
-                        l.push(format!("⚠️ 保存任务进度失败: {}", e));
-                    }
+                    let save_err = crate::job::save_job(&sched.job).err();
 
-                    // 日志：每批输出扫描进度
+                    // 合并所有日志写入到一个锁中
                     {
                         let mut l = logs.lock().await;
+                        if let Some(e) = save_err {
+                            l.push(format!("⚠️ 保存任务进度失败: {}", e));
+                        }
                         l.push(format!(
-                            "📊 扫描游标={} | 已扫描={} | 已匹配={}/{} | 查询={}",
-                            cursor, scanned, matched_count, sched.job.total_students, total_queries
+                            "📊 游标={} | 扫描={} | 匹配={}/{} | 查询={}",
+                            cursor, scanned, matched_count, total_students, total_queries
                         ));
                     }
                 }
