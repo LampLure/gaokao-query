@@ -6,6 +6,9 @@ use chromiumoxide::{
     browser::{Browser, BrowserConfig, HeadlessMode},
     Page,
 };
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+};
 use futures_util::StreamExt;
 
 use crate::data::{QueryResult, QueryStatus, BrowserStatus, BrowserStep, CaptchaStats};
@@ -787,19 +790,21 @@ impl BrowserClient {
             std::fs::write(&temp_path, &img_bytes)
                 .map_err(|e| format!("保存验证码图片失败: {}", e))?;
 
-            // Get container dimensions
+            // Get container dimensions + viewport position (用于CDP鼠标事件)
             let dims_json: String = page.evaluate_expression(
                 r#"(function() {
                     const el = document.getElementById('captchaContainer');
-                    if (!el) return JSON.stringify({w:300, h:150});
+                    if (!el) return JSON.stringify({l:0, t:0, w:300, h:150});
                     const rect = el.getBoundingClientRect();
-                    return JSON.stringify({w: rect.width, h: rect.height});
+                    return JSON.stringify({l: rect.left, t: rect.top, w: rect.width, h: rect.height});
                 })()"#
-            ).await.map(|r| r.into_value().unwrap_or_else(|_| r#"{"w":300,"h":150}"#.to_string()))
-                .unwrap_or_else(|_| r#"{"w":300,"h":150}"#.to_string());
+            ).await.map(|r| r.into_value().unwrap_or_else(|_| r#"{"l":0,"t":0,"w":300,"h":150}"#.to_string()))
+                .unwrap_or_else(|_| r#"{"l":0,"t":0,"w":300,"h":150}"#.to_string());
 
             let dims: serde_json::Value =
-                serde_json::from_str(&dims_json).unwrap_or(serde_json::json!({"w":300,"h":150}));
+                serde_json::from_str(&dims_json).unwrap_or(serde_json::json!({"l":0,"t":0,"w":300,"h":150}));
+            let cl = dims["l"].as_f64().unwrap_or(0.0);
+            let ct = dims["t"].as_f64().unwrap_or(0.0);
             let cw = dims["w"].as_f64().unwrap_or(300.0);
             let ch = dims["h"].as_f64().unwrap_or(150.0);
 
@@ -831,33 +836,50 @@ impl BrowserClient {
                 }
             }
 
-            // Click points — 合并为1次JS调用
+            // Click points — 使用CDP协议模拟真实鼠标事件，每次点击间隔100ms
             self.perf_event("验证码点击开始");
             self.update_step(BrowserStep::ClickingCaptcha);
-            let clicks_js = format!(
-                r#"(function() {{
-                    const container = document.getElementById('captchaContainer');
-                    if (!container) return 'no_container';
-                    const rect = container.getBoundingClientRect();
-                    const points = [{}];
-                    points.forEach(([rx, ry], i) => {{
-                        setTimeout(() => {{
-                            const x = rect.left + rx;
-                            const y = rect.top + ry;
-                            container.dispatchEvent(new MouseEvent('click', {{
-                                clientX: x, clientY: y, bubbles: true, cancelable: true
-                            }}));
-                        }}, i * 150);
-                    }});
-                    return 'clicked_all';
-                }})()"#,
-                ocr_result.points.iter()
-                    .map(|p| format!("[{}, {}]", p.x * cw, p.y * ch))
-                    .collect::<Vec<_>>().join(", ")
-            );
-            let _ = page.evaluate_expression(&clicks_js).await;
-            // 点击后等待验证码结果（缩短等待）
-            self.sleep_critical(150).await;
+            for (idx, point) in ocr_result.points.iter().enumerate() {
+                let vx = cl + point.x * cw;  // viewport X (CSS像素)
+                let vy = ct + point.y * ch;  // viewport Y (CSS像素)
+
+                // 后续点先移动鼠标到目标位置（模拟真实鼠标轨迹）
+                if idx > 0 {
+                    let move_evt = DispatchMouseEventParams::builder()
+                        .r#type(DispatchMouseEventType::MouseMoved)
+                        .x(vx).y(vy)
+                        .build()
+                        .map_err(|e| format!("构建鼠标移动事件失败: {}", e))?;
+                    let _ = page.execute(move_evt).await;
+                }
+
+                // 鼠标按下
+                let press_evt = DispatchMouseEventParams::builder()
+                    .r#type(DispatchMouseEventType::MousePressed)
+                    .x(vx).y(vy)
+                    .button(MouseButton::Left)
+                    .click_count(1)
+                    .build()
+                    .map_err(|e| format!("构建鼠标按下事件失败: {}", e))?;
+                let _ = page.execute(press_evt).await;
+
+                // 鼠标释放
+                let release_evt = DispatchMouseEventParams::builder()
+                    .r#type(DispatchMouseEventType::MouseReleased)
+                    .x(vx).y(vy)
+                    .button(MouseButton::Left)
+                    .click_count(1)
+                    .build()
+                    .map_err(|e| format!("构建鼠标释放事件失败: {}", e))?;
+                let _ = page.execute(release_evt).await;
+
+                // 每次点击之间间隔100ms，防止网站检测
+                if idx < ocr_result.points.len() - 1 {
+                    self.sleep_critical(100).await;
+                }
+            }
+            // 点击后短暂等待，让页面响应
+            self.sleep_critical(100).await;
 
             // ── 快速检测验证码结果（同时检测alert弹窗、captchaModal消失、以及页面进入结果状态） ──
             self.perf_event("验证码点击完成");
