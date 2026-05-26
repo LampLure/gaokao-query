@@ -2,9 +2,10 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::Mutex;
 
+use crate::browser::BrowserPool;
 use crate::config;
 use crate::data::*;
 use crate::matcher;
@@ -73,8 +74,11 @@ pub struct GaokaoApp {
     displayed_browser_statuses: Vec<BrowserStatus>,
     // cancellation (AtomicBool: no lock contention)
     cancel_flag: Arc<AtomicBool>,
-    // prediction completion signal
-    pred_done: Arc<AtomicBool>,
+    // prediction completion signal (generation counter: 值 == pred_generation 表示当前任务完成)
+    pred_done_gen: Arc<AtomicU64>,
+    pred_generation: u64,
+    // 浏览器池共享槽（用于从 UI 线程关闭浏览器）
+    browser_pool_slot: Arc<Mutex<Option<Arc<BrowserPool>>>>,
     // config save debounce
     last_config_save: std::time::Instant,
 }
@@ -138,7 +142,9 @@ impl GaokaoApp {
             browser_statuses: Arc::new(Mutex::new(Vec::new())),
             displayed_browser_statuses: Vec::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
-            pred_done: Arc::new(AtomicBool::new(false)),
+            pred_done_gen: Arc::new(AtomicU64::new(0)),
+            pred_generation: 0,
+            browser_pool_slot: Arc::new(Mutex::new(None)),
             last_config_save: std::time::Instant::now(),
         };
         if app.baokao_path.is_some() && app.sfz_path.is_some() {
@@ -211,11 +217,20 @@ impl GaokaoApp {
 
 impl eframe::App for GaokaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 检查推算任务是否完成
-        if self.pred_state == QueryState::Running && self.pred_done.load(AtomicOrdering::Relaxed) {
+        // 检查推算任务是否完成（使用 generation counter 防止旧任务干扰新任务）
+        if self.pred_state == QueryState::Running 
+            && self.pred_done_gen.load(AtomicOrdering::Relaxed) == self.pred_generation
+            && self.pred_generation > 0
+        {
             self.pred_state = QueryState::Idle;
-            self.pred_done.store(false, AtomicOrdering::Relaxed);
+            self.pred_done_gen.store(0, AtomicOrdering::Relaxed);
+            self.pred_generation = 0;
             self.status_message = "推算任务已完成".to_string();
+            // 清除浏览器池引用
+            {
+                let mut slot = self.browser_pool_slot.try_lock().unwrap();
+                *slot = None;
+            }
         }
 
         // 同步数据：只在运行时同步，空闲时不锁（减少锁竞争）
@@ -1103,8 +1118,14 @@ impl GaokaoApp {
                 if self.pred_state == QueryState::Running {
                     if ui.button(egui::RichText::new("⏹ 停止").heading()).clicked() {
                         self.cancel_flag.store(true, AtomicOrdering::Relaxed);
+                        // 强制关闭浏览器池，杀死所有 Chrome 进程
+                        if let Ok(mut slot) = self.browser_pool_slot.try_lock() {
+                            if let Some(pool) = slot.take() {
+                                pool.force_shutdown();
+                            }
+                        }
                         self.pred_state = QueryState::Idle;
-                        self.log("推算已停止");
+                        self.log("推算已停止，浏览器正在关闭");
                     }
                 }
             });
@@ -1290,11 +1311,12 @@ impl GaokaoApp {
                 }
             };
 
-            // 初始化浏览器状态追踪
+            // 初始化浏览器状态追踪（使用实际的 instance_id）
             {
+                let ids = pool.instance_ids().await;
                 let mut statuses = browser_statuses.lock().await;
-                *statuses = (0..concurrency).map(|i| BrowserStatus {
-                    id: i as u64,
+                *statuses = ids.iter().map(|&id| BrowserStatus {
+                    id,
                     step: BrowserStep::Idle,
                     target: String::new(),
                     name: String::new(),
@@ -1470,16 +1492,42 @@ impl GaokaoApp {
 // 报考号推算 逻辑
 // ============================================================
 impl GaokaoApp {
+    /// 清理旧的推算任务：关闭浏览器池、重置状态
+    fn cleanup_old_prediction(&mut self) {
+        // 关闭旧的浏览器池
+        if let Ok(mut slot) = self.browser_pool_slot.try_lock() {
+            if let Some(pool) = slot.take() {
+                self.log("关闭旧的浏览器池...");
+                pool.force_shutdown();
+            }
+        }
+
+        // 确保取消标志已设置，让旧任务的 worker 退出
+        self.cancel_flag.store(true, AtomicOrdering::Relaxed);
+        
+        // 重置 generation（下次 start/resume 时会递增）
+        self.pred_generation = 0;
+        self.pred_done_gen.store(0, AtomicOrdering::Relaxed);
+    }
+
     fn start_prediction(&mut self, _ctx: &egui::Context) {
         if self.pred_start_bkh == 0 || self.pred_end_bkh == 0 || self.pred_end_bkh <= self.pred_start_bkh {
             self.status_message = "请设定有效的开始考号和结束考号（结束 > 开始）".to_string();
             return;
         }
 
+        // 确保旧的浏览器池已关闭
+        self.cleanup_old_prediction();
+
         self.pred_state = QueryState::Running;
         *self.pred_results.try_lock().unwrap() = Vec::new();
         self.pred_displayed_results.clear();
         self.cancel_flag.store(false, AtomicOrdering::Relaxed);
+
+        // 递增 generation counter，防止旧任务的 pred_done 干扰
+        self.pred_generation += 1;
+        let current_gen = self.pred_generation;
+        self.pred_done_gen.store(0, AtomicOrdering::Relaxed);
 
         let concurrency = self.concurrency as usize;
         let hide_browser = self.hide_browser;
@@ -1495,7 +1543,8 @@ impl GaokaoApp {
         let pred_progress = self.pred_progress.clone();
         let captcha_stats = self.captcha_stats.clone();
         let browser_statuses = self.browser_statuses.clone();
-        let pred_done = self.pred_done.clone();
+        let pred_done_gen = self.pred_done_gen.clone();
+        let browser_pool_slot = self.browser_pool_slot.clone();
 
         // 创建 PredictionJob
         let all_sfz_records = self.pred_sfz_records.clone();
@@ -1552,16 +1601,23 @@ impl GaokaoApp {
                 Err(e) => {
                     let mut l = logs.lock().await;
                     l.push(format!("[ERROR] 浏览器池启动失败：{}", e));
-                    pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    pred_done_gen.store(current_gen, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
             };
 
-            // 初始化浏览器状态追踪
+            // 将池存入共享槽，供 UI 线程关闭
             {
+                let mut slot = browser_pool_slot.lock().await;
+                *slot = Some(pool.clone());
+            }
+
+            // 初始化浏览器状态追踪（使用实际的 instance_id）
+            {
+                let ids = pool.instance_ids().await;
                 let mut statuses = browser_statuses.lock().await;
-                *statuses = (0..concurrency).map(|i| BrowserStatus {
-                    id: i as u64,
+                *statuses = ids.iter().map(|&id| BrowserStatus {
+                    id,
                     step: BrowserStep::Idle,
                     target: String::new(),
                     name: String::new(),
@@ -1606,7 +1662,8 @@ impl GaokaoApp {
             let mut l = logs.lock().await;
             l.push(format!("🏁 推算任务已完成。"));
 
-            pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
+            // 用 generation counter 标记完成，UI 会检查 current_gen 是否匹配
+            pred_done_gen.store(current_gen, std::sync::atomic::Ordering::Relaxed);
         });
     }
 
@@ -1639,11 +1696,19 @@ impl GaokaoApp {
         self.log(format!("📋 恢复任务: {} | 阶段={} | 匹配={}/{} | 已扫描={}个号",
             job.name, job.phase.label(), job.matched_count, job.total_students, job.scanned_numbers.len()));
 
+        // 确保旧的浏览器池已关闭
+        self.cleanup_old_prediction();
+
         // 恢复UI状态
         self.pred_state = QueryState::Running;
         *self.pred_results.try_lock().unwrap() = Vec::new();
         self.pred_displayed_results.clear();
         self.cancel_flag.store(false, AtomicOrdering::Relaxed);
+
+        // 递增 generation counter，防止旧任务的 pred_done 干扰
+        self.pred_generation += 1;
+        let current_gen = self.pred_generation;
+        self.pred_done_gen.store(0, AtomicOrdering::Relaxed);
 
         let concurrency = self.concurrency as usize;
         let hide_browser = self.hide_browser;
@@ -1659,7 +1724,8 @@ impl GaokaoApp {
         let pred_progress = self.pred_progress.clone();
         let captcha_stats = self.captcha_stats.clone();
         let browser_statuses = self.browser_statuses.clone();
-        let pred_done = self.pred_done.clone();
+        let pred_done_gen = self.pred_done_gen.clone();
+        let browser_pool_slot = self.browser_pool_slot.clone();
 
         // 已知报考号 → HashMap<name, exam_number>
         let known_bkh: HashMap<String, u64> = self.pred_known_bkh.iter()
@@ -1686,16 +1752,23 @@ impl GaokaoApp {
                 Err(e) => {
                     let mut l = logs.lock().await;
                     l.push(format!("[ERROR] 浏览器池启动失败：{}", e));
-                    pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                    pred_done_gen.store(current_gen, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
             };
 
-            // 初始化浏览器状态追踪
+            // 将池存入共享槽，供 UI 线程关闭
             {
+                let mut slot = browser_pool_slot.lock().await;
+                *slot = Some(pool.clone());
+            }
+
+            // 初始化浏览器状态追踪（使用实际的 instance_id）
+            {
+                let ids = pool.instance_ids().await;
                 let mut statuses = browser_statuses.lock().await;
-                *statuses = (0..concurrency).map(|i| BrowserStatus {
-                    id: i as u64,
+                *statuses = ids.iter().map(|&id| BrowserStatus {
+                    id,
                     step: BrowserStep::Idle,
                     target: String::new(),
                     name: String::new(),
@@ -1739,7 +1812,8 @@ impl GaokaoApp {
             let mut l = logs.lock().await;
             l.push(format!("🏁 推算任务已完成。"));
 
-            pred_done.store(true, std::sync::atomic::Ordering::Relaxed);
+            // 用 generation counter 标记完成
+            pred_done_gen.store(current_gen, std::sync::atomic::Ordering::Relaxed);
         });
     }
 

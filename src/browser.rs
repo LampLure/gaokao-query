@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore, OwnedSemaphorePermit};
 use chromiumoxide::{
@@ -25,6 +25,8 @@ static INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct BrowserClient {
     _browser: Arc<Browser>,
+    /// CDP handler 任务的 JoinHandle，shutdown 时 abort
+    _handler_task: tokio::task::JoinHandle<()>,
     page: Arc<Mutex<Page>>,
     log: Option<Arc<Mutex<Vec<String>>>>,
     perf: Option<Arc<Mutex<Vec<crate::data::PerfEvent>>>>,
@@ -247,7 +249,10 @@ impl BrowserClient {
         let browser = Arc::new(browser);
 
         let browser_clone = browser.clone();
-        tokio::spawn(async move { loop { let _ = handler.next().await; } });
+        // 修复：handler task 在 stream 结束时自动退出，不再无限循环
+        let handler_task = tokio::spawn(async move {
+            while let Some(_) = handler.next().await {}
+        });
 
         // On Linux, try to hide/minimize Chrome window via external tools
         if hide_browser {
@@ -295,6 +300,7 @@ impl BrowserClient {
         let now = std::time::Instant::now();
         Ok(Self {
             _browser: browser,
+            _handler_task: handler_task,
             page: Arc::new(Mutex::new(page)),
             log,
             perf,
@@ -988,11 +994,20 @@ impl BrowserClient {
             }
         }
     }
+
+    /// 强制关闭浏览器：abort handler task + drop Browser（触发 Chrome 进程退出）
+    pub fn shutdown(self) {
+        self._handler_task.abort();
+        drop(self._browser);
+        drop(self.page);
+    }
 }
 
 pub struct BrowserPool {
     clients: Mutex<VecDeque<BrowserClient>>,
     semaphore: Arc<Semaphore>,
+    /// 标记是否已关闭，防止 release 回写已关闭的池
+    shutdown_flag: AtomicBool,
 }
 
 impl BrowserPool {
@@ -1027,19 +1042,51 @@ impl BrowserPool {
         Ok(Arc::new(Self {
             clients: Mutex::new(clients),
             semaphore: Arc::new(Semaphore::new(count)),
+            shutdown_flag: AtomicBool::new(false),
         }))
+    }
+
+    /// 获取池中所有浏览器的 instance_id（用于初始化 browser_statuses）
+    pub async fn instance_ids(&self) -> Vec<u64> {
+        let clients = self.clients.lock().await;
+        clients.iter().map(|c| c.instance_id).collect()
+    }
+
+    /// 强制关闭所有浏览器并标记池已关闭
+    pub fn force_shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// 池是否已关闭
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown_flag.load(Ordering::SeqCst)
     }
 
     pub async fn acquire(self: &Arc<Self>) -> (OwnedSemaphorePermit, BrowserClient) {
         let permit = self.semaphore.clone().acquire_owned().await.unwrap();
         let mut clients = self.clients.lock().await;
         let client = clients.pop_front().unwrap();
+        // 如果池已关闭，获取到的浏览器也要标记（不过正常流程中 acquire 前会检查 cancel_flag）
         (permit, client)
     }
 
     pub fn release(self: &Arc<Self>, permit: OwnedSemaphorePermit, client: BrowserClient) {
+        // 如果池已关闭，直接杀掉浏览器而不是放回池中
+        if self.is_shutdown() {
+            client.shutdown();
+            drop(permit);
+            return;
+        }
+
         let this = self.clone();
         tokio::spawn(async move {
+            // 检查池是否在 go_home 期间被关闭
+            if this.is_shutdown() {
+                client.shutdown();
+                drop(permit);
+                return;
+            }
+
             // go_home 加了超时保护，不会无限卡住
             if let Err(_e) = client.go_home().await {
                 // go_home 失败，强制刷新页面
@@ -1050,6 +1097,14 @@ impl BrowserPool {
                 drop(page);
                 tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
             }
+
+            // 再次检查池是否已关闭
+            if this.is_shutdown() {
+                client.shutdown();
+                drop(permit);
+                return;
+            }
+
             // 重置状态为空闲
             if let Some(st) = &client.status {
                 if let Ok(mut statuses) = st.try_lock() {

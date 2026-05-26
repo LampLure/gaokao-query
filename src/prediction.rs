@@ -451,6 +451,9 @@ pub async fn run_prediction(
             loop {
                 if cancel_flag.load(AtomicOrdering::Relaxed) { break; }
 
+                // 检查浏览器池是否已关闭（用户点击了停止）
+                if pool.is_shutdown() { break; }
+
                 // 从调度器获取一批任务
                 let batch = {
                     let mut sched = scheduler.lock().await;
