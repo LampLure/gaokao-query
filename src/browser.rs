@@ -235,7 +235,23 @@ impl BrowserClient {
             .headless_mode(HeadlessMode::False)
             .user_data_dir(&user_data_dir)
             .arg("--disable-blink-features=AutomationControlled")
-            .arg("--window-size=400,400");
+            .arg("--window-size=400,400")
+            // 性能优化：防止Chrome后台节流
+            .arg("--disable-background-timer-throttling")
+            .arg("--disable-backgrounding-occluded-windows")
+            .arg("--disable-renderer-backgrounding")
+            .arg("--disable-features=CalculateNativeWinOcclusion")
+            // 内存优化
+            .arg("--disable-dev-shm-usage")
+            .arg("--disable-gpu")
+            .arg("--no-sandbox")
+            .arg("--disable-extensions")
+            .arg("--disable-background-networking")
+            .arg("--disable-sync")
+            .arg("--disable-translate")
+            .arg("--metrics-recording-only")
+            .arg("--no-first-run")
+            .arg("--safebrowsing-disable-auto-update");
 
         if hide_browser {
             builder = builder.arg("--window-position=-32000,-32000");

@@ -1538,8 +1538,17 @@ impl GaokaoApp {
             return;
         }
 
+        // 防止重复点击：如果已在运行中，忽略
+        if self.pred_state == QueryState::Running {
+            return;
+        }
+
         // 确保旧的浏览器池已关闭
         self.cleanup_old_prediction();
+
+        // 先等一小段时间，确保旧任务的 worker 退出
+        // （旧 worker 检查 cancel_flag 后需要时间退出）
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         self.pred_state = QueryState::Running;
         *self.pred_results.try_lock().unwrap() = Vec::new();

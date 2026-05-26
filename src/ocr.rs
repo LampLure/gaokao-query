@@ -33,6 +33,10 @@ fn ready_file_path(port: u16) -> PathBuf {
 static STARTED_PORTS: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// OCR 服务启动标记 — 防止多个浏览器同时触发 OCR 服务启动（修复 TOCTOU 竞争条件）
+/// 使用 AtomicBool 而非 Mutex，避免跨 await 持有锁的问题
+static OCR_STARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// OCR HTTP 服务健康检查是否通过的缓存（避免每次都探测）
 static HEALTH_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<u16>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
@@ -147,13 +151,14 @@ async fn kill_port_occupant(port: u16) {
 }
 
 /// 自动启动 OCR HTTP 服务（如果未运行）
+/// 使用全局锁防止多个浏览器同时触发 OCR 服务启动（修复 TOCTOU 竞争条件）
 async fn ensure_ocr_server(port: u16) {
     // 检查是否可以重试（指数退避）
     if !can_retry_failed_port(port) {
         return;
     }
 
-    // 检查是否已启动过
+    // 快速路径：如果已知已启动，直接返回
     {
         let started = STARTED_PORTS.lock().unwrap();
         if started.contains(&port) {
@@ -162,6 +167,69 @@ async fn ensure_ocr_server(port: u16) {
     }
 
     // 先检查服务是否已经在运行（就绪文件 + HTTP 双重检查）
+    if check_ocr_ready(port).await {
+        let mut started = STARTED_PORTS.lock().unwrap();
+        if !started.contains(&port) {
+            started.push(port);
+        }
+        let mut cache = HEALTH_CACHE.lock().unwrap();
+        if !cache.contains(&port) {
+            cache.push(port);
+        }
+        return;
+    }
+
+    // 获取全局启动标记，防止多个浏览器同时启动 OCR 服务
+    // 使用 CAS (Compare-And-Swap) 模式
+    if OCR_STARTING.compare_exchange(
+        false, true,
+        std::sync::atomic::Ordering::SeqCst,
+        std::sync::atomic::Ordering::SeqCst,
+    ).is_err() {
+        // 另一个线程正在启动 OCR 服务，等它完成后再检查
+        eprintln!("[OCR] 另一个线程正在启动OCR服务，等待...");
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            // 检查是否已启动成功
+            if check_ocr_ready(port).await {
+                let mut started = STARTED_PORTS.lock().unwrap();
+                if !started.contains(&port) {
+                    started.push(port);
+                }
+                let mut cache = HEALTH_CACHE.lock().unwrap();
+                if !cache.contains(&port) {
+                    cache.push(port);
+                }
+                return;
+            }
+            // 检查启动标记是否已清除（启动失败或完成）
+            if !OCR_STARTING.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+        }
+        // 等待超时或启动完成，再次检查
+        if check_ocr_ready(port).await {
+            let mut started = STARTED_PORTS.lock().unwrap();
+            if !started.contains(&port) {
+                started.push(port);
+            }
+            let mut cache = HEALTH_CACHE.lock().unwrap();
+            if !cache.contains(&port) {
+                cache.push(port);
+            }
+            return;
+        }
+        // 启动似乎失败了，尝试自己启动（先重置标记）
+        OCR_STARTING.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    // 双重检查：获得锁后再检查一次（可能其他线程已启动服务）
+    {
+        let started = STARTED_PORTS.lock().unwrap();
+        if started.contains(&port) {
+            return;
+        }
+    }
     if check_ocr_ready(port).await {
         let mut started = STARTED_PORTS.lock().unwrap();
         if !started.contains(&port) {
@@ -183,6 +251,7 @@ async fn ensure_ocr_server(port: u16) {
     if !script.exists() {
         eprintln!("[OCR] ocr_server.py 不存在，跳过自动启动");
         record_port_failure(port);
+        OCR_STARTING.store(false, std::sync::atomic::Ordering::SeqCst);
         return;
     }
 
@@ -226,6 +295,7 @@ async fn ensure_ocr_server(port: u16) {
                         if !cache.contains(&port) {
                             cache.push(port);
                         }
+                        OCR_STARTING.store(false, std::sync::atomic::Ordering::SeqCst);
                         return;
                     } else {
                         eprintln!("[OCR] 就绪文件存在但HTTP健康检查失败，继续等待...");
@@ -239,6 +309,7 @@ async fn ensure_ocr_server(port: u16) {
                         eprintln!("[OCR]    请检查 .venv 中是否安装了所需依赖:");
                         eprintln!("[OCR]    source .venv/bin/activate && pip install ddddocr onnxruntime Pillow");
                         record_port_failure(port);
+                        OCR_STARTING.store(false, std::sync::atomic::Ordering::SeqCst);
                         return;
                     }
                     Ok(None) => {
@@ -254,6 +325,7 @@ async fn ensure_ocr_server(port: u16) {
                     // 尝试杀掉可能还在运行的进程
                     let _ = child_handle.kill().await;
                     record_port_failure(port);
+                    OCR_STARTING.store(false, std::sync::atomic::Ordering::SeqCst);
                     return;
                 }
 
@@ -264,6 +336,7 @@ async fn ensure_ocr_server(port: u16) {
             eprintln!("[OCR] ❌ 启动 ocr_server.py 失败: {}，将降级到子进程模式", e);
             eprintln!("[OCR]    请确认 Python3 已安装且 ddddocr 模块可用: pip install ddddocr Pillow");
             record_port_failure(port);
+            OCR_STARTING.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
