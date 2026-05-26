@@ -132,6 +132,7 @@ pub struct PredictedRecord {
     pub name: String,
     pub shenfenzheng: String,
     pub exam_number: String,
+    pub class_num: u32,             // 班级号
     pub kemumingcheng: String,      // 科类名称（从网站获取）
     pub kaodianmingcheng: String,   // 考点名称（从网站获取）
     pub status: PredictedStatus,
