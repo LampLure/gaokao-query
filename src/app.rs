@@ -265,9 +265,8 @@ impl eframe::App for GaokaoApp {
                 }
             }
             if let Ok(bs) = self.browser_statuses.try_lock() {
-                if bs.len() != self.displayed_browser_statuses.len() || bs.iter().zip(self.displayed_browser_statuses.iter()).any(|(a, b)| a.step != b.step || a.target != b.target || a.name != b.name || a.captcha_attempt != b.captcha_attempt) {
-                    self.displayed_browser_statuses = bs.clone();
-                }
+                // 始终刷新显示（elapsed_ms 需要实时更新）
+                self.displayed_browser_statuses = bs.clone();
             }
 
             // perf stats 只在有新数据时重新计算
@@ -1137,6 +1136,15 @@ impl GaokaoApp {
             });
 
             // progress
+            // FPS 和性能信息
+            let fps = ctx.input(|i| i.stable_dt).recip();
+            {
+                let fps_color = if fps > 30.0 { egui::Color32::GREEN }
+                    else if fps > 15.0 { egui::Color32::YELLOW }
+                    else { egui::Color32::RED };
+                ui.label(egui::RichText::new(format!("FPS: {:.0}", fps)).color(fps_color).size(12.0));
+            }
+
             ui.push_id("pred_progress", |ui| {
                 if let Ok(p) = self.pred_progress.try_lock() {
                     if p.total > 0 {

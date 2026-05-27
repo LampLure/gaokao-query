@@ -52,6 +52,8 @@ def load_models():
     use_gpu = False
     gpu_provider = None
     try:
+        # 全局限制 ONNX Runtime 线程数（通过环境变量，在 import onnxruntime 之前设置）
+        # 这是控制 CPU 占用的最有效方式
         import onnxruntime as ort
         providers = ort.get_available_providers()
         print(f"[OCR Server] 可用 providers: {providers}", flush=True)
@@ -94,6 +96,20 @@ def load_models():
                 print(f"[OCR Server] ONNX Runtime session 优化已启用 (provider: {gpu_provider})", flush=True)
             except Exception as e:
                 print(f"[OCR Server] ⚠️ session options 设置失败: {e}", flush=True)
+                session_options = None
+
+        # CPU 模式也限制线程数，防止 100% 占用
+        if not use_gpu:
+            try:
+                import onnxruntime as ort
+                so = ort.SessionOptions()
+                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                so.intra_op_num_threads = 2  # CPU模式限制为2线程
+                so.inter_op_num_threads = 1
+                session_options = so
+                print("[OCR Server] ONNX Runtime CPU 模式：线程数限制为 2+1", flush=True)
+            except Exception as e:
+                print(f"[OCR Server] ⚠️ CPU session options 设置失败: {e}", flush=True)
                 session_options = None
 
         print("[OCR Server] 正在加载检测模型(beta)...", flush=True)
@@ -605,6 +621,12 @@ def cleanup_ready_file(port):
 
 if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 19999
+
+    # 【关键】在 import onnxruntime 之前设置线程数限制
+    # 防止 ONNX Runtime 占满所有 CPU 核心
+    os.environ['OMP_NUM_THREADS'] = '2'
+    os.environ['OMP_WAIT_POLICY'] = 'PASSIVE'
+    os.environ['MKL_NUM_THREADS'] = '2'
 
     # AMD RDNA2 显卡（RX 6000系列如 6650XT）需要此环境变量才能使用 ROCm
     # 如果未设置，自动设置（不影响 NVIDIA GPU）

@@ -39,6 +39,8 @@ pub struct BrowserClient {
     target_url: String,
     instance_id: u64,
     start: std::time::Instant,
+    /// 每个步骤开始时间（用于显示当前步骤耗时）
+    step_start: Arc<std::sync::Mutex<std::time::Instant>>,
     turbo: bool,
     status: Option<Arc<Mutex<Vec<BrowserStatus>>>>,
     captcha_stats: Option<Arc<Mutex<CaptchaStats>>>,
@@ -132,11 +134,29 @@ impl BrowserClient {
     }
 
     fn update_step(&self, step: BrowserStep) {
+        // 重置步骤计时器
+        if let Ok(mut t) = self.step_start.lock() {
+            *t = std::time::Instant::now();
+        }
         if let Some(st) = &self.status {
             if let Ok(mut statuses) = st.try_lock() {
                 if let Some(s) = statuses.iter_mut().find(|s| s.id == self.instance_id) {
                     s.step = step;
-                    s.elapsed_ms = self.start.elapsed().as_millis() as u64;
+                    s.elapsed_ms = 0; // 新步骤从0开始计时
+                }
+            }
+        }
+    }
+
+    /// 刷新当前步骤的耗时显示
+    fn refresh_elapsed(&self) {
+        let elapsed = self.step_start.lock()
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        if let Some(st) = &self.status {
+            if let Ok(mut statuses) = st.try_lock() {
+                if let Some(s) = statuses.iter_mut().find(|s| s.id == self.instance_id) {
+                    s.elapsed_ms = elapsed;
                 }
             }
         }
@@ -329,6 +349,7 @@ impl BrowserClient {
             target_url: url,
             instance_id,
             start: now,
+            step_start: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
             turbo,
             status: None,
             captcha_stats: None,

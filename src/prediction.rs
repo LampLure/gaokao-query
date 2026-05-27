@@ -761,18 +761,12 @@ impl TaskScheduler {
             return;
         }
 
-        let current_min_exam = self.job.matched_pairs.iter()
-            .filter(|p| self.current_pair.contains(&p.class_num))
-            .map(|p| p.exam_number)
-            .min();
+        // 关键修复：新一班从 end_bkh 重新开始搜索
+        // 不同班的号码范围可能完全不同，不能用上一对的最小号来推算
+        // 但要跳过已确认属于其他班的区域
+        let new_cursor = self.calc_next_cursor();
 
-        let new_cursor = if let Some(min_num) = current_min_exam {
-            min_num.saturating_sub(SEED_RANGE)
-        } else {
-            self.job.pair_cursor.saturating_sub(SEED_RANGE)
-        };
-
-        self.job.pair_cursor = new_cursor.max(self.job.start_bkh);
+        self.job.pair_cursor = new_cursor;
         self.current_pair = next_pair;
         self.current_seeds = Self::calc_seed_numbers(self.job.pair_cursor, self.job.start_bkh);
         self.seed_hits.clear();
@@ -784,6 +778,32 @@ impl TaskScheduler {
 
         eprintln!("[推算] 推进到下一对班级: {:?} | cursor={} | seeds={:?}",
             self.current_pair, self.job.pair_cursor, self.current_seeds);
+    }
+
+    /// 计算下一对的搜索起点
+    /// 策略：从 end_bkh 往前搜索，跳过已被其他班占据的区域
+    fn calc_next_cursor(&self) -> u64 {
+        // 收集已确认的区域范围
+        let mut occupied_zones: Vec<(u64, u64)> = self.job.class_zones.iter()
+            .map(|z| (z.start_number, z.end_number))
+            .collect();
+        occupied_zones.sort_by_key(|z| z.0);
+
+        // 从 end_bkh 开始，找到第一个未被占据的大区间
+        let mut cursor = self.job.end_bkh;
+        
+        // 跳过已占据区域：从高往低找空隙
+        for (zone_start, zone_end) in occupied_zones.iter().rev() {
+            if cursor >= *zone_start {
+                // cursor 在这个区域内或之上，跳到区域下方
+                if *zone_start > 0 {
+                    cursor = zone_start.saturating_sub(1);
+                }
+            }
+        }
+
+        // 确保 cursor 不低于 start_bkh
+        cursor.max(self.job.start_bkh)
     }
 
     fn apply_known_bkh(&mut self) {
