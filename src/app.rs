@@ -292,15 +292,13 @@ impl eframe::App for GaokaoApp {
         // === sidebar ===
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .default_width(180.0)
+            .default_width(130.0)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(egui::RichText::new("高考查询系统").heading().strong());
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("高考查询").heading().strong());
                     ui.separator();
-                    ui.add_space(8.0);
-                    ui.label("场景导航");
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     for s in Scene::all() {
                         let selected = self.scene == s;
                         let text = if selected { format!("📌 {}", s.name()) } else { format!("  {}", s.name()) };
@@ -310,13 +308,27 @@ impl eframe::App for GaokaoApp {
                         }
                     }
                     ui.separator();
-                    ui.add_space(8.0);
+                    ui.add_space(2.0);
                     if let Some(p) = &self.baokao_path {
-                        ui.label(format!("📁 报名号: {}", p.split('/').last().unwrap_or("")));
+                        ui.label(egui::RichText::new(format!("📁 {}", p.split('/').last().unwrap_or(""))).size(10.0));
                     }
                     if let Some(p) = &self.sfz_path {
-                        ui.label(format!("📁 身份证: {}", p.split('/').last().unwrap_or("")));
+                        ui.label(egui::RichText::new(format!("📁 {}", p.split('/').last().unwrap_or(""))).size(10.0));
                     }
+                    ui.add_space(4.0);
+                    // 选项开关
+                    let hw = self.hide_browser;
+                    ui.checkbox(&mut self.hide_browser, "🙈 无头模式");
+                    if hw != self.hide_browser { self.config_dirty = true; }
+                    let dm = self.debug_mode;
+                    ui.checkbox(&mut self.debug_mode, "🔧 调试");
+                    if dm != self.debug_mode { self.config_dirty = true; }
+                    let sp = self.show_perf;
+                    ui.checkbox(&mut self.show_perf, "⏱ 性能");
+                    if sp != self.show_perf { self.config_dirty = true; }
+                    let tb = self.config.turbo;
+                    ui.checkbox(&mut self.config.turbo, "🔥 暴力");
+                    if tb != self.config.turbo { self.config_dirty = true; }
                 });
             });
 
@@ -374,24 +386,13 @@ impl eframe::App for GaokaoApp {
             ui.horizontal(|ui| {
                 ui.heading(self.scene.name());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let hw = self.hide_browser;
-                    ui.checkbox(&mut self.hide_browser, "🙈 隐藏浏览器");
-                    if hw != self.hide_browser { self.config_dirty = true; }
-                    let dm = self.debug_mode;
-                    ui.checkbox(&mut self.debug_mode, "🔧 调试模式");
-                    if dm != self.debug_mode { self.config_dirty = true; }
-                    let sp = self.show_perf;
-                    ui.checkbox(&mut self.show_perf, "⏱ 性能");
-                    if sp != self.show_perf { self.config_dirty = true; }
-                    let tb = self.config.turbo;
-                    ui.checkbox(&mut self.config.turbo, "🔥 暴力");
-                    if tb != self.config.turbo { self.config_dirty = true; }
+                    // 验证码统计放在顶部状态栏
                     if let Ok(cs) = self.captcha_stats.try_lock() {
-                        if cs.total_attempts > 0 {
+                        if cs.total_challenges > 0 {
                             ui.label(egui::RichText::new(format!(
                                 "验证码 {}/{} ({:.0}%) 一次过:{}/{} ({:.0}%)",
-                                cs.total_passes, cs.total_attempts, cs.pass_rate(),
-                                cs.first_try_passes, cs.total_attempts, cs.first_try_rate()
+                                cs.total_passes, cs.total_challenges, cs.pass_rate(),
+                                cs.first_try_passes, cs.total_challenges, cs.first_try_rate()
                             )).color(if cs.pass_rate() >= 80.0 { egui::Color32::GREEN } else if cs.pass_rate() >= 50.0 { egui::Color32::YELLOW } else { egui::Color32::RED }).strong());
                         } else {
                             ui.label("验证码 --%");
@@ -569,10 +570,16 @@ impl GaokaoApp {
     fn ui_query_params(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("并发数：");
-            ui.add(egui::Slider::new(&mut self.concurrency, 1..=10).text("个"));
-            ui.add_space(16.0);
+            // 无头模式可以用更高并发（不消耗 GPU 显示资源）
+            let max_concurrency = if self.hide_browser { 15 } else { 8 };
+            ui.add(egui::Slider::new(&mut self.concurrency, 1..=max_concurrency).text("个"));
+            // 无头模式时显示建议并发数
+            if self.hide_browser {
+                ui.label(egui::RichText::new("💡无头模式建议5~8").color(egui::Color32::from_rgb(100, 200, 255)).small());
+            }
+            ui.add_space(8.0);
             ui.label("查询间隔：");
-            ui.add(egui::Slider::new(&mut self.delay_ms, 0..=10000).text("毫秒").suffix("ms"));
+            ui.add(egui::Slider::new(&mut self.delay_ms, 0..=10000).text("ms").suffix("ms"));
         });
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -617,13 +624,13 @@ impl GaokaoApp {
         ui.push_id("progress_section", |ui| {
             if let Ok(p) = self.progress.try_lock() {
                 if p.total > 0 {
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
                     ui.separator();
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
                     let ratio = if p.total > 0 { p.completed as f32 / p.total as f32 } else { 0.0 };
                     ui.add(egui::ProgressBar::new(ratio).text(format!("{}/{}", p.completed, p.total)));
                     ui.label(format!(
-                        "✅ 成功: {}   ❌ 失败: {}   📌 当前: {}",
+                        "✅ {} ❌ {} 📌 {}",
                         p.success, p.failed, p.current_name
                     ));
                 }
@@ -641,13 +648,13 @@ impl GaokaoApp {
     fn ui_captcha_stats(&mut self, ui: &mut egui::Ui) {
         ui.push_id("captcha_stats_panel", |ui| {
             if let Ok(cs) = self.captcha_stats.try_lock() {
-                if cs.total_attempts > 0 {
+                if cs.total_challenges > 0 {
                     ui.add_space(4.0);
                     ui.separator();
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("🔐 验证码统计").strong());
+                        ui.label(egui::RichText::new("🔐 验证码").strong());
 
                         let pass_rate = cs.pass_rate();
                         let first_rate = cs.first_try_rate();
@@ -655,7 +662,7 @@ impl GaokaoApp {
 
                         ui.label(egui::RichText::new(format!(
                             "通过 {}/{} ({:.0}%)",
-                            cs.total_passes, cs.total_attempts, pass_rate
+                            cs.total_passes, cs.total_challenges, pass_rate
                         )).color(rate_color).strong());
 
                         ui.label("|");
@@ -663,8 +670,17 @@ impl GaokaoApp {
                         let fr_color = if first_rate >= 60.0 { egui::Color32::GREEN } else if first_rate >= 30.0 { egui::Color32::YELLOW } else { egui::Color32::RED };
                         ui.label(egui::RichText::new(format!(
                             "一次过 {}/{} ({:.0}%)",
-                            cs.first_try_passes, cs.total_attempts, first_rate
+                            cs.first_try_passes, cs.total_challenges, first_rate
                         )).color(fr_color));
+
+                        ui.label("|");
+
+                        // 平均重试次数：直观反映验证码难度
+                        let avg_att = cs.avg_attempts();
+                        let avg_color = if avg_att <= 1.5 { egui::Color32::GREEN } else if avg_att <= 3.0 { egui::Color32::YELLOW } else { egui::Color32::RED };
+                        ui.label(egui::RichText::new(format!(
+                            "均试 {:.1}次", avg_att
+                        )).color(avg_color));
 
                         if cs.total_queries > 0 {
                             ui.label("|");
@@ -683,24 +699,24 @@ impl GaokaoApp {
         }
 
         ui.push_id("browser_status_panel", |ui| {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.separator();
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("🖥️ 浏览器实时状态").strong());
+                ui.label(egui::RichText::new("🖥 浏览器").strong());
                 // 统计活跃/空闲数
                 let active = self.displayed_browser_statuses.iter()
                     .filter(|bs| bs.step != BrowserStep::Idle).count();
                 let total = self.displayed_browser_statuses.len();
-                ui.label(format!("({}/{} 活跃)", active, total));
+                ui.label(format!("({}/{})", active, total));
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
 
             egui::Grid::new("browser_status_grid")
                 .striped(true)
-                .num_columns(6)
+                .num_columns(5)
                 .show(ui, |ui| {
-                    ui.strong("实例"); ui.strong("姓名"); ui.strong("报名号"); ui.strong("当前步骤"); ui.strong("验证码"); ui.strong("耗时");
+                    ui.strong("实例"); ui.strong("姓名"); ui.strong("步骤"); ui.strong("验证码"); ui.strong("耗时");
                     ui.end_row();
                     for bs in &self.displayed_browser_statuses {
                         // 实例 ID
@@ -714,22 +730,24 @@ impl GaokaoApp {
                         };
                         ui.label(egui::RichText::new(if bs.name.is_empty() { "-" } else { &bs.name }).color(name_color).strong());
 
-                        // 报名号
-                        let target_display = if bs.target.len() > 16 {
-                            format!("{}...", &bs.target[..16])
-                        } else if bs.target.is_empty() {
-                            "-".to_string()
-                        } else {
-                            bs.target.clone()
-                        };
-                        ui.label(target_display);
-
-                        // 当前步骤（带颜色）
+                        // 当前步骤（带颜色）— 合并报名号到步骤中
                         let (r, g, b) = bs.step.color();
                         let color = egui::Color32::from_rgb(r, g, b);
                         let step_text = match &bs.step {
                             BrowserStep::Error(e) => format!("❌ {}", e),
-                            _ => bs.step.label().to_string(),
+                            _ => {
+                                // 如果有报名号，附加显示
+                                if bs.target.is_empty() {
+                                    bs.step.label().to_string()
+                                } else {
+                                    let short_target = if bs.target.len() > 8 {
+                                        format!("{}..", &bs.target[bs.target.len()-8..])
+                                    } else {
+                                        bs.target.clone()
+                                    };
+                                    format!("{} [{}]", bs.step.label(), short_target)
+                                }
+                            }
                         };
                         ui.label(egui::RichText::new(step_text).color(color).strong());
 
@@ -1086,22 +1104,26 @@ impl GaokaoApp {
 
             ui.add_space(8.0);
             ui.separator();
-            ui.add_space(8.0);
-            // params (concurrency etc.)
-            ui.horizontal(|ui| {
-                ui.label("并发浏览器数：");
-                ui.add(egui::Slider::new(&mut self.concurrency, 1..=10).text("个"));
-                ui.add_space(16.0);
-                ui.label("操作速度：");
-                ui.add(egui::Slider::new(&mut self.step_delay_ms, 100..=5000).text("ms/步").suffix("ms"));
-            });
             ui.add_space(4.0);
+            // 参数区：更紧凑的布局
             ui.horizontal(|ui| {
+                ui.label("并发：");
+                // 无头模式支持更高并发
+                let max_concurrency = if self.hide_browser { 20 } else { 10 };
+                ui.add(egui::Slider::new(&mut self.concurrency, 1..=max_concurrency).text("个"));
+                if self.hide_browser {
+                    if self.concurrency > 10 {
+                        ui.label(egui::RichText::new("🚀无头高并发").color(egui::Color32::GREEN).size(11.0));
+                    } else {
+                        ui.label(egui::RichText::new("💡建议5~8").color(egui::Color32::from_rgb(100, 200, 255)).size(11.0));
+                    }
+                }
+                ui.add_space(8.0);
+                ui.label("速度：");
+                ui.add(egui::Slider::new(&mut self.step_delay_ms, 100..=5000).text("ms").suffix("ms"));
+                ui.add_space(8.0);
                 ui.label("验证码重试：");
                 ui.add(egui::Slider::new(&mut self.captcha_retries, 1..=10).text("次"));
-                ui.add_space(16.0);
-                ui.label("首次等待：");
-                ui.add(egui::Slider::new(&mut self.captcha_wait_ms, 500..=10000).text("ms").suffix("ms"));
             });
 
             ui.add_space(8.0);
@@ -1203,81 +1225,86 @@ impl GaokaoApp {
             // 验证码统计（推算场景也需要看到）
             self.ui_captcha_stats(ui);
 
-            // 浏览器实时状态（推算场景也需要看到）
-            self.ui_browser_status(ui);
-
             // status
             if !self.status_message.is_empty() {
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 ui.label(&self.status_message);
             }
 
-            // results table — always show during running for real-time status
-            let show_table = !self.pred_displayed_results.is_empty()
-                || self.pred_state == QueryState::Running;
-            if show_table {
-                ui.push_id("pred_results_section", |ui| {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(format!(
-                        "📊 推算结果（共 {} 条）", self.pred_displayed_results.len()
-                    )).strong());
-                    ui.add_space(4.0);
+            // ── 双列布局：左侧状态 | 右侧结果 ──
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                // 左列：浏览器状态（固定宽度）
+                let left_width = ui.available_width() * 0.45;
+                ui.vertical(|ui| {
+                    ui.set_max_width(left_width);
+                    self.ui_browser_status(ui);
+                });
 
-                    // Only redraw when data changes (perf optimization)
-                    egui::ScrollArea::vertical().id_salt("pred_results_table").max_height(250.0).show(ui, |ui| {
-                        TableBuilder::new(ui).id_salt("pred_results")
-                            .striped(true)
-                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .column(Column::auto().resizable(true))
-                            .header(20.0, |mut h| {
-                                h.col(|ui| { ui.label("班级"); });
-                                h.col(|ui| { ui.label("姓名"); });
-                                h.col(|ui| { ui.label("身份证号"); });
-                                h.col(|ui| { ui.label("推算报考号"); });
-                                h.col(|ui| { ui.label("科类"); });
-                                h.col(|ui| { ui.label("考点"); });
-                                h.col(|ui| { ui.label("状态"); });
-                            })
-                            .body(|body| {
-                                let n = self.pred_displayed_results.len();
-                                body.rows(20.0, n, |mut row| {
-                                    let i = row.index();
-                                    if let Some(r) = self.pred_displayed_results.get(i) {
-                                        row.col(|ui| { ui.label(format!("{}班", r.class_num)); });
-                                        row.col(|ui| { ui.label(&r.name); });
-                                        row.col(|ui| { ui.label(&r.shenfenzheng); });
-                                        row.col(|ui| { ui.label(&r.exam_number); });
-                                        row.col(|ui| { ui.label(&r.kemumingcheng); });
-                                        row.col(|ui| { ui.label(&r.kaodianmingcheng); });
-                                        row.col(|ui| {
-                                            match &r.status {
-                                                PredictedStatus::Matched => {
-                                                    ui.label(egui::RichText::new("✅ 已匹配").color(egui::Color32::GREEN));
-                                                }
-                                                PredictedStatus::NotFound => {
-                                                    ui.label(egui::RichText::new("❌ 未找到").color(egui::Color32::RED));
-                                                }
+                // 右列：推算结果
+                ui.vertical(|ui| {
+                    let show_table = !self.pred_displayed_results.is_empty()
+                        || self.pred_state == QueryState::Running;
+                    if show_table {
+                        ui.push_id("pred_results_section", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!(
+                                    "📊 推算结果（共 {} 条）", self.pred_displayed_results.len()
+                                )).strong());
+                                if ui.button("💾 保存").clicked() {
+                                    self.save_prediction_results();
+                                }
+                            });
+
+                            egui::ScrollArea::vertical().id_salt("pred_results_table").max_height(300.0).show(ui, |ui| {
+                                TableBuilder::new(ui).id_salt("pred_results")
+                                    .striped(true)
+                                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                                    .column(Column::auto().resizable(true))
+                                    .column(Column::auto().resizable(true))
+                                    .column(Column::auto().resizable(true))
+                                    .column(Column::auto().resizable(true))
+                                    .column(Column::auto().resizable(true))
+                                    .column(Column::auto().resizable(true))
+                                    .column(Column::auto().resizable(true))
+                                    .header(18.0, |mut h| {
+                                        h.col(|ui| { ui.label("班级"); });
+                                        h.col(|ui| { ui.label("姓名"); });
+                                        h.col(|ui| { ui.label("身份证号"); });
+                                        h.col(|ui| { ui.label("推算报考号"); });
+                                        h.col(|ui| { ui.label("科类"); });
+                                        h.col(|ui| { ui.label("考点"); });
+                                        h.col(|ui| { ui.label("状态"); });
+                                    })
+                                    .body(|body| {
+                                        let n = self.pred_displayed_results.len();
+                                        body.rows(18.0, n, |mut row| {
+                                            let i = row.index();
+                                            if let Some(r) = self.pred_displayed_results.get(i) {
+                                                row.col(|ui| { ui.label(format!("{}班", r.class_num)); });
+                                                row.col(|ui| { ui.label(&r.name); });
+                                                row.col(|ui| { ui.label(&r.shenfenzheng); });
+                                                row.col(|ui| { ui.label(&r.exam_number); });
+                                                row.col(|ui| { ui.label(&r.kemumingcheng); });
+                                                row.col(|ui| { ui.label(&r.kaodianmingcheng); });
+                                                row.col(|ui| {
+                                                    match &r.status {
+                                                        PredictedStatus::Matched => {
+                                                            ui.label(egui::RichText::new("✅ 已匹配").color(egui::Color32::GREEN));
+                                                        }
+                                                        PredictedStatus::NotFound => {
+                                                            ui.label(egui::RichText::new("❌ 未找到").color(egui::Color32::RED));
+                                                        }
+                                                    }
+                                                });
                                             }
                                         });
-                                    }
-                                });
+                                    });
                             });
-                    });
-
-                    ui.add_space(8.0);
-                    if ui.button("💾 保存推算结果到文件").clicked() {
-                        self.save_prediction_results();
+                        });
                     }
                 });
-            }
+            });
         } else {
             ui.label("请先选择身份证和信息表格");
         }

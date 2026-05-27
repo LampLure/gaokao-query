@@ -167,18 +167,30 @@ pub struct PerfEvent {
 /// 验证码统计
 #[derive(Debug, Clone, Default)]
 pub struct CaptchaStats {
+    /// 总尝试次数（每次重试都计一次，一个验证码最多重试 N 次）
     pub total_attempts: u64,
+    /// 总通过次数（验证码通过，无论第几次尝试）
     pub total_passes: u64,
+    /// 第一次就通过的次数
     pub first_try_passes: u64,
+    /// 唯一验证码挑战数（每次进入 solve_captcha_modal 计一次）
+    pub total_challenges: u64,
+    /// 总查询次数（人物查询总数，非验证码次数）
     pub total_queries: u64,
 }
 
 impl CaptchaStats {
+    /// 通过率 = 通过次数 / 唯一挑战数（直觉：100次验证码挑战，过了80次 = 80%）
     pub fn pass_rate(&self) -> f64 {
-        if self.total_attempts == 0 { 0.0 } else { self.total_passes as f64 / self.total_attempts as f64 * 100.0 }
+        if self.total_challenges == 0 { 0.0 } else { self.total_passes as f64 / self.total_challenges as f64 * 100.0 }
     }
+    /// 一次过率 = 第一次就通过 / 唯一挑战数
     pub fn first_try_rate(&self) -> f64 {
-        if self.total_attempts == 0 { 0.0 } else { self.first_try_passes as f64 / self.total_attempts as f64 * 100.0 }
+        if self.total_challenges == 0 { 0.0 } else { self.first_try_passes as f64 / self.total_challenges as f64 * 100.0 }
+    }
+    /// 平均每次挑战的重试次数
+    pub fn avg_attempts(&self) -> f64 {
+        if self.total_challenges == 0 { 0.0 } else { self.total_attempts as f64 / self.total_challenges as f64 }
     }
 }
 

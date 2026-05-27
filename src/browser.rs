@@ -258,7 +258,7 @@ impl BrowserClient {
         // CDP 鼠标事件、Canvas、JS 全部正常工作
         // HeadlessMode::True 是旧无头模式（阉割引擎），网站可能检测到并拒绝响应
         let headless = if hide_browser {
-            eprintln!("[Browser#{}] 使用 New Headless 模式（完整引擎，无窗口）", instance_id);
+            eprintln!("[Browser#{}] 使用 New Headless 模式（完整引擎 + SwiftShader，无窗口）", instance_id);
             HeadlessMode::New
         } else {
             HeadlessMode::False
@@ -278,7 +278,6 @@ impl BrowserClient {
             .arg("--disable-features=CalculateNativeWinOcclusion")
             // 内存优化
             .arg("--disable-dev-shm-usage")
-            .arg("--disable-gpu")
             .arg("--no-sandbox")
             .arg("--disable-extensions")
             .arg("--disable-background-networking")
@@ -287,6 +286,17 @@ impl BrowserClient {
             .arg("--metrics-recording-only")
             .arg("--no-first-run")
             .arg("--safebrowsing-disable-auto-update");
+
+        // 无头模式使用软件渲染（SwiftShader），不需要禁用 GPU
+        // 有头模式在 Linux 上使用 --disable-gpu 避免驱动问题
+        if !hide_browser {
+            builder = builder.arg("--disable-gpu");
+        } else {
+            // 无头模式：启用 SwiftShader 软件渲染，确保 Canvas/WebGL 正常工作
+            // 这对验证码图片渲染很重要
+            builder = builder.arg("--use-gl=angle");
+            builder = builder.arg("--use-angle=swiftshader");
+        }
 
         // 无头模式不需要窗口管理参数；有头模式也不需要旧的位置偏移了
         // （New Headless 模式本身就没有窗口）
@@ -320,12 +330,14 @@ impl BrowserClient {
         {
             use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
             let anti_detect_js = r#"
-                // 覆盖 navigator.webdriver（最核心的检测点）
+                // 1. 覆盖 navigator.webdriver（最核心的检测点）
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                // 覆盖 chrome.runtime（headless 下不存在，补充上去）
+
+                // 2. 覆盖 chrome.runtime（headless 下不存在，补充上去）
                 if (!window.chrome) window.chrome = {};
                 if (!window.chrome.runtime) window.chrome.runtime = { connect: function(){}, sendMessage: function(){} };
-                // 覆盖 permissions API 检测（headless 下 notification permission 行为不同）
+
+                // 3. 覆盖 permissions API 检测（headless 下 notification permission 行为不同）
                 const origQuery = window.Permissions?.prototype?.query;
                 if (origQuery) {
                     window.Permissions.prototype.query = function(params) {
@@ -335,13 +347,83 @@ impl BrowserClient {
                         return origQuery.call(this, params);
                     };
                 }
-                // 覆盖 navigator.plugins（headless 通常为空数组）
+
+                // 4. 覆盖 navigator.plugins（headless 通常为空数组，伪造真实浏览器插件列表）
+                //    真实浏览器的 navigator.plugins 是 PluginArray，每个元素有 name/description/filename
                 Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
+                    get: () => {
+                        const fakePlugin = (name, desc, fn) => ({
+                            name, description: desc, filename: fn,
+                            length: 1, 0: { type: 'application/pdf', suffixes: 'pdf', description: desc }
+                        });
+                        const arr = [
+                            fakePlugin('PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'),
+                            fakePlugin('Chrome PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'),
+                            fakePlugin('Chromium PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'),
+                            fakePlugin('Microsoft Edge PDF Viewer', 'Portable Document Format', 'internal-pdf-viewer'),
+                            fakePlugin('WebKit built-in PDF', 'Portable Document Format', 'internal-pdf-viewer'),
+                        ];
+                        // 模拟 PluginArray 接口
+                        arr.item = (i) => arr[i] || null;
+                        arr.namedItem = (n) => arr.find(p => p.name === n) || null;
+                        arr.refresh = () => {};
+                        return arr;
+                    }
                 });
-                // 覆盖 navigator.languages（headless 可能只有 ['en-US']）
+
+                // 5. 覆盖 navigator.languages（headless 可能只有 ['en-US']）
                 Object.defineProperty(navigator, 'languages', {
                     get: () => ['zh-CN', 'zh', 'en-US', 'en']
+                });
+
+                // 6. 覆盖 navigator.platform（headless 在 Linux 上返回 'Linux x86_64'，正常 Chrome 也返回这个，但确保一致性）
+                //    不做修改，Linux 上的正常 Chrome 也是这个值
+
+                // 7. 覆盖 WebGL 渲染器检测（某些网站检查 WEBGL_debug_renderer_info）
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(param) {
+                    if (param === 37445) return 'Intel Inc.';  // UNMASKED_VENDOR_WEBGL
+                    if (param === 37446) return 'Intel Iris OpenGL Engine';  // UNMASKED_RENDERER_WEBGL
+                    return getParameter.call(this, param);
+                };
+                if (typeof WebGL2RenderingContext !== 'undefined') {
+                    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = function(param) {
+                        if (param === 37445) return 'Intel Inc.';
+                        if (param === 37446) return 'Intel Iris OpenGL Engine';
+                        return getParameter2.call(this, param);
+                    };
+                }
+
+                // 8. 伪造 navigator.connection（部分网站检测网络类型判断是否为机器人）
+                if (!navigator.connection) {
+                    Object.defineProperty(navigator, 'connection', {
+                        get: () => ({ effectiveType: '4g', rtt: 50, downlink: 10, saveData: false })
+                    });
+                }
+
+                // 9. 覆盖 Chrome 自动化特征：window.cdc_adoQpoasnfa76pfcZLmcfl_Array
+                //    这是 ChromeDriver 注入的特征变量
+                for (const key in window) {
+                    if (key.match(/^cdc_/)) {
+                        delete window[key];
+                    }
+                }
+
+                // 10. 确保 navigator.mimeTypes 不为空（与 plugins 配套）
+                Object.defineProperty(navigator, 'mimeTypes', {
+                    get: () => {
+                        const pdfMime = {
+                            type: 'application/pdf',
+                            suffixes: 'pdf',
+                            description: 'Portable Document Format',
+                            enabledPlugin: navigator.plugins[0]
+                        };
+                        const arr = [pdfMime];
+                        arr.item = (i) => arr[i] || null;
+                        arr.namedItem = (n) => arr.find(m => m.type === n) || null;
+                        return arr;
+                    }
                 });
             "#;
             let params = AddScriptToEvaluateOnNewDocumentParams::new(anti_detect_js);
@@ -755,13 +837,18 @@ impl BrowserClient {
         // 记录上一轮验证码是否因错误而自动刷新了（避免二次刷新）
         let mut captcha_auto_refreshed = false;
 
+        // 统计唯一验证码挑战数（每次进入本函数计一次）
+        if let Some(cs) = &self.captcha_stats {
+            let mut stats = cs.lock().await;
+            stats.total_challenges += 1;
+        }
+
         for attempt in 1..=max_retries {
             self.update_captcha_attempt(attempt, max_retries);
-            // 统计验证码尝试次数
+            // 统计验证码尝试次数（每次重试都计一次）
             if let Some(cs) = &self.captcha_stats {
-                if let Ok(mut stats) = cs.try_lock() {
-                    stats.total_attempts += 1;
-                }
+                let mut stats = cs.lock().await;
+                stats.total_attempts += 1;
             }
 
             if attempt > 1 {
@@ -964,7 +1051,7 @@ impl BrowserClient {
             // ── 快速检测验证码结果（同时检测alert弹窗、captchaModal消失、以及页面进入结果状态） ──
             self.perf_event("验证码点击完成");
             self.update_step(BrowserStep::WaitingCaptchaResult);
-            let max_polls = 20; // 最多约2秒
+            let max_polls = 40; // 增加到40次轮询（约4秒），确保捕获验证码通过
             let mut captcha_passed = false;
             let mut _alert_found = false;
             for i in 0..max_polls {
@@ -988,8 +1075,9 @@ impl BrowserClient {
                         // unknown状态，可能验证码刚消失，继续等
                     }
                 }
-                // turbo模式下超快轮询
-                self.sleep_critical(if self.turbo { 50 } else if i < 3 { 50 } else { 120 }).await;
+                // 前5次快速轮询（50ms），之后放慢到200ms
+                let delay = if i < 5 { 50 } else { 200 };
+                self.sleep_critical(delay).await;
             }
 
             if captcha_passed {
@@ -997,11 +1085,10 @@ impl BrowserClient {
                 self.log_msg("验证码通过");
                 self.perf_event("验证码验证通过");
                 if let Some(cs) = &self.captcha_stats {
-                    if let Ok(mut stats) = cs.try_lock() {
-                        stats.total_passes += 1;
-                        if attempt == 1 {
-                            stats.first_try_passes += 1;
-                        }
+                    let mut stats = cs.lock().await;
+                    stats.total_passes += 1;
+                    if attempt == 1 {
+                        stats.first_try_passes += 1;
                     }
                 }
                 return Ok(());
@@ -1074,8 +1161,10 @@ impl BrowserClient {
                     if state == "result_ok" || state == "result_err" {
                         self.log_msg("验证码实际已通过，页面已进入结果状态");
                         if let Some(cs) = &self.captcha_stats {
-                            if let Ok(mut stats) = cs.try_lock() {
-                                stats.total_passes += 1;
+                            let mut stats = cs.lock().await;
+                            stats.total_passes += 1;
+                            if attempt == 1 {
+                                stats.first_try_passes += 1;
                             }
                         }
                         return Ok(());
