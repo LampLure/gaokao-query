@@ -138,11 +138,17 @@ impl BrowserClient {
         if let Ok(mut t) = self.step_start.lock() {
             *t = std::time::Instant::now();
         }
+        // 记录步骤开始时的 Unix 时间戳（毫秒），供 UI 端实时计算耗时
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         if let Some(st) = &self.status {
             if let Ok(mut statuses) = st.try_lock() {
                 if let Some(s) = statuses.iter_mut().find(|s| s.id == self.instance_id) {
                     s.step = step;
                     s.elapsed_ms = 0; // 新步骤从0开始计时
+                    s.step_start_ms = now_ms; // UI 端用 now - step_start_ms 实时计算
                 }
             }
         }
@@ -243,17 +249,26 @@ impl BrowserClient {
         let chrome_path = find_chrome()
             .ok_or_else(|| "未找到Chrome/Chromium浏览器。请安装Chrome后重试。".to_string())?;
 
-        let chrome_name = chrome_path.file_stem()
-            .and_then(|s| s.to_str()).unwrap_or("chrome").to_string();
-
         let instance_id = INSTANCE_COUNTER.fetch_add(1, Ordering::SeqCst);
         let user_data_dir = format!("/tmp/chromiumoxide-runner-{}", instance_id);
         let _ = std::fs::create_dir_all(format!("/tmp/gaokao-captcha-{}", instance_id));
 
+        // 核心：勾选"隐藏浏览器"时使用 Chrome New Headless 模式
+        // HeadlessMode::New (Chrome 112+) 运行完整浏览器引擎，只是不显示窗口
+        // CDP 鼠标事件、Canvas、JS 全部正常工作
+        // HeadlessMode::True 是旧无头模式（阉割引擎），网站可能检测到并拒绝响应
+        let headless = if hide_browser {
+            eprintln!("[Browser#{}] 使用 New Headless 模式（完整引擎，无窗口）", instance_id);
+            HeadlessMode::New
+        } else {
+            HeadlessMode::False
+        };
+
         let mut builder = BrowserConfig::builder()
             .chrome_executable(chrome_path)
-            .headless_mode(HeadlessMode::False)
+            .headless_mode(headless)
             .user_data_dir(&user_data_dir)
+            // 反自动化检测：隐藏 navigator.webdriver 标志
             .arg("--disable-blink-features=AutomationControlled")
             .arg("--window-size=400,400")
             // 性能优化：防止Chrome后台节流
@@ -273,10 +288,8 @@ impl BrowserClient {
             .arg("--no-first-run")
             .arg("--safebrowsing-disable-auto-update");
 
-        if hide_browser {
-            builder = builder.arg("--window-position=-32000,-32000");
-            builder = builder.arg("--start-minimized");
-        }
+        // 无头模式不需要窗口管理参数；有头模式也不需要旧的位置偏移了
+        // （New Headless 模式本身就没有窗口）
 
         let config = builder.build()
             .map_err(|e| format!("浏览器配置失败: {}", e))?;
@@ -293,29 +306,47 @@ impl BrowserClient {
             while let Some(_) = handler.next().await {}
         });
 
-        // On Linux, try to hide/minimize Chrome window via external tools
-        if hide_browser {
-            let cn = chrome_name.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                for args in &[
-                    vec!["search", "--name", &cn, "windowminimize"],
-                    vec!["search", "--class", &cn, "windowminimize"],
-                    vec!["search", "--name", "chromium", "windowminimize"],
-                    vec!["search", "--class", "chromium-browser", "windowminimize"],
-                ] {
-                    let _ = std::process::Command::new("xdotool").args(args).output();
-                }
-                let _ = std::process::Command::new("wmctrl")
-                    .args(["-a", &cn, "-b", "add,hidden"]).output();
-            });
-        }
+        // New Headless 模式没有窗口，不需要 xdotool/wmctrl 隐藏
 
         let url = target_url.to_string();
         let page = browser_clone
             .new_page(&url)
             .await
             .map_err(|e| format!("打开页面失败: {}", e))?;
+
+        // ── 反自动化检测注入（关键：每次导航都生效） ──
+        // HeadlessMode::New 虽然运行完整引擎，但仍需隐藏自动化痕迹
+        // 使用 CDP Page.addScriptToEvaluateOnNewDocument 确保每次页面加载都注入
+        {
+            use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+            let anti_detect_js = r#"
+                // 覆盖 navigator.webdriver（最核心的检测点）
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                // 覆盖 chrome.runtime（headless 下不存在，补充上去）
+                if (!window.chrome) window.chrome = {};
+                if (!window.chrome.runtime) window.chrome.runtime = { connect: function(){}, sendMessage: function(){} };
+                // 覆盖 permissions API 检测（headless 下 notification permission 行为不同）
+                const origQuery = window.Permissions?.prototype?.query;
+                if (origQuery) {
+                    window.Permissions.prototype.query = function(params) {
+                        if (params.name === 'notifications') {
+                            return Promise.resolve({ state: Notification.permission });
+                        }
+                        return origQuery.call(this, params);
+                    };
+                }
+                // 覆盖 navigator.plugins（headless 通常为空数组）
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                // 覆盖 navigator.languages（headless 可能只有 ['en-US']）
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['zh-CN', 'zh', 'en-US', 'en']
+                });
+            "#;
+            let params = AddScriptToEvaluateOnNewDocumentParams::new(anti_detect_js);
+            let _ = page.execute(params).await;
+        }
 
         // 修复 Bug 7: 页面加载失败时报错
         let interval = if turbo { 50u64 } else { 200u64 };
@@ -1195,6 +1226,7 @@ impl BrowserPool {
                         s.captcha_attempt = 0;
                         s.captcha_max = 0;
                         s.elapsed_ms = 0;
+                        s.step_start_ms = 0; // 停止计时
                     }
                 }
             }

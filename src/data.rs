@@ -154,6 +154,8 @@ pub struct PredictionProgress {
     pub current_batch: String,
     pub phase: String,
     pub total_queries: u64,
+    /// 查询开始时的 Unix 时间戳（毫秒），用于计算 QPS
+    pub start_time_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -189,7 +191,11 @@ pub struct BrowserStatus {
     pub name: String,
     pub captcha_attempt: u32,
     pub captcha_max: u32,
+    /// 当前步骤的耗时（毫秒），由 UI 端从 step_start_ms 实时计算
     pub elapsed_ms: u64,
+    /// 当前步骤开始时的 Unix 时间戳（毫秒），用于 UI 端实时计算耗时
+    /// 设置为 0 表示不计时（如 Idle 状态）
+    pub step_start_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

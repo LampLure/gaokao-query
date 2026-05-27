@@ -748,16 +748,27 @@ impl GaokaoApp {
                             ui.label("-");
                         }
 
-                        // 耗时
-                        let elapsed_sec = bs.elapsed_ms as f64 / 1000.0;
-                        let elapsed_text = if bs.elapsed_ms < 1000 {
-                            format!("{}ms", bs.elapsed_ms)
+                        // 耗时 — 实时计算，不再依赖浏览器端更新
+                        let elapsed_ms = if bs.step_start_ms > 0 {
+                            // 从 step_start_ms 实时计算（每帧刷新，始终准确）
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            now_ms.saturating_sub(bs.step_start_ms)
+                        } else {
+                            // step_start_ms == 0 表示不在计时（Idle 状态）
+                            bs.elapsed_ms
+                        };
+                        let elapsed_sec = elapsed_ms as f64 / 1000.0;
+                        let elapsed_text = if elapsed_ms < 1000 {
+                            format!("{}ms", elapsed_ms)
                         } else {
                             format!("{:.1}s", elapsed_sec)
                         };
-                        let elapsed_color = if bs.elapsed_ms < 5000 {
+                        let elapsed_color = if elapsed_ms < 5000 {
                             egui::Color32::GREEN
-                        } else if bs.elapsed_ms < 15000 {
+                        } else if elapsed_ms < 15000 {
                             egui::Color32::YELLOW
                         } else {
                             egui::Color32::RED
@@ -1138,12 +1149,30 @@ impl GaokaoApp {
             // progress
             // FPS 和性能信息
             let fps = ctx.input(|i| i.stable_dt).recip();
-            {
+            ui.horizontal(|ui| {
                 let fps_color = if fps > 30.0 { egui::Color32::GREEN }
                     else if fps > 15.0 { egui::Color32::YELLOW }
                     else { egui::Color32::RED };
                 ui.label(egui::RichText::new(format!("FPS: {:.0}", fps)).color(fps_color).size(12.0));
-            }
+
+                // QPS 查询速度
+                if let Ok(p) = self.pred_progress.try_lock() {
+                    if p.start_time_ms > 0 && p.total_queries > 0 {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let elapsed_sec = (now_ms.saturating_sub(p.start_time_ms)) as f64 / 1000.0;
+                        if elapsed_sec > 0.5 {
+                            let qps = p.total_queries as f64 / elapsed_sec;
+                            let qps_color = if qps > 1.0 { egui::Color32::GREEN }
+                                else if qps > 0.5 { egui::Color32::YELLOW }
+                                else { egui::Color32::RED };
+                            ui.label(egui::RichText::new(format!("QPS: {:.2}", qps)).color(qps_color).size(12.0));
+                        }
+                    }
+                }
+            });
 
             ui.push_id("pred_progress", |ui| {
                 if let Ok(p) = self.pred_progress.try_lock() {
@@ -1346,6 +1375,7 @@ impl GaokaoApp {
                     captcha_attempt: 0,
                     captcha_max: 0,
                     elapsed_ms: 0,
+                    step_start_ms: 0,
                 }).collect();
             }
 
@@ -1663,6 +1693,7 @@ impl GaokaoApp {
                     captcha_attempt: 0,
                     captcha_max: 0,
                     elapsed_ms: 0,
+                    step_start_ms: 0,
                 }).collect();
             }
 
@@ -1836,6 +1867,7 @@ impl GaokaoApp {
                     captcha_attempt: 0,
                     captcha_max: 0,
                     elapsed_ms: 0,
+                    step_start_ms: 0,
                 }).collect();
             }
 

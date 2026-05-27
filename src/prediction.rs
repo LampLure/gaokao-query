@@ -867,6 +867,13 @@ pub async fn run_prediction(
         p.matched = job.matched_count;
         p.not_found = 0;
         p.phase = job.phase.label().to_string();
+        // 记录开始时间，用于计算 QPS
+        if p.start_time_ms == 0 {
+            p.start_time_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+        }
     }
 
     {
